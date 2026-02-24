@@ -1,0 +1,9 @@
+[book]
+authors = ["HFT Engineer"]
+language = "zh-CN"
+src = "src"
+title = "Rust 高频交易实战 (HFT in Rust)"
+
+[output.html]
+git-repository-url = "https://github.com/yxz/hft-book-rs"
+edit-url-template = "https://github.com/yxz/hft-book-rs/edit/main/{path}"

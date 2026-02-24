@@ -1,0 +1,62 @@
+# Summary
+
+[前言](introduction/README.md)
+- [为什么选择 Rust 做高频交易](introduction/why_rust.md)
+- [HFT 生态概览](introduction/ecosystem.md)
+
+# 第一部分：低延迟 Rust 基础 (Foundations)
+- [内存布局与缓存效率 (Memory & Cache)](foundations/memory_layout.md)
+- [零成本抽象 (Zero-Cost Abstractions)](foundations/zero_cost.md)
+- [Unsafe Rust 实战 (SIMD, Intrinsics)](foundations/unsafe_rust.md)
+- [并发模型选择 (Async vs Thread vs Actor)](foundations/concurrency.md)
+
+# 第二部分：核心基础设施 (Core Infrastructure)
+- [无锁数据结构 (Lock-Free Structures)](infrastructure/lock_free.md)
+    - [Ring Buffer 实现](infrastructure/ring_buffer.md)
+    - [SPSC/MPSC 队列](infrastructure/queues.md)
+    - [原子操作详解](infrastructure/atomics.md)
+- [高性能日志系统 (Zero-Allocation Logging)](infrastructure/logging.md)
+- [配置管理与热加载](infrastructure/config.md)
+- [指标监控与遥测 (Metrics & Telemetry)](infrastructure/metrics.md)
+
+# 第三部分：网络与 I/O (Network & I/O)
+- [I/O 模型演进 (Evolution of I/O Models)](network/io_models.md)
+- [内核旁路技术 (Kernel Bypass)](network/kernel_bypass.md)
+    - [DPDK 集成](network/dpdk.md)
+    - [AF_XDP 实战](network/af_xdp.md)
+    - [Solarflare OpenOnload](network/openonload.md)
+- [io_uring 深度解析](network/io_uring.md)
+- [TCP/UDP 调优](network/tuning.md)
+
+# 第四部分：市场连接 (Market Connectivity)
+- [交易所协议详解](connectivity/protocols.md)
+    - [FIX 协议解析 (Nom & Zero-copy)](connectivity/fix.md)
+    - [二进制协议 (SBE, ITCH, OUCH)](connectivity/binary_protocols.md)
+- [市场数据处理 (Market Data)](connectivity/market_data.md)
+    - [L1/L2/L3 数据构建](connectivity/order_book_data.md)
+    - [增量更新与快照](connectivity/incremental_updates.md)
+- [订单路由系统 (Order Routing)](connectivity/order_routing.md)
+
+# 第五部分：交易引擎架构 (Trading Engine)
+- [订单簿管理 (Order Book Management)](engine/order_book.md)
+- [风控系统 (Risk Management System)](engine/risk.md)
+    - [预交易风控 (Pre-trade Check)](engine/pre_trade_risk.md)
+    - [持仓管理](engine/position.md)
+- [策略框架设计 (Strategy Framework)](engine/strategy.md)
+    - [信号生成 (Signal Generation)](engine/signals.md)
+    - [执行算法 (Execution Algos)](engine/execution.md)
+
+# 第六部分：优化与硬件 (Optimization & Hardware)
+- [CPU 亲和性与隔离 (Pinning & Isolation)](optimization/cpu_affinity.md)
+- [基准测试 (Micro-benchmarking)](optimization/benchmarking.md)
+- [性能分析 (Profiling)](optimization/profiling.md)
+- [FPGA 交互 (Rust Bindings)](optimization/fpga.md)
+
+# 第七部分：回测与仿真 (Simulation)
+- [事件驱动回测引擎](simulation/event_driven.md)
+- [历史数据回放](simulation/replay.md)
+- [高精度时钟模拟](simulation/clock.md)
+
+# 附录
+- [推荐阅读](appendix/reading.md)
+- [开源项目资源](appendix/resources.md)
