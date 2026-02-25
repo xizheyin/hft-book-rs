@@ -1,4 +1,4 @@
-document.addEventListener("DOMContentLoaded", function() {
+document.addEventListener("DOMContentLoaded", function () {
     // 1. 配置 Giscus (请替换为你自己的 GitHub Repo 信息)
     const giscusConfig = {
         src: "https://giscus.app/client.js",
@@ -22,7 +22,7 @@ document.addEventListener("DOMContentLoaded", function() {
     const sidebar = document.createElement("div");
     sidebar.className = "giscus-sidebar";
     sidebar.id = "giscus-sidebar";
-    
+
     // 添加标题和关闭按钮
     const header = document.createElement("div");
     header.style.display = "flex";
@@ -30,8 +30,8 @@ document.addEventListener("DOMContentLoaded", function() {
     header.style.alignItems = "center";
     header.style.marginBottom = "20px";
     header.innerHTML = `
-        <h3 style="margin:0;">📝 读书笔记 (GitHub)</h3>
-        <button id="close-giscus" style="background:none;border:none;cursor:pointer;font-size:1.5em;color:var(--icons)">×</button>
+        <h3 style="margin:0;">📝 读书笔记</h3>
+        <button id="close-giscus" title="关闭侧边栏" style="background:none;border:none;cursor:pointer;font-size:1.5em;color:var(--icons)">×</button>
     `;
     sidebar.appendChild(header);
 
@@ -39,14 +39,14 @@ document.addEventListener("DOMContentLoaded", function() {
     const giscusContainer = document.createElement("div");
     giscusContainer.className = "giscus";
     sidebar.appendChild(giscusContainer);
-    
+
     document.body.appendChild(sidebar);
 
     // 3. 加载 Giscus 脚本的函数
     let isGiscusLoaded = false;
     function loadGiscus() {
         if (isGiscusLoaded) return;
-        
+
         const script = document.createElement("script");
         Object.entries(giscusConfig).forEach(([key, value]) => {
             script.setAttribute(key, value);
@@ -63,7 +63,7 @@ document.addEventListener("DOMContentLoaded", function() {
         btn.className = "icon-button giscus-toggle-btn";
         btn.title = "打开/关闭 笔记";
         btn.innerHTML = `<i class="fa fa-commenting-o"></i>`; // 使用 FontAwesome 图标
-        
+
         // 插入到搜索按钮之前
         const searchBtn = document.getElementById("search-toggle");
         if (searchBtn) {
@@ -73,8 +73,9 @@ document.addEventListener("DOMContentLoaded", function() {
         }
 
         // 绑定点击事件
-        btn.addEventListener("click", function() {
+        btn.addEventListener("click", function () {
             sidebar.classList.toggle("open");
+            document.body.classList.toggle("giscus-open"); // 切换 body class 以挤压内容
             if (sidebar.classList.contains("open")) {
                 loadGiscus(); // 首次打开时才加载
             }
@@ -82,14 +83,15 @@ document.addEventListener("DOMContentLoaded", function() {
     }
 
     // 关闭按钮事件
-    document.getElementById("close-giscus").addEventListener("click", function() {
+    document.getElementById("close-giscus").addEventListener("click", function () {
         sidebar.classList.remove("open");
+        document.body.classList.remove("giscus-open"); // 恢复内容宽度
     });
 
     // 监听主题变化，同步更新 Giscus 主题
     const html = document.documentElement;
-    const observer = new MutationObserver(function(mutations) {
-        mutations.forEach(function(mutation) {
+    const observer = new MutationObserver(function (mutations) {
+        mutations.forEach(function (mutation) {
             if (mutation.type === "attributes" && mutation.attributeName === "class") {
                 // 向 Giscus iframe 发送消息更新主题
                 const iframe = document.querySelector('iframe.giscus-frame');

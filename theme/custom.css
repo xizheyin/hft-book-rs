@@ -20,7 +20,21 @@
     right: 0;
 }
 
-/* 移动端适配 */
+/* 响应式布局：当侧边栏打开时，压缩主内容区域 */
+body {
+    transition: margin-right 0.3s ease;
+}
+
+body.giscus-open {
+    margin-right: 450px; /* 与侧边栏宽度一致 */
+}
+
+/* 窄屏时（如平板/手机），仍然覆盖，因为屏幕不够宽 */
+@media (max-width: 1000px) {
+    body.giscus-open {
+        margin-right: 0;
+    }
+}
 @media (max-width: 600px) {
     .giscus-sidebar {
         width: 100%;
