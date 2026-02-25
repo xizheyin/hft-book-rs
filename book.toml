@@ -2,7 +2,7 @@
 authors = ["HFT Engineer"]
 language = "zh-CN"
 src = "src"
-title = "Rust 高频交易实战 (HFT in Rust)"
+title = "Rust 高频交易基础与实战 (HFT in Rust)"
 
 [output.html]
 additional-css = ["theme/custom.css", "theme/mermaid.css"]
