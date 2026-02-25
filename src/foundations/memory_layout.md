@@ -156,7 +156,139 @@ CPU 有专门的电路来检测内存访问模式。当你按顺序访问 `price
 - **SoA**: 完美的线性访问。预取器工作效率 100%。
 - **AoS**: 跳跃式访问 (`addr`, `addr+56`, `addr+112`...)。虽然现代预取器也能识别步长（Stride Prefetcher），但效率远不如纯线性访问高，且浪费了宝贵的内存带宽加载无用的 padding。
 
-## 4. 常见陷阱 (Pitfalls)
+## 4. 高级话题：Huge Pages 与 TLB (Translation Lookaside Buffer)
+
+在极度优化的 HFT 系统中，除了 CPU 缓存 (L1/L2/L3)，还有一个经常被忽视的瓶颈：**TLB**。
+
+### 4.1 什么是 TLB？
+
+CPU 使用虚拟地址，而内存使用物理地址。每次访问内存，CPU 都需要查表（页表）进行转换。为了加速这个过程，CPU 有一个专门的缓存叫 TLB。
+
+- **默认页大小**: Linux 默认使用 **4KB** 的页。
+- **TLB 容量**: 典型的 L1 TLB 只有 64 个条目（指令）和 100 个条目（数据）。L2 TLB 可能有 1500 个。
+
+**问题**: 如果你的程序频繁访问 1GB 的随机内存，你需要 $1GB / 4KB = 262,144$ 个页表项。TLB 根本装不下。结果是每次内存访问都会触发 **TLB Miss**，导致额外的内存延迟（通常几十纳秒）。
+
+### 4.2 Huge Pages (大页)
+
+解决方案是使用 **Huge Pages**。在 x86_64 上，标准大页是 **2MB**（还有 1GB 的巨型页）。
+
+- **4KB 页**: 覆盖 2MB 内存需要 512 个 TLB 条目。
+- **2MB 页**: 覆盖 2MB 内存只需要 **1 个 TLB 条目**。
+
+这极大提高了 TLB 命中率。
+
+### 4.3 实战：在 Rust 中使用 `mmap` 分配大页
+
+要使用大页，通常需要两个步骤：系统配置和代码实现。
+
+#### 步骤 1: 操作系统配置 (System Configuration)
+
+你必须先告诉 Linux 内核预留一部分物理内存作为大页。否则 `mmap` 会失败。
+
+```bash
+# 查看当前大页情况
+cat /proc/sys/vm/nr_hugepages
+
+# 预留 128 个 2MB 大页（共 256MB 内存）
+# 这部分内存会被立即锁定，普通程序无法使用
+sudo sysctl -w vm.nr_hugepages=128
+```
+
+#### 步骤 2: Rust 代码实现
+
+我们可以使用 `libc` crate 直接调用 `mmap`。
+
+```rust
+use std::ptr;
+use std::slice;
+
+fn allocate_huge_page() {
+    // 2MB 是 x86_64 上默认的大页大小
+    const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+    let len = HUGE_PAGE_SIZE;
+
+    unsafe {
+        // MAP_HUGETLB (0x40000) 告诉内核我们要大页
+        // 注意：如果系统没有预留大页，这里会返回 MAP_FAILED (通常是 ENOMEM)
+        let ptr = libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+            -1,
+            0,
+        );
+
+        if ptr == libc::MAP_FAILED {
+            panic!("mmap failed! Did you run 'sudo sysctl -w vm.nr_hugepages=128'?");
+        }
+
+        println!("Successfully allocated 2MB huge page at: {:p}", ptr);
+
+        // 使用 slice 访问这块内存
+        let data = slice::from_raw_parts_mut(ptr as *mut u8, len);
+        
+        // 触发缺页中断 (Page Fault)，内核真正分配物理页
+        data[0] = 1; 
+        data[len - 1] = 255;
+
+        // 释放内存
+        // 注意：在 HFT 生产环境中，通常在程序启动时一次性分配所有内存并常驻，
+        // 只有在程序退出或重加载配置时才释放。
+        libc::munmap(ptr, len);
+    }
+}
+
+### 4.4 Rust 风格的 RAII 封装
+
+为了避免手动管理内存导致泄漏，我们应该利用 Rust 的 `Drop` trait 来自动管理大页的生命周期。
+
+```rust
+struct HugePageBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl HugePageBuffer {
+    fn new(size: usize) -> Self {
+        // ... mmap implementation ...
+        // 略，参考上文 allocate_huge_page 实现
+        unsafe {
+             let ptr = libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+                -1,
+                0,
+            );
+            if ptr == libc::MAP_FAILED {
+                panic!("HugePage allocation failed");
+            }
+            HugePageBuffer { ptr: ptr as *mut u8, len: size }
+        }
+    }
+    
+    fn as_slice_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for HugePageBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            // 当结构体离开作用域时，自动归还大页给操作系统
+            libc::munmap(self.ptr as *mut _, self.len);
+        }
+    }
+}
+```
+```
+
+> **注意**: 在生产环境中，我们通常使用 `HugeTLB` 文件系统或者透明大页 (THP)。但对于延迟敏感的 HFT，**显式分配 (Explicit Allocation)** 是最可控的。
+
+## 5. 常见陷阱 (Pitfalls)
 
 1.  **过度对齐 (Over-alignment)**:
     给每个小对象都加上 `#[repr(align(64))]` 会导致巨大的内存浪费（Fragmentation）。只在存在**伪共享风险**的并发数据结构中使用它。
