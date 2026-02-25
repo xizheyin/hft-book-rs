@@ -98,65 +98,40 @@ impl Position {
 use std::sync::atomic::{AtomicI64, Ordering};
 
 pub struct AtomicPositionManager {
-    // 假设 symbol_id 是 index
-    positions: Vec<AtomicI64>, 
+    // 简单场景：只维护数量
+    quantities: Vec<AtomicI64>, 
 }
 
 impl AtomicPositionManager {
-    pub fn get(&self, symbol_id: usize) -> i64 {
-        self.positions[symbol_id].load(Ordering::Acquire)
+    pub fn new(num_symbols: usize) -> Self {
+        let mut quantities = Vec::with_capacity(num_symbols);
+        for _ in 0..num_symbols {
+            quantities.push(AtomicI64::new(0));
+        }
+        Self { quantities }
     }
 
-    pub fn add(&self, symbol_id: usize, qty: i64) {
-        self.positions[symbol_id].fetch_add(qty, Ordering::SeqCst);
+    #[inline(always)]
+    pub fn update(&self, symbol_id: usize, delta: i64) {
+        self.quantities[symbol_id].fetch_add(delta, Ordering::SeqCst);
     }
-}
-```
 
-## 4. 浮动盈亏 (Unrealized PnL)
-
-浮动盈亏是基于当前市场价格计算的。
-
-$$ Unrealized PnL = (Mark Price - Avg Price) \times Position $$
-
-*   **Mark Price**: 可以是最新成交价 (LTP)，也可以是买一卖一的中间价 (Mid Price)。
-*   **计算时机**: 通常在策略循环中按需计算，或者由监控线程定期计算，不建议在热路径中实时更新。
-
-## 5. 对账与纠错 (Reconciliation)
-
-本地维护的持仓可能与交易所端的实际持仓不一致（由于丢包、系统重启、Bug）。
-
-### 5.1 定期查询
-每隔一段时间（如 1秒 或 1分钟），或者在启动时，发送 `PositionRequest` 给交易所。
-
-### 5.2 强制同步
-收到交易所的持仓快照后，强制覆盖本地持仓。
-
-```rust
-pub fn reconcile(&mut self, exchange_qty: i32) {
-    if self.quantity != exchange_qty {
-        log::error!("Position mismatch! Local: {}, Exchange: {}. Syncing...", 
-                    self.quantity, exchange_qty);
-        // 强制同步逻辑：
-        // 1. 修改 quantity
-        // 2. 可能需要调整 avg_price (虽然交易所通常不发 avg_price)
-        self.quantity = exchange_qty;
-        
-        // 触发风控重算
-        self.trigger_risk_check();
+    #[inline(always)]
+    pub fn get_qty(&self, symbol_id: usize) -> i64 {
+        self.quantities[symbol_id].load(Ordering::SeqCst)
     }
 }
 ```
 
-## 6. 多策略管理
+### 3.3 影子持仓 (Shadow Position)
 
-如果一个账户跑多个策略，我们通常需要维护两套持仓：
-1.  **Strategy Position**: 策略视角的持仓（逻辑持仓）。
-2.  **Account Position**: 账户视角的总持仓（物理持仓）。
+由于成交回报 (Fill) 总是有延迟的，策略在发出订单后，实际上已经承担了潜在的风险。
+因此，我们通常维护两个持仓：
+1.  **已确认持仓 (Confirmed Position)**: 基于 Fill 更新。
+2.  **潜在持仓 (Pending/Shadow Position)**: 发单时立即更新，收到 Fill 或 Reject 时修正。
 
-$$ Account Position = \sum Strategy Position $$
+风控检查通常基于 `Pending Position`，以防止“超发”。
 
-风控通常基于 **Account Position**，而信号生成基于 **Strategy Position**。
+## 4. 总结
 
----
-下一章：[策略框架设计 (Strategy Framework)](strategy.md)
+持仓管理是 HFT 系统的账本。虽然逻辑看似简单（加加减减），但在高并发环境下保证数据的一致性和实时性是一项挑战。通过区分“风控用持仓”（原子化、极简）和“策略用持仓”（详细、包含 PnL），我们可以同时满足低延迟和功能完备的需求。

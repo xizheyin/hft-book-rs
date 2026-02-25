@@ -147,6 +147,15 @@ fn bench_memory_layout(c: &mut Criterion) {
 - **AoS**: 每次迭代加载 64 字节缓存行，但只使用了其中的 8 字节 (price)。有效带宽利用率仅 12.5%。
 - **SoA**: 每次加载 64 字节缓存行，包含 8 个连续的 price。有效带宽利用率 100%。
 
+### 3.3 硬件预取器 (Hardware Prefetcher)
+
+SoA 的胜利不仅仅是因为数据密度。**硬件预取器** 是关键。
+
+CPU 有专门的电路来检测内存访问模式。当你按顺序访问 `prices[0], prices[1], prices[2]...` 时，预取器会立刻识别出这个线性模式，并提前将 `prices[3], prices[4]...` 从主存拉取到 L1 Cache。
+
+- **SoA**: 完美的线性访问。预取器工作效率 100%。
+- **AoS**: 跳跃式访问 (`addr`, `addr+56`, `addr+112`...)。虽然现代预取器也能识别步长（Stride Prefetcher），但效率远不如纯线性访问高，且浪费了宝贵的内存带宽加载无用的 padding。
+
 ## 4. 常见陷阱 (Pitfalls)
 
 1.  **过度对齐 (Over-alignment)**:

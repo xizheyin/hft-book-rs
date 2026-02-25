@@ -93,14 +93,33 @@ pub fn trigger_kill_switch() {
 ### 3.2 硬件熔断
 有些 HFT 公司会使用 FPGA 网卡作为最后的网关。如果软件层失控（例如死循环发包），FPGA 层的看门狗 (Watchdog) 会直接切断物理连接或丢弃数据包。
 
-## 4. 常见陷阱
+## 4. 常见陷阱与并发安全
 
-1.  **整数溢出**: 计算 `Price * Quantity` 时，如果使用 `u32` 可能会溢出。务必使用 `u64` 或 `u128`。
-2.  **并发更新导致的超限**:
-    *   线程 A 检查持仓：`Current (100) + New (10) < Max (105)`? -> False (允许)。
-    *   线程 B 检查持仓：`Current (100) + New (10) < Max (105)`? -> False (允许)。
-    *   结果：持仓变成 120，超过 105。
-    *   **解决**: 使用 `fetch_add` 预扣除，如果超限则回滚（`fetch_sub`）。
+### 4.1 整数溢出
+计算 `Price * Quantity` 时，如果使用 `u32` 可能会溢出。务必使用 `u64` 或 `u128`。
 
----
-下一章：[预交易风控实现 (Pre-trade Check)](pre_trade_risk.md)
+### 4.2 并发更新导致的超限 (Race Condition)
+场景：最大持仓限制 100。
+*   线程 A 读取当前持仓：90。准备买入 10。
+*   线程 B 读取当前持仓：90。准备买入 10。
+*   线程 A 检查：90 + 10 <= 100 (Pass)。发送订单。
+*   线程 B 检查：90 + 10 <= 100 (Pass)。发送订单。
+*   **结果**：持仓变成 110，突破风控限制。
+
+**解决方案**:
+1.  **原子预扣 (Atomic Reservation)**: 使用 `fetch_add` 预先扣除额度。如果超限，再 `fetch_sub` 加回来。
+    ```rust
+    // 尝试预扣额度
+    let current = position.fetch_add(qty, Ordering::SeqCst);
+    if current + qty > MAX_POSITION {
+        // 失败回滚
+        position.fetch_sub(qty, Ordering::SeqCst);
+        return Err(RiskError::PositionLimitExceeded);
+    }
+    ```
+2.  **单线程风控 (Single Threaded Risk)**: 将所有订单路由到一个专门的风控线程进行串行检查（牺牲延迟换取安全性）。
+3.  **Thread-local Quota**: 每个线程分配固定额度（如总额度 100，线程 A 分 50，线程 B 分 50）。
+
+## 5. 总结
+
+HFT 风控的核心在于平衡：既要足够快以免拖累策略，又要足够严以防系统崩溃。通过使用无锁原子操作、静态检查和分层设计，我们可以在纳秒级延迟下实现严密的风控体系。记住，风控是最后一道防线，永远假设上游代码（策略）是不可信的。

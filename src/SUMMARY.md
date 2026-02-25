@@ -5,6 +5,8 @@
 - [HFT 生态概览](introduction/ecosystem.md)
 
 # 第一部分：低延迟 Rust 基础 (Foundations)
+- [CPU 微架构原理 (CPU Microarchitecture)](foundations/cpu_arch.md)
+- [操作系统原理回顾 (OS Internals)](foundations/os_internals.md)
 - [内存布局与缓存效率 (Memory & Cache)](foundations/memory_layout.md)
 - [零成本抽象 (Zero-Cost Abstractions)](foundations/zero_cost.md)
 - [Unsafe Rust 实战 (SIMD, Intrinsics)](foundations/unsafe_rust.md)

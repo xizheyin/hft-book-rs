@@ -70,13 +70,15 @@ fn main() {
         // 3. 忙轮询循环
         loop {
             // 接收数据
-            if let Some(packet) = receive_packet() {
-                process(packet);
-            } else {
-                // 关键优化：PAUSE 指令
-                // 告诉 CPU "我在空转"，避免流水线推测执行过热，节省电力
-                std::hint::spin_loop(); 
-            }
+                    if let Some(packet) = receive_packet() {
+                        process(packet);
+                    } else {
+                        // 关键优化：PAUSE 指令
+                        // 1. 节能：让流水线暂停，降低功耗。
+                        // 2. 避免内存顺序冲突：在退出自旋循环时，防止流水线清空带来的巨大惩罚 (Memory Order Violation)。
+                        // Intel 推荐在 Skylake 架构上使用 `_mm_pause()` (大约 140 周期)。
+                        std::hint::spin_loop(); 
+                    }
         }
     });
 
@@ -91,6 +93,26 @@ fn main() {
 `isolcpus=2,3,4,5`
 
 这样，Linux 调度器会完全忽略这些核心。除非你显式地将线程绑定上去，否则这些核心上不会运行任何用户态进程。这是 HFT 服务器的标准配置。
+
+### 2.4 NUMA 架构感知 (NUMA Awareness)
+
+现代高性能服务器通常是双路（Dual Socket）甚至四路的。这就引入了 **NUMA (Non-Uniform Memory Access)** 问题。
+
+- **Local Access**: CPU 访问自己插槽上的内存，延迟低 (~60ns)。
+- **Remote Access**: CPU 访问另一个插槽上的内存（通过 QPI/UPI 总线），延迟高 (~100ns+)。
+
+**HFT 铁律**: 你的线程在哪颗 CPU 上跑，你的内存就必须在哪颗 CPU 上分配。
+
+在 Rust 中，这通常意味着：
+1.  **线程绑定**: 确保线程固定在某个 NUMA 节点的核心上。
+2.  **内存分配**: 在该线程中进行内存分配（Linux 的 `first-touch` 策略通常保证了这一点）。或者使用 `libnuma` 显式绑定内存。
+
+```rust
+// 伪代码：检查 NUMA 拓扑
+let topology = hwloc::Topology::new();
+let core = topology.objects_with_type(ObjectType::Core)[0];
+// 确保网卡、CPU 核心、内存都在同一个 NUMA 节点！
+```
 
 ## 3. 性能分析：跨核通信 (Cross-Core Communication)
 

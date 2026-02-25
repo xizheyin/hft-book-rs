@@ -66,14 +66,16 @@ SOR 会根据各交易所的流动性和延迟，决定分配多少数量。
 
 ## 5. 代码实现模式：执行状态机
 
-执行逻辑通常独立于策略逻辑。
+执行逻辑通常独立于策略逻辑，使用有限状态机（FSM）管理订单生命周期。
 
 ```rust
 enum ExecutionState {
     Idle,
-    Working(u64), // OrderID
+    PendingNew(u64), // 等待交易所确认
+    Working(u64),    // 挂单中 (OrderID)
+    PendingCancel(u64), // 等待撤单确认
     Filled,
-    Rejected,
+    Rejected(RejectReason),
 }
 
 struct ExecutionAlgo {
@@ -88,22 +90,41 @@ impl ExecutionAlgo {
             ExecutionState::Idle => {
                 if self.filled_qty < self.target_qty {
                     // 发出第一笔子订单
-                    let child_qty = calc_child_qty();
-                    ctx.send_order(...);
-                    self.state = ExecutionState::Working(oid);
+                    let child_qty = self.calc_child_qty();
+                    let oid = ctx.send_order(child_qty);
+                    self.state = ExecutionState::PendingNew(oid);
                 }
             }
             ExecutionState::Working(oid) => {
                 // 检查是否需要改单 (Reprice)
-                if need_reprice() {
-                    ctx.cancel_replace(oid, ...);
+                if self.need_reprice(ctx) {
+                    ctx.cancel_replace(oid, self.new_price(ctx));
+                    self.state = ExecutionState::PendingCancel(oid); // 或 PendingReplace
                 }
             }
+            // ... 处理其他状态
             _ => {}
+        }
+    }
+    
+    fn on_order_ack(&mut self, oid: u64) {
+        if let ExecutionState::PendingNew(pending_oid) = self.state {
+            if oid == pending_oid {
+                self.state = ExecutionState::Working(oid);
+            }
         }
     }
 }
 ```
 
----
-下一章：[优化与硬件篇 (Optimization & Hardware)](../optimization/cpu_affinity.md)
+## 6. 执行优化技巧
+
+1.  **Cancel-Replace vs Modify**: 
+    *   某些交易所支持 `OrderModify` 请求，这通常比先 Cancel 后 New 更快，且可能保留部分队列优先权（如果只减少数量）。
+    *   如果只改价格，通常会失去队列位置。
+    
+2.  **批处理 (Batching)**:
+    *   如果你需要同时调整 10 个订单，尽量将它们打包在一个 TCP 包中发送（如果协议允许），或者使用 `io_uring` 批量提交系统调用。
+
+3.  **预分配订单 ID**:
+    *   不要等交易所返回 OrderID。在本地生成唯一的 OrderID（ClientOrderID），以此作为索引。这样可以在收到 ACK 之前就开始处理后续逻辑。
