@@ -11,6 +11,7 @@
 - [零成本抽象 (Zero-Cost Abstractions)](foundations/zero_cost.md)
 - [Unsafe Rust 实战 (SIMD, Intrinsics)](foundations/unsafe_rust.md)
 - [并发模型选择 (Async vs Thread vs Actor)](foundations/concurrency.md)
+- [Async Rust 原理与 Tokio (Async Rust & Tokio)](foundations/async_rust.md)
 
 # 第二部分：核心基础设施 (Core Infrastructure)
 - [无锁数据结构 (Lock-Free Structures)](infrastructure/lock_free.md)
@@ -62,3 +63,5 @@
 # 附录
 - [推荐阅读](appendix/reading.md)
 - [开源项目资源](appendix/resources.md)
+- [HFT 面试宝典 (Interview Guide)](appendix/interview.md)
+- [我的笔记 (My Notes)](personal_notes.md)
