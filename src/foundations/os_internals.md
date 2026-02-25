@@ -106,22 +106,60 @@ Syscall 不仅仅是一个函数调用。它涉及：
 某些频繁调用的 Syscall（如 `gettimeofday`, `clock_gettime`）被优化了。内核将这些函数的实现映射到用户空间，使得调用它们就像调用普通函数一样，**无需陷入内核**。
 这就是为什么在 Rust 中调用 `Instant::now()` 非常快。
 
-## 4. 中断与异常 (Interrupts & Exceptions)
+## 4. 中断 (Interrupts)
 
-### 4.1 硬中断 (Hardware Interrupts)
-当网卡收到数据包时，它会给 CPU 发送一个电信号（中断）。CPU 必须**立即停止**当前正在做的事情，跳转到中断处理程序 (ISR)。
+中断是 CPU 响应外部事件（如网卡数据到达、时钟滴答）的机制。对于 HFT 来说，中断是把双刃剑：它既是获取行情的源头，也是破坏确定性（Determinism）的元凶。
 
-**解决**: **Core Isolation (核隔离)**。将关键交易线程绑定到特定的 CPU 核心，并配置 OS 使得该核心**不处理任何中断**（除了本地时钟中断）。
+### 4.1 硬件中断 vs 软中断 (HardIRQ vs SoftIRQ)
 
-## 5. 总结
+Linux 的中断处理分为两个阶段：
 
-在面试中，当被问到内存管理时，你应该展示出**整体视角**：
+1.  **上半部 (Top Half / HardIRQ)**:
+    *   **极快**: 立即响应硬件信号，屏蔽其他中断。
+    *   **任务**: 仅仅把数据从网卡寄存器拷贝到 RAM（Ring Buffer），然后触发软中断。
+    *   **HFT 影响**: 会打断当前正在运行的任何代码（包括你的策略线程）。这会导致 **Context Switch** 和 **Cache Pollution**。
 
-1.  **虚拟 -> 物理**: 理解页表和 TLB 的作用。
-2.  **不确定性**: 理解 Page Fault 和 Swap 是延迟杀手。
-3.  **解决方案**:
-    - **Pre-fault**: 消除运行时的缺页异常。
-    - **mlock**: 消除 Swap 风险。
-    - **Hugepages**: 扩大 TLB 覆盖范围，减少页表遍历开销。
+2.  **下半部 (Bottom Half / SoftIRQ)**:
+    *   **稍慢**: 处理复杂的逻辑（如 TCP/IP 协议栈解析）。
+    *   **任务**: 运行在 `ksoftirqd` 线程中，消耗 CPU 时间。
 
-这才是 HFT 级别的内存管理认知。
+### 4.2 中断亲和性 (SMP Affinity)
+
+为了防止中断打断核心策略线程，我们需要将中断“赶”到非关键核心上。
+
+假设你的 CPU 有 16 个核心：
+*   **Core 0-1**: 处理 OS 杂务（SSH, 日志）。
+*   **Core 2-3**: 专门处理网卡中断（网卡队列绑定）。
+*   **Core 4-15**: **隔离核心 (Isolated Cores)**，运行策略线程。
+
+**操作命令**:
+```bash
+# 查看当前网卡中断分布
+cat /proc/interrupts | grep eth0
+
+# 将网卡 eth0 的中断只绑定到 CPU 2 (掩码 0x4)
+# echo 4 > /proc/irq/<irq_num>/smp_affinity
+```
+
+### 4.3 局部性原理的破坏者
+
+为什么中断如此可怕？
+想象你的策略线程正在 Core 4 上全速运行，L1/L2 Cache 填满了订单簿数据。
+突然，网卡中断来了。Core 4 被迫暂停你的线程，跳转到内核的中断处理程序 (ISR)。ISR 执行了一堆代码，把 L1/L2 Cache 全洗了一遍。
+等中断处理完，你的线程恢复执行，发现 Cache 全是冷的（Cache Miss），延迟瞬间飙升 10-20 微秒。
+
+**解决方案**: **Kernel Bypass (内核旁路)**。
+使用 DPDK 或 OpenOnload，直接在用户态轮询（Polling）网卡，完全绕过内核中断机制。
+
+## 5. 总结 (Summary)
+
+1.  **预故障 (Pre-faulting)**: 初始化时摸一遍所有内存。
+2.  **内存锁定 (Mlock)**: 防止 Swap。
+3.  **大页 (Hugepages)**: 减少 TLB Miss。
+4.  **隔离核心 (Isolcpus)**: 避免 OS 调度干扰。
+5.  **中断绑定 (SMP Affinity)**: 避免中断打断关键线程。
+
+掌握这些 OS 原理，是写出微秒级系统的入场券。
+
+---
+下一章：[内存布局与缓存效率](memory_layout.md)
