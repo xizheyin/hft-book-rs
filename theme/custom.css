@@ -1,1 +1,57 @@
+/* Generated Table of Contents in Sidebar */
+.sidebar .chapter-item.section-link {
+    margin-top: 0.2em;
+    margin-bottom: 0.2em;
+    list-style: none;
+}
 
+.sidebar .generated-toc {
+    padding-left: 0;
+    margin-left: 0;
+}
+
+.sidebar .chapter-item.section-link a {
+    padding-left: 20px;
+    font-size: 0.9em;
+    color: var(--sidebar-fg);
+    opacity: 0.8;
+    transition: color 0.2s, opacity 0.2s;
+    text-decoration: none;
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    padding-top: 3px;
+    padding-bottom: 3px;
+}
+
+/* H3 items indented further */
+.sidebar .chapter-item.section-link.h3-section a {
+    padding-left: 35px;
+    font-size: 0.85em;
+    opacity: 0.7;
+}
+
+/* Hover effects */
+.sidebar .chapter-item.section-link a:hover {
+    color: var(--sidebar-active);
+    opacity: 1;
+    background-color: var(--sidebar-hover-bg, rgba(0, 0, 0, 0.05));
+    text-decoration: none;
+}
+
+/* Make sure the generated list looks like part of the sidebar */
+.sidebar ol.generated-toc {
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+    border-left: 2px solid var(--sidebar-active, #ccc);
+    /* Visual cue connecting sections */
+    margin-left: 10px;
+    /* Indent the whole block slightly */
+}
+
+/* Dark mode adjustments if needed (vars handle most of it) */
+@media (prefers-color-scheme: dark) {
+    .sidebar .chapter-item.section-link a {
+        color: var(--sidebar-fg);
+    }
+}
