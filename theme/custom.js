@@ -42,10 +42,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
     // 3. Create a sub-list for the sidebar
     var ul = document.createElement("ol");
-    ul.className = "section";
-    ul.style.marginLeft = "20px"; // Indent the sub-list
-    ul.style.listStyleType = "none"; // Remove bullets
-    ul.style.padding = "0";
+    ul.className = "section generated-toc"; // Add a specific class for styling
 
     headers.forEach(function (header) {
         // Skip headers without ID (cannot link)
@@ -53,20 +50,15 @@ document.addEventListener("DOMContentLoaded", function () {
 
         var li = document.createElement("li");
         li.className = "chapter-item section-link";
-        li.style.marginTop = "0.5em";
 
         var a = document.createElement("a");
         a.href = "#" + header.id;
         a.textContent = header.textContent.replace(/^#+\s*/, ''); // Remove leading # if any
         a.className = "sidebar-link";
 
-        // Styling based on header level
+        // Add class for H3 to style in CSS
         if (header.tagName === "H3") {
-            a.style.fontSize = "0.9em";
-            a.style.opacity = "0.8";
-            a.style.paddingLeft = "15px"; // Indent H3 more
-        } else {
-            a.style.fontSize = "0.95em";
+            li.classList.add("h3-section");
         }
 
         li.appendChild(a);
