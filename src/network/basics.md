@@ -123,30 +123,78 @@ UDP 头部只有 8 字节：Source Port, Dest Port, Length, Checksum。
 
 TCP 的设计目标是**在不可靠的网络上提供可靠的字节流传输**。为了实现这一点，它引入了大量机制，而这些机制在低延迟场景下往往反而是阻碍。
 
-### 3.1 三次握手与 RTT
+### 3.1 三次握手 (Three-Way Handshake)
 
-TCP 建立连接需要 1.5 个 RTT (Round Trip Time)。
+TCP 建立连接需要 3 个步骤，这消耗了 1.5 个 RTT (Round Trip Time)。
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Server
     
+    Note left of Client: CLOSED
+    Note right of Server: LISTEN
+    
+    Client->>Server: 1. SYN (seq=x)
     Note left of Client: SYN_SENT
-    Client->>Server: SYN (seq=x)
+    
+    Server->>Client: 2. SYN (seq=y), ACK (x+1)
     Note right of Server: SYN_RCVD
-    Server->>Client: SYN (seq=y), ACK (x+1)
+    
+    Client->>Server: 3. ACK (y+1)
     Note left of Client: ESTABLISHED
-    Client->>Server: ACK (y+1)
     Note right of Server: ESTABLISHED
+    
     Client->>Server: Data Request...
 ```
 
+1.  **SYN**: 客户端发送 SYN 包，告诉服务器“我想连你，我的初始序号是 x”。
+2.  **SYN-ACK**: 服务器回复“收到了，我的初始序号是 y，期待你的下一个包是 x+1”。
+3.  **ACK**: 客户端回复“收到，连接建立”。
+
 **HFT 影响**:
-*   如果你的策略依赖于新建连接（短连接），那么你还没发送订单，就已经输在起跑线上了。
+*   **1.5 RTT 的代价**: 如果你的策略依赖于新建连接（短连接），那么你还没发送订单，就已经输在起跑线上了。在跨洋链路中，这可能是几百毫秒的延迟。
 *   **优化**: 必须使用 **长连接 (Keep-Alive)**。在开盘前建立好连接，并维持心跳。
 
-### 3.2 Nagle 算法与 Delayed ACK 的死锁
+### 3.2 四次挥手 (Four-Way Wave)
+
+断开连接比建立连接更复杂，需要 4 个包，因为 TCP 是**全双工**的（每一方都需要单独关闭自己的发送通道）。
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    
+    Note left of Client: ESTABLISHED
+    Note right of Server: ESTABLISHED
+    
+    Client->>Server: 1. FIN (seq=u)
+    Note left of Client: FIN_WAIT_1
+    Note right of Server: CLOSE_WAIT
+    
+    Server->>Client: 2. ACK (u+1)
+    Note left of Client: FIN_WAIT_2
+    
+    Note right of Server: Server 处理完剩余数据...
+    Server->>Client: 3. FIN (seq=v)
+    Note right of Server: LAST_ACK
+    
+    Client->>Server: 4. ACK (v+1)
+    Note left of Client: TIME_WAIT
+    Note right of Server: CLOSED
+    
+    Note left of Client: 等待 2MSL (60s)
+    Note left of Client: CLOSED
+```
+
+1.  **FIN**: 客户端说“我发完了”。进入 `FIN_WAIT_1`。
+2.  **ACK**: 服务器说“知道了”。此时服务器进入 `CLOSE_WAIT`，客户端进入 `FIN_WAIT_2`。**注意：此时服务器可能还有数据要发给客户端，连接处于半关闭状态。**
+3.  **FIN**: 服务器发完数据后，也说“我也发完了”。进入 `LAST_ACK`。
+4.  **ACK**: 客户端说“好的，再见”。进入 `TIME_WAIT`。
+
+理解这个流程，是理解后文 `TIME_WAIT` 和 `CLOSE_WAIT` 陷阱的前提。
+
+### 3.3 Nagle 算法与 Delayed ACK 的死锁
 
 这是 TCP 性能杀手排行榜第一名。
 
