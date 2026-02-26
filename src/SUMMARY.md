@@ -23,6 +23,7 @@
 - [指标监控与遥测 (Metrics & Telemetry)](infrastructure/metrics.md)
 
 # 第三部分：网络与 I/O (Network & I/O)
+- [网络协议栈基础 (Network Stack Basics)](network/basics.md)
 - [I/O 模型演进 (Evolution of I/O Models)](network/io_models.md)
 - [内核旁路技术 (Kernel Bypass)](network/kernel_bypass.md)
     - [DPDK 集成](network/dpdk.md)

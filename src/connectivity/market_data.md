@@ -20,6 +20,20 @@
 
 一个典型的 MD 流水线包含以下阶段：
 
+```mermaid
+graph TD
+    UDP((UDP Multicast)) -->|Kernel Bypass| Capture[Packet Capture]
+    Capture -->|Raw Bytes| Parser[Protocol Parser]
+    Parser -->|Normalized Msg| Arb[Arbitration A/B]
+    Arb -->|Unique Msg| Book[Order Book Builder]
+    Book -->|L2/L3 Update| Strategy[Strategy Engine]
+    
+    style Capture fill:#f96,stroke:#333
+    style Parser fill:#f96,stroke:#333
+    style Book fill:#9cf,stroke:#333
+    style Strategy fill:#dfd,stroke:#333
+```
+
 1.  **Packet Capture**: 内核旁路或 Socket 接收 (Network Layer)。
 2.  **Parsing**: 将字节流转为 Rust Struct (Protocol Layer)。
 3.  **Arbitration**: A/B 通道去重与仲裁。

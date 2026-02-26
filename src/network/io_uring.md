@@ -9,6 +9,30 @@ Linux 5.1 引入的 `io_uring` 是异步 I/O 的革命。在它之前，我们�
 
 `io_uring` 的核心是两个共享内存的 Ring Buffer：
 
+```mermaid
+graph TD
+    subgraph UserSpace
+        App[Application]
+        SQ[Submission Queue (SQ)]
+        CQ[Completion Queue (CQ)]
+    end
+    subgraph KernelSpace
+        Kernel[Kernel Thread]
+        Device[Hardware / Driver]
+    end
+
+    App -- "1. Push SQE" --> SQ
+    SQ -- "2. Read SQE (No Syscall)" --> Kernel
+    Kernel -- "3. Execute I/O" --> Device
+    Device -- "4. Interrupt/Poll" --> Kernel
+    Kernel -- "5. Push CQE" --> CQ
+    CQ -- "6. Poll/Read CQE" --> App
+
+    style SQ fill:#dfd,stroke:#333
+    style CQ fill:#fdd,stroke:#333
+    style Kernel fill:#f96,stroke:#333
+```
+
 1.  **Submission Queue (SQ)**: 用户进程将 I/O 请求（SQE, Submission Queue Entry）写入此队列。
 2.  **Completion Queue (CQ)**: 内核完成 I/O 后，将结果（CQE, Completion Queue Entry）写入此队列。
 

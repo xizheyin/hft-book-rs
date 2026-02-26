@@ -10,6 +10,34 @@
 
 风控通常分为三层：
 
+```mermaid
+graph TD
+    Strategy[Strategy Thread] -->|New Order| PreTrade[Pre-Trade Risk]
+    
+    subgraph Synchronous Blocking
+        PreTrade -->|Check Max Qty| C1{Pass?}
+        C1 -->|No| Reject[Reject Order]
+        C1 -->|Yes| C2{Check Price}
+        C2 -->|No| Reject
+    end
+    
+    C2 -->|Yes| Gateway[Order Gateway]
+    Gateway -->|TCP/UDP| Exchange
+    
+    Exchange -->|Execution Report| Gateway
+    Gateway -->|Fill Update| PostTrade[Post-Trade Risk]
+    
+    subgraph Asynchronous
+        PostTrade -->|Update Position| Pos[Position Manager]
+        Pos -->|Check Max Exposure| Kill{Kill Switch?}
+        Kill -->|Yes| Cancel[Cancel All]
+    end
+    
+    style PreTrade fill:#f96,stroke:#333
+    style PostTrade fill:#9cf,stroke:#333
+    style Kill fill:#f00,stroke:#333,color:#fff
+```
+
 ### 1.1 预交易风控 (Pre-trade Risk)
 *   **位置**: 在策略生成订单之后，发送到网关之前。
 *   **特点**: **同步 (Synchronous)**，**阻塞 (Blocking)**。

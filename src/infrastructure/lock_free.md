@@ -5,11 +5,34 @@
 ## 1. 为什么 HFT 痛恨锁？
 
 ### 1.1 优先级反转 (Priority Inversion)
+
 假设你有两个线程：
 - **线程 A (高优先级)**: 处理行情数据，延迟要求极高。
 - **线程 B (低优先级)**: 处理日志记录，延迟要求宽松。
 
 如果 B 持有了一个锁（例如日志缓冲区的锁），此时 OS 调度器决定暂停 B（因为它优先级低）。接着 A 运行，试图获取同一个锁。A 将被阻塞，直到 OS 重新调度 B 并让 B 释放锁。
+
+```mermaid
+sequenceDiagram
+    participant A as Thread A (High Prio)
+    participant B as Thread B (Low Prio)
+    participant L as Lock
+    
+    Note over B: Acquires Lock
+    B->>L: Lock()
+    Note over B: Preempted by OS
+    
+    Note over A: Wakes up (Market Data)
+    A->>L: Lock()
+    Note over A: BLOCKED! Waiting for B...
+    
+    Note over B: Resumes execution (eventually)
+    B->>L: Unlock()
+    
+    Note over A: Finally gets Lock
+    Note right of A: Huge Latency Spike!
+```
+
 结果：**高优先级的 A 被低优先级的 B 拖慢了**。在极端情况下，这可能导致数百微秒的延迟抖动。
 
 ### 1.2 死锁与活锁 (Deadlock & Livelock)
@@ -23,6 +46,22 @@
 "无锁" 并不意味着没有同步，而是指**系统作为一个整体，总是在前进**。
 
 > **定义**: 如果一个线程被挂起，其他线程仍然可以继续执行并取得进展，那么这个算法就是无锁的。
+
+```mermaid
+graph TD
+    subgraph Lock-Based
+        T1[Thread 1] -- Waiting for Lock --> T2[Thread 2 (Holder)]
+        T2 -- Descheduled --> Stall[System Stalled]
+    end
+    
+    subgraph Lock-Free
+        LF1[Thread 1] -- CAS Failed --> Retry[Retry Loop]
+        LF2[Thread 2] -- CAS Success --> Progress[System Progress]
+    end
+    
+    style Stall fill:#f99,stroke:#333
+    style Progress fill:#dfd,stroke:#333
+```
 
 还有一个更强的保证叫 **无等待 (Wait-Free)**：任何操作都能在有限步数内完成，无论其他线程在做什么。HFT 追求的是 Wait-Free，但在实践中，我们通常满足于 Lock-Free。
 

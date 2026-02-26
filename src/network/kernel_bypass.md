@@ -13,7 +13,32 @@
 
 ## 1. 主流技术方案
 
-### 1.1 DPDK (Data Plane Development Kit)
+### 1.1 对比：内核栈 vs 旁路
+
+```mermaid
+graph TD
+    subgraph Kernel Stack
+        App1[Application] -->|Syscall| Socket[BSD Socket]
+        Socket -->|Copy| KBuf[Kernel Buffer (sk_buff)]
+        KBuf -->|TCP/IP| Stack[Protocol Stack]
+        Stack -->|Driver| NIC1[NIC Driver]
+        NIC1 -->|Interrupt| HW1[Hardware NIC]
+    end
+    
+    subgraph Kernel Bypass
+        App2[Application] -->|DMA / Zero Copy| Ring[Userspace Ring]
+        Ring -->|Poll Mode| PMD[PMD Driver]
+        PMD -->|PCIe| HW2[Hardware NIC]
+    end
+    
+    style App2 fill:#dfd,stroke:#333
+    style Ring fill:#dfd,stroke:#333
+    style PMD fill:#f96,stroke:#333
+    style KBuf fill:#f99,stroke:#333
+    style Stack fill:#f99,stroke:#333
+```
+
+### 1.2 DPDK (Data Plane Development Kit)
 Intel 推出的开源框架，是目前最通用的方案。
 - **原理**: 使用 UIO (Userspace I/O) 或 VFIO 驱动，将网卡寄存器映射到用户空间。
 - **特点**: 

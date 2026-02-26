@@ -8,11 +8,32 @@
 1.  **Writer (单写者)**: 网络线程（或专门的市场数据线程），负责接收交易所数据并更新订单簿。
 2.  **Reader (多读者)**: 策略线程，负责读取订单簿并做出决策。
 
-### 1.1 锁的困境
+### 1.1 架构图示
+
+```mermaid
+graph TD
+    MD[Market Data Feed] -->|Updates| Writer
+    subgraph Engine
+        Writer[Writer Thread]
+        OB[OrderBook (Shared Memory)]
+        Reader1[Strategy A]
+        Reader2[Strategy B]
+        Reader3[Risk Check]
+    end
+    Writer -->|Write (SeqLock)| OB
+    OB -.->|Read (Optimistic)| Reader1
+    OB -.->|Read (Optimistic)| Reader2
+    OB -.->|Read (Optimistic)| Reader3
+    
+    style Writer fill:#f96,stroke:#333,stroke-width:2px
+    style OB fill:#9cf,stroke:#333,stroke-width:2px
+```
+
+### 1.2 锁的困境
 *   `Mutex<OrderBook>`: 绝对禁止。锁竞争会导致严重的延迟抖动（Jitter）。
 *   `RwLock<OrderBook>`: 依然不够好。Writer 必须等待所有 Readers 释放锁，导致行情更新被阻塞，这在高频场景下是不可接受的（行情更新优先级最高）。
 
-### 1.2 解决方案：SeqLock (Sequence Lock)
+### 1.3 解决方案：SeqLock (Sequence Lock)
 
 SeqLock 是一种乐观锁机制，允许 Writer 随时写入（不阻塞），而 Reader 需要检测在读取过程中是否发生了写入。如果发生了，Reader 重试。
 
@@ -20,10 +41,10 @@ SeqLock 是一种乐观锁机制，允许 Writer 随时写入（不阻塞），�
 
 ## 2. SeqLock 实现 (Implementation)
 
-Rust 标准库没有内置 SeqLock，我们需要自己实现。
+Rust 标准库没有内置 SeqLock，我们需要自己实现。为了保证在所有架构（包括 ARM/AArch64）上的正确性，我们需要严格处理内存顺序。
 
 ```rust
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
 use std::cell::UnsafeCell;
 
 pub struct SeqLock<T> {
@@ -42,51 +63,75 @@ impl<T> SeqLock<T> {
     }
 
     /// Writer: 获取独占访问权
+    /// 
+    /// # Safety
+    /// 必须确保同一时间只有一个 Writer 调用此方法。
+    /// 通常通过架构设计（单线程写）来保证，或者在 SeqLock 外部再包一层 Mutex（如果需要多写者）。
     pub fn write(&self, f: impl FnOnce(&mut T)) {
         // 1. 增加序列号 (变为奇数)，表示正在写入
-        // 使用 Acquire 保证之前的读操作已经完成（虽然 SeqLock 不强制阻塞读，但需要内存屏障）
+        // Relaxed 即可，因为后续的 fence(Release) 会保证顺序
         let seq = self.seq.load(Ordering::Relaxed);
-        // 自旋等待（如果也是多写者，这里需要 CAS；如果是单写者，直接 store 即可）
-        // 假设单写者模型：
-        self.seq.store(seq + 1, Ordering::Release);
+        self.seq.store(seq + 1, Ordering::Relaxed);
 
-        // 2. 执行修改
+        // 2. 内存屏障：保证之前的写操作不会重排到 seq 更新之后
+        // 同时也保证后续的 data 修改不会重排到 seq 更新之前
+        fence(Ordering::Release);
+
+        // 3. 执行修改
         // SAFETY: 只有一个 writer，且 seq 为奇数时 reader 会重试
         f(unsafe { &mut *self.data.get() });
 
-        // 3. 增加序列号 (变为偶数)，表示写入完成
-        self.seq.store(seq + 2, Ordering::Release);
+        // 4. 内存屏障：保证 data 修改全部完成
+        fence(Ordering::Release);
+
+        // 5. 增加序列号 (变为偶数)，表示写入完成
+        self.seq.store(seq + 2, Ordering::Relaxed);
     }
 
     /// Reader: 乐观读取
-    pub fn read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+    pub fn read<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        // 1. 读取开始序列号
+        let seq1 = self.seq.load(Ordering::Acquire);
+        
+        // 如果 seq 是奇数，说明正在写，直接失败（或由调用者决定自旋）
+        if seq1 & 1 != 0 {
+            return None;
+        }
+
+        // 2. 执行读取
+        // 注意：这里必须防止编译器优化重排，但在 Rust 中闭包调用通常是无法跨越 fence 优化的
+        let result = f(unsafe { &*self.data.get() });
+
+        // 3. 内存屏障
+        // 关键！确保数据读取 (step 2) 发生在读取 seq2 (step 4) 之前。
+        // 如果没有这个 fence，CPU 或编译器可能会将 seq2 的读取提前到 data 读取之前，
+        // 导致我们读到了旧的 seq2，但读到了新的（不一致的）data。
+        fence(Ordering::Acquire);
+
+        // 4. 再次读取序列号
+        let seq2 = self.seq.load(Ordering::Relaxed);
+
+        // 5. 验证一致性
+        if seq1 == seq2 {
+            Some(result)
+        } else {
+            None
+        }
+    }
+    
+    /// Reader: 循环直到读取成功
+    pub fn read_loop<R>(&self, mut f: impl FnMut(&T) -> R) -> R {
         loop {
-            // 1. 读取开始序列号
-            let seq1 = self.seq.load(Ordering::Acquire);
-            
-            // 如果 seq 是奇数，说明正在写，自旋等待
-            if seq1 & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
+            if let Some(val) = self.read(&mut f) {
+                return val;
             }
-
-            // 2. 执行读取
-            let result = f(unsafe { &*self.data.get() });
-
-            // 3. 再次读取序列号 (内存屏障)
-            let seq2 = self.seq.load(Ordering::Acquire);
-
-            // 4. 验证一致性
-            if seq1 == seq2 {
-                return result;
-            }
-            // 否则重试
+            std::hint::spin_loop();
         }
     }
 }
 ```
 
-> **注意**: 在 Rust 中实现 SeqLock 需要非常小心内存顺序（Memory Ordering）。上面的实现是一个简化版。生产级实现需要考虑 `atomic::fence`。
+> **Why `fence(Ordering::Acquire)`?**: 在 x86 架构上，Load-Load 不会重排，所以可能不需要显式的 fence。但在 ARM (Apple Silicon) 等弱内存模型架构上，CPU 完全可能先加载 `seq2` 再加载 `data`。如果是这样，Reader 可能会看到一致的 `seq`（都是偶数 N），但读到的 `data` 却是 Writer 更新了一半的内容。`fence(Acquire)` 强制禁止这种重排。
 
 ## 3. 双缓冲 (Double Buffering)
 

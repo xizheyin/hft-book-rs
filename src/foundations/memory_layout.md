@@ -18,6 +18,18 @@ CPU 并不是按字节从内存读取数据，而是按块（Block）读取，�
 
 Rust 默认不保证结构体字段的内存顺序（除非使用 `#[repr(C)]`），编译器可能会重排字段以减少 padding。但在 HFT 中，我们需要精确控制。
 
+```mermaid
+graph LR
+    subgraph BadLayout [Bad Layout (Padding Waste)]
+        D1[id: 8B] --- D2[is_buy: 1B] --- D3[pad: 7B] --- D4[price: 8B]
+        style D3 fill:#f99,stroke:#333
+    end
+    subgraph GoodLayout [Good Layout (Compact)]
+        A1[id: 8B] --- A2[price: 8B] --- A3[is_buy: 1B] --- A4[pad: 0B]
+        style A4 fill:#dfd,stroke:#333
+    end
+```
+
 ### 2.1 填充与对齐 (Padding & Alignment)
 
 为了避免跨越缓存行边界（这会导致两次内存访问），我们需要对关键数据结构进行对齐。
