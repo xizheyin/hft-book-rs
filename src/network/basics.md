@@ -275,6 +275,15 @@ UDP 不保证顺序。你收到的包可能是：`Seq 1, Seq 3, Seq 2`。
     *   增大 OS 全局 UDP 缓冲区限制: `sysctl -w net.core.rmem_max=26214400` (25MB)
     *   代码中设置 Socket 选项: `socket.set_recv_buffer_size(26214400)`
 
+### 4.4 组播实战 (Multicast in Practice)
+
+在代码层面，加入组播组需要特殊的 Socket 选项：
+
+1.  **`IP_ADD_MEMBERSHIP`**: 告诉内核“我要订阅这个组播 IP (如 224.0.0.1)”。
+2.  **`SO_REUSEADDR`**: **必开**。允许多个进程（比如你的实盘程序和录制程序）同时绑定同一个端口接收同一份行情数据。
+3.  **`IP_MULTICAST_LOOP`**: 如果发送端和接收端在同一台机器上，是否允许回环。通常设为 0 (禁用)，防止自己收到自己发的数据。
+4.  **`IP_MULTICAST_IF`**: 指定从哪个网卡接口发送 IGMP 请求。如果不指定，内核可能默认走 eth0 (管理口)，导致你连不上位于 eth1 (光口) 的交易所网络。
+
 ## 5. 链路层与驱动优化 (L2/Driver Optimization)
 
 ### 5.1 MTU 与分片 (Fragmentation)

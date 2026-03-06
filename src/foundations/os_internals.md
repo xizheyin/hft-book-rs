@@ -106,6 +106,77 @@ Syscall 不仅仅是一个函数调用。它涉及：
 某些频繁调用的 Syscall（如 `gettimeofday`, `clock_gettime`）被优化了。内核将这些函数的实现映射到用户空间，使得调用它们就像调用普通函数一样，**无需陷入内核**。
 这就是为什么在 Rust 中调用 `Instant::now()` 非常快。
 
+### 3.3 锁的代价 (Cost of Locking): Mutex vs Spinlock
+
+在 HFT 面试中，这是必考题：**为什么我们要自己写 Spinlock 而不用 std::sync::Mutex？**
+
+*   **Mutex (互斥锁)**:
+    *   基于操作系统的 `futex` (Fast Userspace Mutex) 系统调用。
+    *   **快路径**: 如果没有竞争，它是用户态的原子操作（快）。
+    *   **慢路径**: 如果有竞争，线程会陷入内核（Syscall），进入睡眠状态（Context Switch）。
+    *   **唤醒**: 当锁释放时，内核唤醒线程（Context Switch）。
+    *   **总开销**: 竞争发生时，至少 5-10 微秒。
+
+*   **Spinlock (自旋锁)**:
+    *   基于 `Atomic` CAS (Compare-And-Swap) 操作。
+    *   **原理**: 线程在一个 `while` 循环中不断尝试获取锁，不让出 CPU。
+    *   **优点**: 没有系统调用，没有上下文切换。获取锁的延迟仅为几十纳秒（CAS 指令周期）。
+    *   **缺点**: 浪费 CPU 电力。如果持有锁的线程被切走（Preemption），等待者会空转很久（这也是为什么我们需要 `isolcpus`）。
+
+**HFT 结论**: 在关键路径上，我们**只使用 Spinlock**，且临界区（Critical Section）必须极短（几条指令）。
+
+### 3.4 实战：自旋锁 (Spinlock in Action)
+
+Spinlock 最常用于**多生产者-单消费者 (MPSC)** 或 **多生产者-多消费者 (MPMC)** 的队列尾部指针更新。虽然 Lock-free 结构更好，但有时简单的 Spinlock 更容易实现且性能足够。
+
+```rust
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::UnsafeCell;
+
+pub struct SpinLock<T> {
+    lock: AtomicBool,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Sync for SpinLock<T> {}
+
+impl<T> SpinLock<T> {
+    pub fn new(data: T) -> Self {
+        Self {
+            lock: AtomicBool::new(false),
+            data: UnsafeCell::new(data),
+        }
+    }
+
+    pub fn lock(&self) -> SpinLockGuard<T> {
+        // 1. 尝试获取锁
+        // compare_exchange_weak 在循环中通常比 strong 快
+        while self.lock.compare_exchange_weak(
+            false, 
+            true, 
+            Ordering::Acquire, 
+            Ordering::Relaxed
+        ).is_err() {
+            // 2. 关键优化：PAUSE 指令
+            // 告诉 CPU "我在忙等"，让 CPU 暂停流水线，降低功耗，避免内存顺序冲突
+            std::hint::spin_loop(); 
+        }
+        
+        SpinLockGuard { lock: self }
+    }
+}
+
+pub struct SpinLockGuard<'a, T> {
+    lock: &'a SpinLock<T>,
+}
+
+impl<'a, T> Drop for SpinLockGuard<'a, T> {
+    fn drop(&mut self) {
+        self.lock.lock.store(false, Ordering::Release);
+    }
+}
+```
+
 ## 4. 中断 (Interrupts)
 
 中断是 CPU 响应外部事件（如网卡数据到达、时钟滴答）的机制。对于 HFT 来说，中断是把双刃剑：它既是获取行情的源头，也是破坏确定性（Determinism）的元凶。
@@ -151,13 +222,91 @@ cat /proc/interrupts | grep eth0
 **解决方案**: **Kernel Bypass (内核旁路)**。
 使用 DPDK 或 OpenOnload，直接在用户态轮询（Polling）网卡，完全绕过内核中断机制。
 
-## 5. 总结 (Summary)
+## 5. 系统调优：消除抖动 (System Tuning: Eliminating Jitter)
+
+即使你写出了完美的代码，操作系统本身的行为（节能、调度）也会毁掉你的延迟。为了让 OS "滚一边去"，我们需要在启动参数 (`/etc/default/grub`) 中动手术。
+
+### 5.1 隔离与无滴答 (Isolation & Tickless)
+
+*   **`isolcpus=4-15`**: 将 CPU 4 到 15 从内核调度器中移除。普通进程（如 SSH、cron）永远不会被调度到这些核心上。只有你的 HFT 线程通过 `taskset` 显式绑定上去才能运行。
+*   **`nohz_full=4-15`**: **Tickless Kernel**。通常内核每秒会有 100-1000 次时钟中断（Tick）来检查任务调度。对于 HFT 核心，如果只运行一个任务，这个 Tick 是多余的且有害的。`nohz_full` 告诉内核：如果核心上只有一个任务，就别发 Tick 中断打扰它。
+*   **`rcu_nocbs=4-15`**: 将 RCU (Read-Copy-Update) 的回调处理移出这些核心。RCU 回调是内核中的垃圾回收机制，如果不移出，它会随机借用你的 CPU 时间。
+
+### 5.2 禁用节能 (Disable Power Management)
+
+CPU 在空闲时会进入 C-States (C1, C6...) 以省电。
+*   **代价**: 从 C6 (深度睡眠) 唤醒到 C0 (全速运行) 需要 **10-100 微秒**！
+*   **对策**:
+    *   `intel_idle.max_cstate=0`: 禁止进入深层睡眠。
+    *   `processor.max_cstate=1`: 限制最大睡眠深度为 C1 (Halt，唤醒极快)。
+    *   BIOS 设置: 关闭 Hyper-Threading (超线程)，关闭 Turbo Boost (睿频，导致时钟不稳定)，开启 "Performance Mode"。
+
+### 5.3 启动参数示例
+
+一个标准的 HFT 服务器内核启动参数如下：
+
+```bash
+GRUB_CMDLINE_LINUX="isolcpus=4-15 nohz_full=4-15 rcu_nocbs=4-15 intel_idle.max_cstate=0 processor.max_cstate=1 skew_tick=1 hugepages=1024"
+```
+
+## 6. 进阶话题 (Advanced Topics)
+
+### 6.1 I/O 模型进化论
+
+在 HFT 中，网络 I/O 是生命线。关于 I/O 模型的详细演进（从阻塞到非阻塞，再到多路复用），请参考 [I/O 模型演进](../network/io_models.md)。
+
+这里我们要强调的是：**标准的多路复用 (Epoll) 对于微秒级竞争来说仍然太慢**。
+
+*   **Epoll 的瓶颈**: 系统调用开销、内存拷贝、中断上下文切换。
+*   **HFT 的选择**: **忙轮询 (Busy Polling)**。通过用户态死循环检查数据，消除上下文切换。
+
+### 6.2 内核旁路 (Kernel Bypass)
+
+当 `epoll` 甚至 `busy poll` 都不够快时，瓶颈在于 Linux 内核本身（协议栈处理、内存拷贝）。
+
+关于 Kernel Bypass 的详细原理和实现（DPDK, OpenOnload），请参考 [内核旁路技术](../network/kernel_bypass.md)。
+
+*   **核心思想**: 让用户态程序直接控制网卡，绕过内核协议栈。
+*   **收益**: 延迟从 ~10us 降至 <1us。
+
+### 6.3 NUMA 架构 (Non-Uniform Memory Access)
+
+在双路（Dual Socket）服务器上，CPU 0 访问插在 CPU 1 旁边的内存，比访问本地内存要慢 20-50ns (QPI/UPI 总线开销)。
+
+**HFT 黄金法则**:
+*   **本地性**: 线程绑定在 CPU Node X，内存分配在 Node X，网卡插在 Node X 的 PCIe 插槽上。
+*   **工具**: 使用 `lscpu` 查看拓扑，使用 `numactl --cpunodebind=0 --membind=0 ./my_hft_app` 启动程序。
+
+### 6.4 实时调度 (Real-time Scheduling)
+
+虽然我们使用了 `isolcpus`，但为了双重保险，可以将线程调度策略设置为 `SCHED_FIFO`。
+
+```rust
+// 设置当前线程为实时优先级 99
+pub fn set_realtime_priority() {
+    let params = libc::sched_param { sched_priority: 99 };
+    unsafe {
+        libc::pthread_setschedparam(
+            libc::pthread_self(),
+            libc::SCHED_FIFO,
+            &params
+        );
+    }
+}
+```
+
+*   **注意**: 这是一个危险操作。如果你的线程死循环且没有让出 CPU，这台机器可能会死机（这也是为什么我们需要 `isolcpus`）。
+
+## 7. 总结 (Summary)
 
 1.  **预故障 (Pre-faulting)**: 初始化时摸一遍所有内存。
 2.  **内存锁定 (Mlock)**: 防止 Swap。
 3.  **大页 (Hugepages)**: 减少 TLB Miss。
 4.  **隔离核心 (Isolcpus)**: 避免 OS 调度干扰。
 5.  **中断绑定 (SMP Affinity)**: 避免中断打断关键线程。
+6.  **内核旁路 (Kernel Bypass)**: 绕过内核协议栈。
+7.  **NUMA 亲和性**: 保证内存和网卡在同一节点。
+
 
 掌握这些 OS 原理，是写出微秒级系统的入场券。
 

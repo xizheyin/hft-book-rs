@@ -48,3 +48,189 @@ CPU 是系统中最宝贵的资源，对其管理需要极度精细。
 ---
 
 > **后记**: 优化是没有尽头的。不要为了优化而优化，**Benchmark Everything**。数据不会骗人，直觉通常会。
+
+---
+
+## 6. HFT 面试技能矩阵 (The Skill Matrix)
+
+为了满足 "95% 头部高频量化" 的面试要求，除了操作系统、网络和并发基础（前三章）之外，你必须掌握以下进阶领域：
+
+### 6.1 计算机体系结构 (Computer Architecture)
+这是区分初级和高级开发者的分水岭。
+- **Cache Coherency**: MESI 协议，False Sharing 的底层原理，Store Buffer 与 Load Buffer 的作用。
+- **Memory Ordering**: 为什么需要 `std::sync::atomic::Ordering`？Acquire/Release 语义到底在 CPU 层面做了什么（内存屏障）？
+- **Branch Prediction**: 静态预测 vs 动态预测，如何写出对分支预测器友好的代码 (`if (unlikely(...))`)。
+
+### 6.2 交易协议与市场微结构 (Protocols & Microstructure)
+不懂业务的技术在 HFT 只是通用组件开发。
+- **交易所协议**:
+    - **文本协议**: FIX (Financial Information Exchange) —— 慢，由于 Tag=Value 解析开销。
+    - **二进制协议**: SBE (Simple Binary Encoding), OUCH, ITCH (纳斯达克数据协议)。
+    - **核心考点**: 如何编写零拷贝、零分配的协议解析器？(Rust `nom` vs 手写状态机)。
+- **订单簿 (Order Book)**:
+    - **L2 vs L3 数据**: 什么是快照 (Snapshot)？什么是增量 (Incremental)？
+    - **设计题**: 如何设计一个支持 O(1) 插入/取消/修改的 Limit Order Book？(通常使用 HashMap + Doubly Linked List)。
+
+### 6.3 低延迟编码实战 (Low Latency Coding)
+面试官通常会让你手写代码（白板或 CoderPad）。
+- **无锁队列 (Lock-free Queue)**:
+    - SPSC (Single Producer Single Consumer) Ring Buffer —— HFT 的基石。
+    - MPMC (Bounded Blocking Queue) —— 为什么 HFT 很少用 MPMC？(竞争太激烈)。
+- **内存管理**:
+    - **Object Pool**: 避免 `malloc`/`free`。
+    - **Arena Allocator**: 区域内存分配。
+- **热路径优化**:
+    - 如何消除虚函数调用 (Devirtualization)？(Rust `enum` vs `dyn Trait`)。
+    - SIMD 优化 (AVX2/AVX-512) 在行情处理中的应用。
+
+### 6.4 硬件与系统边界 (Hardware & System Boundaries)
+- **Kernel Bypass**: Userspace Networking (DPDK/Solarflare OpenOnload) 的原理。哪怕你不写，也要懂它为什么快（TLB Miss, Context Switch, Interrupts）。
+- **FPGA**: 只要了解它在 HFT 中的位置（行情解码、风控网关），知道软件与硬件的延迟数量级差异 (Software ~2-5us vs FPGA ~100-800ns)。
+- **Switching**: Cut-through vs Store-and-forward 交换机。
+
+### 6.5 C++ vs Rust (The Elephant in the Room)
+绝大多数 HFT 存量代码是 C++。
+- **对比**: Rust 的 Move Semantics 对应 C++ 的 `std::move`。
+- **内存模型**: Rust `Box` vs C++ `std::unique_ptr`。
+- **虚表**: Trait Objects vs Virtual Functions (vtable layout)。
+- **FFI**: 如何低开销地在 Rust 中调用 C++ 遗留库。
+
+---
+
+## 7. 核心面试题详解 (Deep Dive Q&A)
+
+这里挑选了 3 个最常考的 HFT 编码/设计题进行详解。
+
+### 7.1 设计一个 L3 Order Book (Limit Order Book)
+
+**题目**: 请设计一个支持 O(1) `Add`, `Cancel`, `Execute` 的限价订单簿。
+
+**分析**:
+- 仅仅使用 `Vec` 或 `BTreeMap` 是不够的。`BTreeMap` 查找是 O(log N)，而在 HFT 中我们需要 O(1)。
+- **标准解法**: `HashMap<OrderId, OrderNode>` + `BTreeMap<Price, LevelNode>` (或固定价格数组) + `Doubly Linked List` (在每个价格档位内)。
+
+**Rust 实现思路 (伪代码)**:
+
+```rust
+struct Order {
+    id: u64,
+    price: u64,
+    qty: u32,
+    // prev/next 指针用于链表
+    prev: Option<NonNull<Order>>,
+    next: Option<NonNull<Order>>,
+}
+
+struct PriceLevel {
+    price: u64,
+    head: Option<NonNull<Order>>,
+    tail: Option<NonNull<Order>>,
+}
+
+struct OrderBook {
+    // 快速查找订单，O(1) Cancel/Modify
+    orders: HashMap<u64, NonNull<Order>>,
+    // 维护价格优先，BTreeMap 或者对于固定价格步长用 Vec
+    levels: BTreeMap<u64, PriceLevel>,
+}
+
+impl OrderBook {
+    fn add_order(&mut self, order: Order) {
+        // 1. 插入 HashMap
+        // 2. 找到对应的 PriceLevel
+        // 3. 插入 PriceLevel 的链表尾部 (时间优先)
+    }
+
+    fn cancel_order(&mut self, order_id: u64) {
+        // 1. 从 HashMap 找到 Order 指针
+        // 2. 从链表中 O(1) 断开连接 (Unlink)
+        // 3. 如果 PriceLevel 空了，移除 PriceLevel
+        // 4. 移除 HashMap 条目
+    }
+}
+```
+
+> **面试加分项**: 提到使用 `Arena` 或 `Object Pool` 来分配 `Order` 节点，避免 `Box::new` 带来的内存碎片和分配开销。
+
+### 7.2 实现一个无锁 SPSC 队列
+
+**题目**: 手写一个单生产者单消费者 (Single Producer Single Consumer) 的 Ring Buffer。
+
+**关键点**:
+- 缓存行填充 (Padding) 避免 False Sharing。
+- `Acquire` / `Release` 内存序。
+- 只有 Producer 修改 `head`，只有 Consumer 修改 `tail`。
+
+**代码片段**:
+
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const CACHE_LINE: usize = 64;
+
+struct SpscRingBuffer<T, const N: usize> {
+    buffer: [Option<T>; N], // 实际应该用 UnsafeCell<MaybeUninit<T>>
+    
+    #[repr(align(64))] // 避免 head 和 tail 在同一缓存行
+    head: AtomicUsize, 
+    
+    #[repr(align(64))]
+    tail: AtomicUsize,
+}
+
+impl<T, const N: usize> SpscRingBuffer<T, N> {
+    pub fn push(&self, item: T) -> Result<(), T> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire); // 同步 Consumer 的修改
+        
+        if head.wrapping_sub(tail) >= N {
+            return Err(item); // Full
+        }
+        
+        // 写入数据 (伪代码，需 unsafe)
+        // self.buffer[head % N] = Some(item);
+        
+        // Release 语义保证 Consumer 能看到数据写入
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+        Ok(())
+    }
+
+    pub fn pop(&self) -> Option<T> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire); // 同步 Producer 的修改
+        
+        if tail == head {
+            return None; // Empty
+        }
+        
+        // 读取数据
+        // let item = self.buffer[tail % N].take();
+        
+        // Release 语义保证 Producer 能看到 slot 被释放
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        // return item
+        None 
+    }
+}
+```
+
+### 7.3 解释 False Sharing 及其修复
+
+**题目**: 什么是 False Sharing？在 Rust 中如何修复？
+
+**回答**:
+- **现象**: 两个线程分别修改两个独立的变量 `A` 和 `B`，但这俩变量恰好位于同一个 Cache Line (64字节) 中。
+- **后果**: Core 1 修改 `A` 会导致 Core 2 的 Cache Line 失效 (Invalidate)，Core 2 修改 `B` 又会导致 Core 1 失效。这种“乒乓效应”会导致严重的性能下降（可能慢 10-100 倍）。
+- **修复**: 使用 `#[repr(align(64))]` 强制对齐，或者在变量之间插入 Padding。
+
+```rust
+#[repr(align(64))]
+struct AlignedCounter {
+    value: AtomicUsize,
+}
+
+// 这样数组中的每个计数器都会独占一个 Cache Line
+let counters: Vec<AlignedCounter> = Vec::with_capacity(10);
+```
+
+

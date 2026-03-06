@@ -158,14 +158,106 @@ d = f + 1;
 
 在 HFT 代码中，我们有时会通过**打破依赖链**来提高指令级并行度 (ILP)。
 
-## 4. 超标量 (Superscalar)
+## 4. 超标量与流水线 (Superscalar & Pipeline)
 
-现代 CPU 核心通常有多个执行端口（Port）。例如，它可能有两个整数 ALU，两个浮点 FPU，两个加载/存储单元。
-这意味着，在理想情况下，CPU 一个周期可以同时发射并执行 4-6 条指令！
+很多初学者容易混淆“流水线”和“超标量”这两个概念。它们是 CPU 提升性能的两个不同维度：
+
+### 4.1 纵向 vs 横向
+
+*   **流水线 (Pipelining) —— 纵向切分 (Temporal Parallelism)**
+    *   **原理**: 将一条指令的执行过程拆分成多个阶段（如 5 级：取指、译码、执行...）。
+    *   **效果**: 让 CPU 可以同时处理多条处于**不同阶段**的指令。
+    *   **类比**: 工厂的**装配线**。甲在装轮胎，乙在装引擎，丙在喷漆。虽然造一辆车还是要很久，但每分钟都能下线一辆车。
+    *   **瓶颈**: 最多只能达到 IPC (Instructions Per Cycle) = 1。即每个周期完成 1 条指令。
+
+*   **超标量 (Superscalar) —— 横向扩展 (Spatial Parallelism)**
+    *   **原理**: 在同一个阶段（主要是**执行阶段**）复制多份硬件资源。
+    *   **硬件**: 现代 CPU 核心通常有多个执行端口（Port）。例如，它可能有两个整数 ALU，两个浮点 FPU，两个加载/存储单元。
+    *   **效果**: CPU 一个周期可以同时发射并执行 4-6 条指令！
+    *   **类比**: 工厂开了**多条装配线**。现在有 3 个甲同时装轮胎，3 个乙同时装引擎。
+    *   **突破**: 打破了 IPC = 1 的限制，理论上 IPC 可以达到 4 甚至更高。
+
+### 4.2 为什么 SIMD 和循环展开有效？
 
 这就是为什么 SIMD（单指令多数据）和循环展开（Loop Unrolling）如此有效——它们喂饱了 CPU 的所有执行单元。
 
-## 5. 总结
+*   **循环展开**: 
+    ```rust
+    // 普通循环：每次迭代只有 1 次加法，由于数据依赖，可能只能用 1 个 ALU
+    for i in 0..n { acc += data[i]; }
+
+    // 展开循环：打破依赖链，让 CPU 可以同时用 4 个 ALU 计算 acc1, acc2, acc3, acc4
+    for i in (0..n).step_by(4) {
+        acc1 += data[i];
+        acc2 += data[i+1];
+        acc3 += data[i+2];
+        acc4 += data[i+3];
+    }
+    ```
+    如果不展开，CPU 的其他 ALU 就在“摸鱼”。展开后，超标量架构才能火力全开。
+
+## 5. 计时的真相：TSC (Time Stamp Counter)
+
+在 HFT 中，我们需要测量纳秒级的代码执行时间。标准的 `std::time::Instant::now()` 虽然方便，但它是通过 vDSO 调用 `clock_gettime` 实现的，开销在 20-50ns 左右。对于一段执行时间只有 100ns 的代码，这误差太大了。
+
+### 5.1 RDTSC 指令
+
+x86 CPU 提供了一个寄存器 **TSC (Time Stamp Counter)**，它记录了 CPU 上电以来的时钟周期数。
+
+*   **指令**: `rdtsc` (Read Time-Stamp Counter)。
+*   **开销**: 约 20-30 个 **时钟周期** (Cycles)，即 **6-10 纳秒** (ns)。
+    *   (假设 CPU 主频 3.0GHz，1 ns ≈ 3 cycles)
+*   **精度**: 绝对的 CPU 周期级精度。
+
+```rust
+#[cfg(target_arch = "x86_64")]
+pub fn rdtsc() -> u64 {
+    unsafe {
+        use std::arch::x86_64::_rdtsc;
+        _rdtsc()
+    }
+}
+```
+
+#### 如何转换为纳秒 (ns)？
+
+TSC 得到的是**周期数**，要转换成时间，必须除以 CPU 的**标称频率 (Base Frequency)**。
+
+1.  **获取频率**: 在 Linux 上，读取 `/proc/cpuinfo` 中的 `tsc_khz`，或者在程序启动时测量一次（Sleep 1秒，看 TSC 增加了多少）。
+2.  **转换公式**: `ns = (end_tsc - start_tsc) * 1_000_000_000 / frequency_hz`。
+    *   **优化**: 除法太慢（~20-50 cycles）。在 HFT 中，我们将除法转换为乘法：`ns = delta_tsc * mult_factor >> shift`。
+
+#### 如何处理指令开销？
+
+`rdtsc` 本身也有开销（约 20-30 周期）。如果你的代码段非常短（例如只有 50 周期），那么测量误差高达 50%。
+
+**处理方法**:
+1.  **空跑校准 (Calibration)**: 测量连续执行两次 `rdtsc` 的差值，作为基准开销。
+2.  **减去开销**: `duration = (end - start) - overhead`。
+
+```rust
+pub fn measure_overhead() -> u64 {
+    let start = rdtsc();
+    let end = rdtsc();
+    end - start // 这就是测量本身的开销
+}
+```
+
+### 5.2 陷阱：乱序执行与 RDTSCP
+
+由于 CPU 是乱序执行的，`rdtsc` 可能会被重排到你想要测量的代码块**中间**甚至**后面**执行！
+
+*   **解决方案**: 使用 `rdtscp` 指令。它是一个**序列化 (Serializing)** 指令，保证它前面的所有指令都执行完才读取 TSC。或者在 `rdtsc` 前后加内存屏障 (`lfence` / `mfence`)。
+
+### 5.3 陷阱：变频与 Invariant TSC
+
+早期的 CPU 在降频（节能）时，TSC 也会变慢。这意味着你无法用 TSC 来计算真实时间。
+现代 CPU（Nehalem 之后）都有 **Invariant TSC**（恒定 TSC），即使 CPU 降频或休眠，TSC 依然以标称频率（如 3.0GHz）稳定增加。
+
+> **面试题**: "如何在 Rust 中实现一个开销小于 10ns 的计时器？"
+> **答案**: "直接封装 `_rdtsc` intrinsic，并在启动时通过 `cpuid` 检查 `invariant_tsc` 标志位，计算出 TSC 频率作为转换因子。"
+
+## 6. 总结
 
 编写低延迟代码不仅仅是写出逻辑正确的代码，更是要写出**对 CPU 友好**的代码：
 

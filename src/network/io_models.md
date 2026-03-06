@@ -107,17 +107,67 @@ Linux 2.6 引入的革命性技术。它是 **O(1)** 的。
     - **高效**：减少了系统调用次数。
     - **危险**：必须配合非阻塞 I/O 循环读取，直到 `EWOULDBLOCK`。
 
-## 5. 为什么 HFT 还需要超越 Epoll？
+## 5. 模型对比与优劣分析 (Comparison & Trade-offs)
 
-虽然 `epoll` 已经非常高效（Nginx, Redis, Netty 都基于它），但在微秒级竞争中，它仍有瓶颈：
+我们将从机制、开销和适用场景三个维度，对比这几种主流 I/O 模型。
 
-1.  **系统调用开销**：`epoll_wait` 是系统调用。从用户态切换到内核态，再切换回来，至少需要几百纳秒甚至 1 微秒。如果每秒处理 100 万个包，光是系统调用的开销就占满了 CPU。
-2.  **内存拷贝**：数据依然需要从内核缓冲区 `copy` 到用户缓冲区。
-3.  **中断风暴**：高吞吐量下，网卡频繁中断 CPU，导致上下文切换频繁。
+| 特性 | Blocking I/O | Non-blocking I/O | I/O Multiplexing (Epoll) | Asynchronous I/O (io_uring) | Kernel Bypass (DPDK) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **系统调用 (Syscall)** | 每次读写 1 次 (阻塞) | 每次读写 1 次 (可能空转) | `epoll_wait` + `read/write` (至少 2 次) | **0 次** (SQPOLL模式) 或 1 次 (Batch) | **0 次** (完全接管网卡) |
+| **数据拷贝** | 内核 -> 用户 (1次) | 内核 -> 用户 (1次) | 内核 -> 用户 (1次) | 内核 -> 用户 (1次, 异步) 或 **0次** (Zero-Copy) | **0 次** (DMA 直接到用户空间) |
+| **CPU 开销** | 线程挂起/唤醒 (高) | 忙轮询 (极高) | 中等 (红黑树维护 +就绪链表) | **极低** (共享内存 + 内核线程轮询) | **独占核心** (Spin 100%) |
+| **编程复杂度** | 低 (同步代码) | 中 (需处理 `EWOULDBLOCK`) | 高 (Reactor 模式, 回调) | **极高** (Proactor 模式, 内存安全挑战) | **地狱级** (驱动管理, 协议栈自研) |
+| **适用场景** | 简单客户端, 低并发 | 极低延迟单连接 (Spin) | **高并发通用网关 (Nginx, Redis)** | **超高并发 / 磁盘 I/O / HFT 日志** | **极致低延迟 (HFT 核心网关)** |
 
-为了解决这些问题，我们引入了 **Kernel Bypass** 技术（DPDK, OpenOnload）和新一代异步 I/O 接口 **io_uring**。
+### 5.1 为什么 Epoll 是当前主流？
+`epoll` (Reactor 模型) 统治了过去 20 年的高性能网络编程。
+- **成熟稳定**: 经过了无数生产环境验证 (Linux Kernel 2.6+)。
+- **兼容性好**: 几乎所有语言的标准库都封装了它 (Rust `mio`, Go Netpoller, Java NIO)。
+- **性能足够**: 对于 99% 的应用（Web Server, Database），`epoll` 的开销完全可以接受。
 
-- **io_uring**: 允许用户态和内核态通过共享内存环形队列提交和完成任务，批量处理系统调用，甚至实现零系统调用（Polled Mode）。
-- **Kernel Bypass**: 完全绕过内核，用户态程序直接接管网卡，实现真正的零拷贝和零中断。
+### 5.2 为什么 HFT 需要超越 Epoll？
+但在微秒级竞争中，`epoll` 仍有瓶颈：
+1.  **系统调用开销**: `epoll_wait` 是系统调用。从用户态切换到内核态，再切换回来，至少需要几百纳秒。如果每秒处理 100 万个包，光是系统调用的开销就占满了 CPU。
+2.  **双次调用**: 必须先 `wait` (通知) 再 `read` (数据搬运)。这导致了**两次**用户态/内核态切换。
+3.  **内存拷贝**: 数据依然需要从内核缓冲区 `copy` 到用户缓冲区。
+
+### 5.3 下一代：io_uring 与 Kernel Bypass
+为了解决这些问题，我们引入了两种技术路线：
+1.  **io_uring (Proactor)**: 
+    - **合并调用**: `wait` 和 `read` 合并为一步（提交请求 -> 内核完成后通知）。
+    - **共享内存**: 通过 SQ/CQ 环形队列，实现用户态和内核态的零拷贝通信。
+    - **Polling**: 内核线程主动轮询，消灭系统调用。
+2.  **Kernel Bypass (DPDK/OpenOnload)**: 
+    - **完全绕过内核**: 用户态程序直接接管网卡，实现真正的零拷贝和零中断。
+    - **极致低延迟**: 但开发难度极大，且不仅限于 Linux 兼容性。
+
+### 5.4 Rust 生态现状 (Ecosystem Status)
+
+知道原理后，我们来看看在 Rust 中可以直接使用哪些库。
+
+#### 1. Epoll (Reactor)
+- **[mio](https://github.com/tokio-rs/mio)**: Rust 异步生态的基石。它是一个轻量级的系统调用封装，统一了 Linux (epoll), macOS (kqueue), Windows (IOCP)。几乎所有上层 Runtime (Tokio, async-std) 都基于它。
+- **[tokio](https://github.com/tokio-rs/tokio)**: 工业级标准。基于 `mio`，提供了 Work-stealing 调度器。
+  - **评价**: 极其稳定，生态最丰富。但在超高并发下，Work-stealing 带来的跨核通信开销可能会成为瓶颈（相比于 Thread-per-core）。
+
+#### 2. io_uring (Proactor)
+- **[io-uring](https://github.com/tokio-rs/io-uring)**: `tokio` 团队维护的底层 Bindings。
+  - **评价**: 非常 Raw，全是 `unsafe`。它只提供了像 C 语言一样的基础接口（Submission Queue/Completion Queue 操作）。如果你要极致性能，就用这个自己造轮子。
+- **[glommio](https://github.com/DataDog/glommio)**: DataDog 开源。基于 `io_uring` 的 Thread-per-core 架构（类似 C++ Seastar）。
+  - **评价**: 专为 NVMe 磁盘 I/O 和高吞吐网络设计。没有跨核开销，但不仅限于较新的 Linux 内核。
+- **[monoio](https://github.com/bytedance/monoio)**: 字节跳动开源。也是 Thread-per-core 设计。
+  - **评价**: 性能通常优于 Tokio。支持 `io_uring` 和 `epoll` 双驱动切换。
+
+#### 3. Kernel Bypass (DPDK / AF_XDP)
+- **[dpdk-rs](https://crates.io/crates/dpdk-rs)**: 仅仅是 `bindgen` 生成的 C 接口绑定。
+  - **评价**: **极难使用**。你必须写大量 `unsafe` 代码来管理 mbuf 内存池、PCIe 设备初始化。目前 Rust 社区缺乏像 C++ `SPDK` 那样成熟的高级封装。
+- **AF_XDP (XDP Socket)**: Linux 内核提供的原生 Bypass 方案（比 DPDK 稍微慢一点点，但更安全）。
+  - **库**: 通常结合 eBPF 库（如 **[aya](https://github.com/aya-rs/aya)**）使用。
+  - **评价**: 这是 Rust 更有潜力的方向。不需要像 DPDK 那样接管整个网卡硬件，能与内核协议栈共存。
+
+**HFT 选型建议**:
+- **交易执行 (Execution)**: 流量不大但要求极低延迟 -> **io_uring (Raw)** 或 **AF_XDP**。
+- **行情数据 (Market Data)**: 吞吐量巨大 -> **DPDK (C FFI)** 或 **io_uring (Multishot)**。
+- **通用网关**: -> **Tokio** (不要过早优化)。
 
 下一章，我们将深入探讨 **io_uring**。

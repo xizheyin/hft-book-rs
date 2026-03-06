@@ -11,8 +11,89 @@ CPU 并不是按字节从内存读取数据，而是按块（Block）读取，�
 
 这意味着，当你访问结构体的一个字段时，CPU 会将该字段周围的 64 字节一并加载到 L1 Cache 中。利用这一特性，我们可以极大提升数据访问效率（Spatial Locality）。
 
-### 1.2 伪共享 (False Sharing)
-当两个线程分别修改位于同一个缓存行中的不同变量时，尽管逻辑上它们互不干扰，但在硬件层面，这两个变量所在的缓存行会不断在两个核心的私有 L1 Cache 之间来回失效和传输。这种现象称为伪共享，会导致严重的性能下降。
+### 1.2 MESI 协议与伪共享 (MESI & False Sharing)
+
+要理解为什么"内存布局决定性能"，必须理解 CPU 核心之间是如何保持缓存一致性的。
+
+#### 1.2.1 MESI 协议
+CPU 核心之间通过 **MESI 协议** 来保证缓存一致性。每个 Cache Line (通常 64 字节) 有四种状态：
+*   **M (Modified)**: 已修改。脏数据，独占。**这是唯一允许写入的状态。**
+*   **E (Exclusive)**: 独占。干净数据，只有我有。
+*   **S (Shared)**: 共享。干净数据，大家都有。
+*   **I (Invalid)**: 无效。我的数据过期了。
+
+**状态流转示例 (MESI Transitions)**:
+
+假设有两个核心 Core A 和 Core B，操作同一个变量 `X`。
+
+1.  **Read Miss (A 读取 X)**:
+    *   A 向总线发起 Read 请求。
+    *   内存返回 X。
+    *   A 将 X 放入 Cache，状态设为 **E (Exclusive)**。
+
+2.  **Remote Read (B 读取 X)**:
+    *   B 向总线发起 Read 请求。
+    *   A 监听到请求，将自己的状态降级为 **S (Shared)**，并将数据发给 B。
+    *   B 将 X 放入 Cache，状态设为 **S (Shared)**。
+    *   此时 A 和 B 都有 X 的副本，且都是干净的。
+
+3.  **Local Write (A 写入 X)**:
+    *   A 想要写入，必须获得独占权。
+    *   A 向总线广播 **Read-For-Ownership (RFO)** 或 **Invalidate** 消息。
+    *   B 收到消息，将自己的 X 标记为 **I (Invalid)**，并回复确认。
+    *   A 收到所有确认后，将状态升级为 **M (Modified)**，然后写入新值。
+    *   **代价**: 这个广播-等待确认的过程（RFO）非常慢，因为需要跨核心通信。
+
+4.  **Remote Read after Write (B 再次读取 X)**:
+    *   B 发现自己的 X 是 I (无效)，发起 Read 请求。
+    *   A 监听到请求，必须先把修改后的脏数据 **写回内存 (Write Back)** 或者直接 **转发 (Cache-to-Cache Transfer)** 给 B。
+    *   A 降级为 S，B 变为 S。
+
+> **HFT 启示**: **写操作不仅慢在写入本身，更慢在它需要"杀死"其他所有人的缓存副本。** 如果多个核心频繁争抢写入同一个变量（如 `Arc<Mutex<T>>` 或 `AtomicU64`），总线就会被 RFO 消息塞满，导致严重的 **Ping-Pong Effect**。
+
+#### 1.2.2 伪共享 (False Sharing)
+这是多核编程中最隐蔽的性能杀手。
+
+**场景**:
+*   变量 `A` 和变量 `B` 在内存中紧挨着（例如在一个结构体里）。
+*   它们虽然逻辑上无关，但物理上正好落在**同一个 Cache Line (64B)** 里。
+*   线程 1 频繁修改 `A`。
+*   线程 2 频繁修改 `B`。
+
+**后果**:
+1.  线程 1 写 `A` -> 抢占 Cache Line -> 踢掉线程 2 的 Cache。
+2.  线程 2 写 `B` -> 抢占 Cache Line -> 踢掉线程 1 的 Cache。
+3.  **Ping-Pong Effect**: Cache Line 在两个核心之间疯狂跳来跳去，导致总线拥塞，性能比单线程还差。
+
+### 1.3 Rust 中的解决方案：Padding
+我们需要通过 **Padding (填充)** 强行把 `A` 和 `B` 隔开，确保它们分别处于不同的 Cache Line。
+
+#### 方案 A: 使用 `#[repr(align(N))]`
+```rust
+#[repr(align(64))] // 强行对齐到 64 字节边界
+struct AlignedCounter {
+    value: std::sync::atomic::AtomicU64,
+}
+// 这样数组中的每个元素都会独占一个 Cache Line
+// let counters: [AlignedCounter; 16]; 
+```
+
+#### 方案 B: 使用 `crossbeam::utils::CachePadded`
+这是社区的标准做法，自动适配不同架构的 Cache Line 大小。
+
+```rust
+use crossbeam::utils::CachePadded;
+use std::sync::atomic::AtomicU64;
+
+struct SharedState {
+    // 读写分离：读者只读 head，写者只写 tail
+    // 如果不隔离，写者修改 tail 会导致读者读取 head 变慢（因为在同一 Cache Line）
+    head: CachePadded<AtomicU64>,
+    tail: CachePadded<AtomicU64>,
+}
+```
+
+> **HFT 黄金法则**: 永远不要让两个频繁竞争的变量处于同一个 Cache Line。特别是 SPSC 队列的 `head` 和 `tail` 指针，必须隔离。
 
 ## 2. 核心实现：控制结构体布局 (Struct Layout)
 
