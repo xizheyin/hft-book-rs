@@ -77,5 +77,4 @@
 # 附录
 - [推荐阅读](appendix/reading.md)
 - [开源项目资源](appendix/resources.md)
-- [HFT 面试宝典 (Interview Guide)](appendix/interview.md)
 - [Rust HFT 核心速查表 (Cheat Sheet)](appendix/cheat_sheet.md)

@@ -4,8 +4,11 @@ language = "zh-CN"
 src = "src"
 title = "Rust 高频交易：从基础到实战 (HFT in Rust)"
 
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
 [output.html]
-additional-css = ["theme/custom.css", "theme/mermaid.css"]
-additional-js = ["theme/custom.js", "theme/mermaid.min.js", "theme/mermaid-init.js"]
+additional-css = ["theme/custom.css"]
+additional-js = ["theme/custom.js", "mermaid.min.js", "mermaid-init.js"]
 git-repository-url = "https://github.com/yxz/hft-book-rs"
 edit-url-template = "https://github.com/yxz/hft-book-rs/edit/main/{path}"
