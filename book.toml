@@ -8,6 +8,7 @@ title = "Rust 高频交易：从基础到实战 (HFT in Rust)"
 command = "mdbook-mermaid"
 
 [output.html]
+site-url = "/hft-book-rs/"
 additional-css = ["theme/custom.css"]
 additional-js = ["theme/custom.js", "mermaid.min.js", "mermaid-init.js"]
 git-repository-url = "https://github.com/yxz/hft-book-rs"
