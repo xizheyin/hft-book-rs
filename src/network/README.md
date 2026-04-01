@@ -1,35 +1,41 @@
-# 网络篇 (Network)
+# 第四部分：网络与高性能 I/O (Network & I/O)
 
-在 HFT 系统中，网络不仅仅是传输数据的管道，它是战场的最前线。
-当你在交易所的撮合引擎收到成交确认时，实际上你已经比竞争对手慢了几微秒。真正的竞争发生在你按下“发送”按钮的那一刻，甚至更早——发生在你的网卡收到行情数据的那一纳秒。
+本部分讨论数据如何进入系统，以及 I/O 栈如何影响延迟分布。对低延迟应用而言，网络并不是一个抽象的“传输层”，而是一条由网卡、中断、驱动、内核协议栈、系统调用和用户态缓冲区共同组成的执行路径。
 
-本章将带你深入 Linux 网络栈的深渊，并教你如何绕过它。
+理解这条路径的意义在于：很多时候，程序的瓶颈并不来自业务逻辑，而来自数据在不同保护域和不同缓存层次之间的移动成本。
 
 ## 章节概览
 
-1.  **[内核旁路技术 (Kernel Bypass)](kernel_bypass.md)**
-    *   为什么 `epoll` 还不够快？
-    *   用户态网络栈原理 (DPDK, Solarflare OpenOnload)。
-    *   如何让 Rust 代码直接与网卡对话。
+1.  **[网络协议栈基础 (Network Stack Basics)](basics.md)**
+    *   网络设备、中断、驱动与内核协议栈的关系。
+    *   用户态程序如何与内核态 I/O 路径交互。
 
-2.  **[TCP 协议优化 (TCP Optimization)](tcp_optimization.md)**
-    *   Nagle 算法与 Delayed ACK 的致命组合。
-    *   Socket 缓冲区调优。
+2.  **[I/O 模型演进 (Evolution of I/O Models)](io_models.md)**
+    *   阻塞 I/O、非阻塞 I/O、复用与异步 I/O 的差异。
+    *   吞吐优先与低延迟优先模型的权衡。
+
+3.  **[TCP 协议优化 (TCP Optimization)](tcp_optimization.md)**
+    *   Nagle 算法、Delayed ACK 与缓冲区调优。
     *   Busy Polling 与低延迟读写。
 
-3.  **[UDP 多播处理 (UDP Multicast)](udp_multicast.md)**
-    *   处理交易所的高速行情数据流 (Market Data Feed)。
-    *   多播组管理与 IGMP。
-    *   丢包检测与 A/B 通道仲裁。
+4.  **[UDP 多播处理 (UDP Multicast)](udp_multicast.md)**
+    *   多播组管理、丢包检测与恢复策略。
+    *   高速消息流的接收与分发。
 
-4.  **[FPGA 互联 (FPGA Interconnect)](fpga.md)**
-    *   (高级话题) 当软件已经达到物理极限，如何与 FPGA 协同工作。
+5.  **[io_uring 深度解析](io_uring.md)**
+    *   提交队列、完成队列与系统调用折叠。
+    *   批处理、注册缓冲区与用户态驱动边界。
+
+6.  **[内核旁路技术 (Kernel Bypass)](kernel_bypass.md)**
+    *   为什么 `epoll` 在某些负载下仍然不够快。
+    *   DPDK、AF_XDP、OpenOnload 的适用边界。
+
+7.  **[Linux 网络调优](tuning.md)**
+    *   网卡队列、中断亲和性、内核参数与系统噪声控制。
 
 ## 关键指标
 
 在网络编程中，我们关注两个核心指标：
 
-- **RTT (Round Trip Time)**: 往返时延。对于同城交易所，这通常在 100µs - 2ms 之间。
-- **Jitter (抖动)**: 延迟的标准差。在 HFT 中，抖动比平均延迟更可怕。我们追求的是**确定性的低延迟**。
-
-准备好抛弃 `std::net::TcpStream` 了吗？让我们开始吧。
+- **RTT (Round Trip Time)**: 往返时延，用于衡量端到端传输成本。
+- **Jitter (抖动)**: 延迟的波动程度。对低延迟系统而言，抖动往往比平均值更值得关注。

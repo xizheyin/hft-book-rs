@@ -1,8 +1,8 @@
-# HFT 生态概览 (Ecosystem)
+# 低延迟系统 Rust 生态概览 (Ecosystem)
 
-Rust 的高性能生态正在飞速发展。虽然不如 C++ 成熟，但在某些细分领域（如安全性、构建工具、包管理）已经超越了 C++。
+Rust 的高性能生态正在持续成熟。虽然它在某些传统系统软件领域仍不如 C++ 积累深厚，但在安全性、构建工具、依赖管理与库设计一致性方面，已经形成了鲜明优势。
 
-以下是构建 HFT 系统时不可或缺的 Rust 库（Crates）：
+以下是构建低延迟系统时经常会接触到的一组 Rust 库（Crates）：
 
 ## 1. 并发与底层优化
 *   **[crossbeam](https://github.com/crossbeam-rs/crossbeam)**: 提供了无锁队列（ArrayQueue, SegQueue）、Epoch-based 内存回收、Cache-padded 原子类型等。这是 HFT 的基石。

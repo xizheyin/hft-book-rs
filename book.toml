@@ -2,7 +2,7 @@
 authors = ["HFT Engineer"]
 language = "zh-CN"
 src = "src"
-title = "Rust 高频交易：从基础到实战 (HFT in Rust)"
+title = "Effective Rust：面向低延迟系统的设计与实战"
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"

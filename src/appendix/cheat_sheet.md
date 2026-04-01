@@ -1,10 +1,10 @@
-# Rust HFT 核心速查表 (Cheat Sheet)
+# Rust 低延迟开发速查表 (Cheat Sheet)
 
-这张表是为那些需要在高压环境下快速回忆 Rust 性能特性和陷阱的开发者准备的。
+这张表用于快速回顾 Rust 在低延迟开发中的常见性能特性、抽象代价与工程陷阱。
 
 ## 1. 内存与缓存 (Memory & Cache)
 
-| 概念 | 关键点 | HFT 最佳实践 |
+| 概念 | 关键点 | 低延迟场景建议 |
 | :--- | :--- | :--- |
 | **Cache Line** | 通常 64 字节。CPU 按块读取。 | 永远不要跨 Cache Line 访问原子变量。 |
 | **False Sharing** | 多核写同一 Cache Line 的不同变量。 | 使用 `#[repr(align(64))]` 或 `crossbeam::utils::CachePadded` 隔离热点变量。 |
@@ -13,7 +13,7 @@
 
 ## 2. 智能指针与容器 (Pointers & Containers)
 
-| 类型 | 开销 (Overhead) | HFT 场景建议 |
+| 类型 | 开销 (Overhead) | 低延迟场景建议 |
 | :--- | :--- | :--- |
 | **`Box<T>`** | 堆分配 (`malloc`) + 指针间接访问。 | **热路径严禁使用**。仅在启动时或冷路径使用。 |
 | **`Rc<T>`** | 堆分配 + 非原子计数器。 | **!Send, !Sync**。单线程共享只读数据可用，但要注意 Cache 不友好。 |
