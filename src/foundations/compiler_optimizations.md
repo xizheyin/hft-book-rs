@@ -44,11 +44,23 @@ LLVM IR 是通用优化平台。内联、循环不变量外提、自动向量化
 DCE 会移除结果不可观测的计算和永远不会执行的分支。一个实用技巧是把“开关逻辑”尽可能前移到编译期，典型做法是 `const` 泛型或常量条件，这样无效分支在产物中直接消失，而不是在运行时判断。
 
 ```rust
-fn process<const CHECK: bool>(data: i32) {
+fn heavy_validation(data: i32) {
+    assert!(data >= 0, "data must not be negative");
+}
+
+fn fast_path(data: i32) -> i32 {
+    data * 2
+}
+
+fn process<const CHECK: bool>(data: i32) -> i32 {
     if CHECK {
         heavy_validation(data);
     }
-    fast_path(data);
+    fast_path(data)
+}
+
+fn main() {
+    assert_eq!(process::<false>(21), 42);
 }
 ```
 
@@ -73,12 +85,25 @@ fn process<const CHECK: bool>(data: i32) {
 边界检查不是“坏事”，它是安全保证。性能关键在于让检查次数可控。一般来说，迭代器写法和先切片后访问更容易让优化器把检查收敛到更少位置。
 
 ```rust
-for item in vec.iter() {
-    process(item);
+fn process(item: &u64) -> u64 {
+    item + 1
 }
 
-let head = &vec[..4];
-consume(head);
+fn consume(items: &[u64]) -> u64 {
+    items.iter().sum()
+}
+
+fn main() {
+    let values = vec![10, 20, 30, 40, 50];
+
+    let processed_sum: u64 = values.iter().map(process).sum();
+    assert_eq!(processed_sum, 155);
+
+    // 已知 values 至少有 4 项时，切片边界只需在入口处确认一次。
+    assert!(values.len() >= 4);
+    let head = &values[..4];
+    assert_eq!(consume(head), 100);
+}
 ```
 
 工程上应优先选择语义清晰写法，而不是盲目追求索引式循环。很多情况下，可读性更高的写法反而更容易被优化。

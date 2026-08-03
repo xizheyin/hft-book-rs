@@ -1,266 +1,445 @@
 # Ring Buffer 实现 (Ring Buffer)
 
-Ring Buffer (环形缓冲区) 是 HFT 系统中最基础、最重要的数据结构。几乎所有的高频交易系统，从 LMAX Disruptor 到 Aeron，其核心都是一个 Ring Buffer。
+Ring Buffer（环形缓冲区）是低延迟系统最常用的数据结构之一。它的价值不只是“首尾相接”，而是把三个目标放在一起：**启动时预分配、运行时复用固定槽位、用清晰的所有权协议完成跨线程传递**。
 
-它不仅仅是一个队列，更是一种设计哲学：**预分配内存**、**无锁并发**、**缓存友好**。
+本章先建立直觉，再实现一个真正由类型系统约束“单生产者、单消费者”的 SPSC 队列。代码中的 `unsafe` 不是为了炫技，而是为了把必须证明的安全不变量集中在一个很小的边界里。
 
-## 1. 理论背景 (Theory & Context)
-
-### 1.1 为什么要用 Ring Buffer？
-
-Ring Buffer (环形缓冲区) 是 HFT 系统中最基础、最重要的数据结构。几乎所有的高频交易系统，从 LMAX Disruptor 到 Aeron，其核心都是一个 Ring Buffer。
+## 1. 为什么 Ring Buffer 适合 HFT
 
 ```mermaid
-graph TD
-    subgraph Memory Layout
-        Head[Head (Producer)]
-        Tail[Tail (Consumer)]
-        
-        subgraph Buffer [Circular Buffer]
-            S0[Slot 0]
-            S1[Slot 1]
-            S2[Slot 2 (Writing)]
-            S3[Slot 3]
-            S4[Slot 4 (Reading)]
-            S5[Slot 5]
-        end
-    end
-    
-    Head -->|Write Index| S2
-    Tail -->|Read Index| S4
-    
-    style Head fill:#f96,stroke:#333
-    style Tail fill:#9cf,stroke:#333
-    style S2 fill:#f96,stroke:#333
-    style S4 fill:#9cf,stroke:#333
+flowchart LR
+    P["Producer<br/>只写 head"] --> S2["slot 2<br/>正在写"]
+    S0["slot 0"] --- S1["slot 1"] --- S2 --- S3["slot 3"] --- S4["slot 4<br/>正在读"] --- S5["slot 5"]
+    S4 --> C["Consumer<br/>只写 tail"]
+    S5 -.回绕.-> S0
 ```
 
-1.  **零内存分配 (Zero Allocation)**: 在启动时分配一块固定大小的内存，运行过程中不再进行任何 `malloc` 或 `free`。这消除了 GC 压力和内存碎片。
-2.  **缓存局部性 (Cache Locality)**: 数组在内存中是连续的，CPU 预取器 (Prefetcher) 可以完美工作。
-3.  **避免伪共享 (False Sharing)**: 通过精心设计的填充 (Padding)，确保生产者和消费者的指针位于不同的缓存行。
+### 1.1 三个直接收益
 
-### 1.2 模运算优化
-Ring Buffer 本质上是一个数组，索引会回绕。
-通常写法：`index = sequence % capacity`。
-但除法（取模）运算在 CPU 中非常昂贵（几十个周期）。
+1. **固定容量**：缓冲区在启动时一次性分配，热路径不再扩容；
+2. **缓存友好**：槽位连续，顺序访问更容易命中缓存和硬件预取；
+3. **天然背压信号**：满时必须明确选择拒绝、丢弃、降级或等待，不会悄悄把延迟变成无限内存。
 
-**优化**: 强制要求 capacity 为 2 的幂（如 1024, 4096）。
-优化写法：`index = sequence & (capacity - 1)`。
-位运算只需 1 个周期。
+“零分配”指的是稳态 push/pop 不分配，并不代表创建 Ring Buffer 时没有分配，也不代表放进槽位的 `T` 自身不会分配。例如，移动一个已经分配好的 `String` 不会复制其堆缓冲区，但构造这个 `String` 仍可能分配。
 
-## 2. 核心实现：SPSC Ring Buffer
+### 1.2 为什么容量常取 2 的幂
 
-我们将实现一个单生产者单消费者 (SPSC) 的 Ring Buffer。这是最快、最简单的变体，常用于行情线程向策略线程传递数据。
-
-### 2.1 数据结构定义
-
-为了消除伪共享 (False Sharing)，我们需要确保 `head` 和 `tail` 位于不同的 Cache Line 上。
+序号 `sequence` 对应的槽位是 `sequence % capacity`。当 `capacity` 是 2 的幂时，可写成：
 
 ```rust
-use std::sync::atomic::{AtomicUsize, Ordering};
+let sequence = 13_usize;
+let capacity = 8_usize;
+assert!(capacity.is_power_of_two());
+let index = sequence & (capacity - 1);
+assert_eq!(index, 5);
+```
+
+这省去了通用除法，也让回绕计算简单。但别把“位运算一定快很多”当成无条件结论：容量若是编译期常量，编译器也可能把 `%` 优化掉。这里选择 2 的幂，更重要的是让算法不变量和生成代码都可预测。
+
+## 2. 先写出安全不变量
+
+SPSC 的快来自限制，而不是某条神奇指令：
+
+- 只有生产者写 `head`，只有消费者读 `head`；
+- 只有消费者写 `tail`，只有生产者读 `tail`；
+- 当 `head - tail < capacity` 时，`head` 指向的槽位归生产者；
+- 当 `tail != head` 时，`tail` 指向的槽位归消费者；
+- 生产者写完槽位后，才用 Release 发布 `head`；
+- 消费者 Acquire 读到新 `head` 后，才读取槽位；
+- 消费者取走值后，才用 Release 发布 `tail`，允许生产者复用槽位。
+
+当前常见的错误写法是给共享队列提供 `try_push(&self)`，然后在注释里说“调用者只能有一个生产者”。这不是安全抽象：两个线程完全可以同时调用，最终对同一 `UnsafeCell` 并发写，产生未定义行为。安全 API 必须让错误用法无法通过普通 Rust 构造出来。
+
+## 3. 用双句柄编码 SPSC 约束
+
+下面先把同一个实现拆成 3.1–3.6 六段讲解。后五段依赖 3.1 中的类型与导入，不能作为独立 crate 编译，因此围栏标为 `rust,ignore`；3.7 会给出拼接后的**完整可编译版本**，由 `mdbook test` 实际校验。工业使用还应补充 Miri、Loom、析构计数和双线程压力测试。
+
+### 3.1 内部存储与缓存行隔离
+
+```rust
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-// 缓存行大小通常为 64 字节，但也可能是 128 (如 Apple Silicon M1/M2)
-// 为了安全，我们按 128 对齐
+// 128 是保守的隔离粒度；目标机器的真实 cache line 应通过测量确认。
+// 包装类型的 size 会按 alignment 向上取整，所以两个游标不会共享这 128 字节。
 #[repr(align(128))]
-struct CacheLinePad;
+struct CachePadded<T>(T);
 
-pub struct SpscRingBuffer<T> {
-    // 缓冲区：使用 MaybeUninit 避免 T::default() 的开销，且支持无默认值的类型
-    buffer: Vec<UnsafeCell<MaybeUninit<T>>>,
+struct Inner<T> {
+    buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
     capacity: usize,
     mask: usize,
-    
-    // 生产者只写 head，消费者只读 head
-    // 放在单独的 cache line 以避免伪共享
-    _pad1: CacheLinePad,
-    head: AtomicUsize, 
-    
-    // 消费者只写 tail，生产者只读 tail
-    _pad2: CacheLinePad,
-    tail: AtomicUsize,
-    
-    _pad3: CacheLinePad,
+
+    // producer 写、consumer 读
+    head: CachePadded<AtomicUsize>,
+    // consumer 写、producer 读
+    tail: CachePadded<AtomicUsize>,
 }
 
-// 必须实现 Sync，因为我们在多线程间共享
-// T 必须是 Send 的，因为数据会在线程间传递
-unsafe impl<T: Send> Sync for SpscRingBuffer<T> {}
-unsafe impl<T: Send> Send for SpscRingBuffer<T> {}
-```
+pub struct Producer<T> {
+    inner: Arc<Inner<T>>,
+    // 生产者私有缓存：只有“看起来满”时才刷新共享 tail。
+    cached_tail: usize,
+}
 
-### 2.2 构造函数与初始化
-
-```rust
-impl<T> SpscRingBuffer<T> {
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0 && capacity.is_power_of_two(), "Capacity must be power of 2");
-        
-        let mut buffer = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            buffer.push(UnsafeCell::new(MaybeUninit::uninit()));
-        }
-
-        Self {
-            buffer,
-            capacity,
-            mask: capacity - 1,
-            _pad1: CacheLinePad,
-            head: AtomicUsize::new(0),
-            _pad2: CacheLinePad,
-            tail: AtomicUsize::new(0),
-            _pad3: CacheLinePad,
-        }
-    }
+pub struct Consumer<T> {
+    inner: Arc<Inner<T>>,
+    // 消费者私有缓存：只有“看起来空”时才刷新共享 head。
+    cached_head: usize,
 }
 ```
 
-### 2.3 生产者逻辑 (Push)
+为什么不能只在字段之间塞一个零大小的 `CacheLinePad`？因为 padding 是否把**目标字段本身**完整包在独立缓存行里并不直观，结构体布局也不应靠肉眼猜。把原子变量放进带对齐的包装类型，意图更明确；工业代码也可使用经过验证的 `CachePadded` 实现。
 
-```rust
-impl<T> SpscRingBuffer<T> {
-    pub fn try_push(&self, value: T) -> Result<(), T> {
-        let head = self.head.load(Ordering::Relaxed);
-        // Acquire: 确保我们看到了消费者最新的 tail 更新
-        let tail = self.tail.load(Ordering::Acquire); 
+### 3.2 唯一一处 `unsafe impl Sync`
 
-        if head.wrapping_sub(tail) >= self.capacity {
-            return Err(value); // 满了
+```rust,ignore
+// SAFETY:
+// 1. buffer 不会扩容，slot 地址创建后保持稳定；
+// 2. Producer/Consumer 各只有一个，且方法需要 &mut self；
+// 3. head/tail 协议保证同一 slot 不会被双方同时访问；
+// 4. Release/Acquire 在 slot 交接时建立 happens-before；
+// 5. T: Send，因为 T 的所有权会从生产者线程转移到消费者线程。
+unsafe impl<T: Send> Sync for Inner<T> {}
+```
+
+`UnsafeCell` 默认是 `!Sync`，所以编译器要求我们明确作出承诺。面试时只说“因为用了原子变量所以安全”不够；真正关键的是上面五条组合起来，覆盖了**地址稳定、角色唯一、槽位所有权、内存可见性、元素跨线程移动**。
+
+### 3.3 构造两个不可克隆的角色
+
+```rust,ignore
+pub fn spsc_channel<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+    assert!(capacity > 0, "capacity must be positive");
+    assert!(capacity.is_power_of_two(), "capacity must be a power of two");
+    // 序号使用 wrapping 算术；容量小于半个地址空间可避免新旧距离歧义。
+    assert!(capacity <= usize::MAX / 2, "capacity is too large");
+
+    let buffer = (0..capacity)
+        .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+
+    let inner = Arc::new(Inner {
+        buffer,
+        capacity,
+        mask: capacity - 1,
+        head: CachePadded(AtomicUsize::new(0)),
+        tail: CachePadded(AtomicUsize::new(0)),
+    });
+
+    let producer = Producer {
+        inner: Arc::clone(&inner),
+        cached_tail: 0,
+    };
+    let consumer = Consumer {
+        inner,
+        cached_head: 0,
+    };
+    (producer, consumer)
+}
+```
+
+这里的 `Arc` 只在创建和销毁句柄时修改引用计数；每次 push/pop 不会 clone `Arc`，所以热路径没有引用计数开销。
+
+### 3.4 生产者：写完后再发布
+
+```rust,ignore
+impl<T> Producer<T> {
+    pub fn try_push(&mut self, value: T) -> Result<(), T> {
+        // 只有生产者写 head，因此读取自己的进度只需 Relaxed。
+        let head = self.inner.head.0.load(Ordering::Relaxed);
+
+        if head.wrapping_sub(self.cached_tail) >= self.inner.capacity {
+            // 看起来满了，再 Acquire 消费者发布的最新 tail。
+            self.cached_tail = self.inner.tail.0.load(Ordering::Acquire);
+            if head.wrapping_sub(self.cached_tail) >= self.inner.capacity {
+                return Err(value);
+            }
         }
 
-        let index = head & self.mask;
-        
-        // SAFETY: 
-        // 1. 我们是唯一的生产者 (SPSC)。
-        // 2. index 对应的 slot 此时归生产者所有（因为 head - tail < capacity）。
+        let index = head & self.inner.mask;
+        // SAFETY: 根据容量检查，该 slot 已由消费者归还且现在只归本 Producer。
         unsafe {
-            let slot = &mut *self.buffer[index].get();
-            slot.write(value);
+            (*self.inner.buffer[index].get()).write(value);
         }
 
-        // Release: 确保 buffer 的写入在 head 更新之前完成
-        // 这样消费者看到新的 head 时，buffer 中的数据一定是有效的
-        self.head.store(head.wrapping_add(1), Ordering::Release);
-        
+        // 发布顺序：slot 写入 happens-before 看见新 head 的消费者读取 slot。
+        self.inner
+            .head
+            .0
+            .store(head.wrapping_add(1), Ordering::Release);
         Ok(())
     }
 }
 ```
 
-### 2.4 消费者逻辑 (Pop)
+本地 `cached_tail` 允许它“偏旧”。旧值最多让生产者误以为队列可能已满，于是刷新一次；绝不能让它误以为一个尚未消费的槽位可写。因此这是安全的保守缓存。
 
-```rust
-impl<T> SpscRingBuffer<T> {
-    pub fn try_pop(&self) -> Option<T> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        // Acquire: 确保我们看到了生产者最新的 head 更新
-        // 以及 buffer 中对应的数据写入
-        let head = self.head.load(Ordering::Acquire);
+### 3.5 消费者：看见发布后再读取
 
-        if tail == head {
-            return None; // 空了
+```rust,ignore
+impl<T> Consumer<T> {
+    pub fn try_pop(&mut self) -> Option<T> {
+        // 只有消费者写 tail，因此读取自己的进度只需 Relaxed。
+        let tail = self.inner.tail.0.load(Ordering::Relaxed);
+
+        if self.cached_head.wrapping_sub(tail) == 0 {
+            // 看起来空了，再 Acquire 生产者发布的最新 head。
+            self.cached_head = self.inner.head.0.load(Ordering::Acquire);
+            if self.cached_head.wrapping_sub(tail) == 0 {
+                return None;
+            }
         }
 
-        let index = tail & self.mask;
-
-        // SAFETY:
-        // 1. 我们是唯一的消费者 (SPSC)。
-        // 2. index 对应的 slot 此时归消费者所有（因为 tail < head）。
+        let index = tail & self.inner.mask;
+        // SAFETY: Acquire 已观察到该 slot 的发布；该 slot 现在只归本 Consumer。
         let value = unsafe {
-            let slot = &*self.buffer[index].get();
-            slot.assume_init_read()
+            (*self.inner.buffer[index].get()).assume_init_read()
         };
 
-        // Release: 告诉生产者这个 slot 已经空出来了
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
-
+        // 读走 T 之后才归还 slot，生产者随后才可以覆盖它。
+        self.inner
+            .tail
+            .0
+            .store(tail.wrapping_add(1), Ordering::Release);
         Some(value)
     }
 }
 ```
 
-## 3. 性能分析 (Performance Analysis)
+`assume_init_read` 会把 `T` 移出槽位。此后该槽位逻辑上未初始化，直到生产者再次写入。对 `String` 等带 `Drop` 的类型也成立，并不要求 `T: Copy`。
 
-### 3.1 内存顺序详解
-*   **Producer Store Head (Release)** <-> **Consumer Load Head (Acquire)**: 
-    这构成了同步点。Producer 保证写入数据 -> 更新 Head。Consumer 保证读取 Head -> 读取数据。这防止了 CPU 重排导致 Consumer 读到未初始化的数据。
-*   **Consumer Store Tail (Release)** <-> **Producer Load Tail (Acquire)**:
-    这也是同步点。Consumer 保证读取数据 -> 更新 Tail。Producer 保证读取 Tail -> 覆盖旧数据。这防止了 Producer 覆盖还未被消费的数据。
+### 3.6 队列销毁时释放尚未消费的元素
 
-### 3.2 批处理优化 (Batching)
-在极端高频场景下，每次 Push/Pop 都执行原子操作（尽管是无锁的）仍然昂贵，因为 `Acquire`/`Release` 会影响流水线。
-一种优化是**缓存 Head/Tail**：
-*   **Producer**: 维护一个本地的 `cached_tail`。只有当 buffer 看起来满了时，才去读取真正的原子 `tail`。
-*   **Consumer**: 维护一个本地的 `cached_head`。只有当 buffer 看起来空了时，才去读取真正的原子 `head`。
+Ring Buffer 被销毁时，队列中可能仍有元素。若不处理，`String`、`Vec` 等资源会泄漏。
 
-这可以显著减少 Cache Traffic。
+```rust,ignore
+impl<T> Drop for Inner<T> {
+    fn drop(&mut self) {
+        // 能进入 Inner::drop，说明两个 Arc 句柄都已销毁，不再有并发访问。
+        let mut tail = *self.tail.0.get_mut();
+        let head = *self.head.0.get_mut();
 
-```rust
-// 伪代码：带缓存的生产者
-if head - self.cached_tail >= self.capacity {
-    self.cached_tail = self.tail.load(Ordering::Acquire);
-    if head - self.cached_tail >= self.capacity {
-        return Err(Full);
+        while tail != head {
+            let index = tail & self.mask;
+            // SAFETY: [tail, head) 正是仍处于已初始化状态的槽位。
+            unsafe {
+                self.buffer[index].get_mut().assume_init_drop();
+            }
+            tail = tail.wrapping_add(1);
+        }
     }
 }
 ```
 
-## 3. 性能分析 (Performance Analysis)
+这段 Drop 逻辑也是安全证明的一部分。一个容器不仅要在“正常 pop”时正确，还要在任意一端提前退出时正确释放剩余元素。
 
-### 3.1 内存屏障开销
-注意 `try_push` 和 `try_pop` 中的 `Acquire` / `Release` 对。
-- `Acquire` 确保我们看到了对方最新的修改。
-- `Release` 确保我们的修改对对方可见。
-在 x86 上，这几乎是零开销的。在 ARM 上，这对应 `LDAR` / `STLR` 指令，开销也很低。
+### 3.7 可编译的完整版本
 
-### 3.2 批处理优化 (Batching)
-为了进一步减少原子操作的开销，我们可以引入**批处理**。
-消费者可以一次性读取 `tail` 到 `head` 之间的所有数据，处理完后再更新 `tail`。这称为 **Smart Batching**。
+下面把前六段原样组装，并加入最小行为断言。`mdbook test` 能证明它在当前工具链下通过编译并跑通单线程边界示例；这**不能替代并发安全证明**，跨线程交错仍应使用 Loom/Miri 和目标硬件压力测试。
 
 ```rust
-// 批量消费接口示例
-pub fn consume_batch<F>(&self, mut handler: F) -> usize 
-where F: FnMut(T) 
-{
-    let tail = self.tail.load(Ordering::Relaxed);
-    let head = self.head.load(Ordering::Acquire);
-    
-    let available = head.wrapping_sub(tail);
-    if available == 0 { return 0; }
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // 处理所有可用数据，不更新原子变量
-    for i in 0..available {
-        let index = (tail + i) & self.mask;
-        let val = unsafe { *self.buffer.get_unchecked(index).get() };
-        handler(val);
-    }
+#[repr(align(128))]
+struct CachePadded<T>(T);
 
-    // 只更新一次原子变量
-    self.tail.store(tail.wrapping_add(available), Ordering::Release);
-    available
+struct Inner<T> {
+    buffer: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    capacity: usize,
+    mask: usize,
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
 }
+
+struct Producer<T> {
+    inner: Arc<Inner<T>>,
+    cached_tail: usize,
+}
+
+struct Consumer<T> {
+    inner: Arc<Inner<T>>,
+    cached_head: usize,
+}
+
+// SAFETY: 两个不可克隆句柄保证角色唯一；游标协议保证槽位独占，
+// Release/Acquire 负责跨线程发布；T: Send 允许元素转移到另一线程。
+unsafe impl<T: Send> Sync for Inner<T> {}
+
+fn spsc_channel<T: Send>(capacity: usize) -> (Producer<T>, Consumer<T>) {
+    assert!(capacity > 0, "capacity must be positive");
+    assert!(capacity.is_power_of_two(), "capacity must be a power of two");
+    assert!(capacity <= usize::MAX / 2, "capacity is too large");
+
+    let buffer = (0..capacity)
+        .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let inner = Arc::new(Inner {
+        buffer,
+        capacity,
+        mask: capacity - 1,
+        head: CachePadded(AtomicUsize::new(0)),
+        tail: CachePadded(AtomicUsize::new(0)),
+    });
+
+    (
+        Producer { inner: Arc::clone(&inner), cached_tail: 0 },
+        Consumer { inner, cached_head: 0 },
+    )
+}
+
+impl<T> Producer<T> {
+    fn try_push(&mut self, value: T) -> Result<(), T> {
+        let head = self.inner.head.0.load(Ordering::Relaxed);
+        if head.wrapping_sub(self.cached_tail) >= self.inner.capacity {
+            self.cached_tail = self.inner.tail.0.load(Ordering::Acquire);
+            if head.wrapping_sub(self.cached_tail) >= self.inner.capacity {
+                return Err(value);
+            }
+        }
+
+        let index = head & self.inner.mask;
+        // SAFETY: 容量检查证明该槽位已由消费者归还，且只有本 Producer 写。
+        unsafe { (*self.inner.buffer[index].get()).write(value) };
+        self.inner.head.0.store(head.wrapping_add(1), Ordering::Release);
+        Ok(())
+    }
+}
+
+impl<T> Consumer<T> {
+    fn try_pop(&mut self) -> Option<T> {
+        let tail = self.inner.tail.0.load(Ordering::Relaxed);
+        if self.cached_head.wrapping_sub(tail) == 0 {
+            self.cached_head = self.inner.head.0.load(Ordering::Acquire);
+            if self.cached_head.wrapping_sub(tail) == 0 {
+                return None;
+            }
+        }
+
+        let index = tail & self.inner.mask;
+        // SAFETY: Acquire 已观察到发布，且只有本 Consumer 读取该槽位。
+        let value = unsafe { (*self.inner.buffer[index].get()).assume_init_read() };
+        self.inner.tail.0.store(tail.wrapping_add(1), Ordering::Release);
+        Some(value)
+    }
+}
+
+impl<T> Drop for Inner<T> {
+    fn drop(&mut self) {
+        let mut tail = *self.tail.0.get_mut();
+        let head = *self.head.0.get_mut();
+        while tail != head {
+            let index = tail & self.mask;
+            // SAFETY: [tail, head) 是仍包含有效 T 的槽位。
+            unsafe { self.buffer[index].get_mut().assume_init_drop() };
+            tail = tail.wrapping_add(1);
+        }
+    }
+}
+
+let (mut producer, mut consumer) = spsc_channel(2);
+assert_eq!(consumer.try_pop(), None);
+assert_eq!(producer.try_push(String::from("A")), Ok(()));
+assert_eq!(producer.try_push(String::from("B")), Ok(()));
+assert_eq!(producer.try_push(String::from("full")), Err(String::from("full")));
+assert_eq!(consumer.try_pop().as_deref(), Some("A"));
+assert_eq!(consumer.try_pop().as_deref(), Some("B"));
+assert_eq!(consumer.try_pop(), None);
 ```
 
-这种优化可以将吞吐量从每秒 1000 万条提升到 5000 万条以上。
+## 4. 从代码到 happens-before
 
-## 4. 常见陷阱 (Pitfalls)
+生产者与消费者有两条对称的同步链：
 
-1.  **False Sharing 再次来袭**:
-    一定要确保 `head` 和 `tail` 不在同一个 Cache Line。如果 `_pad` 被移除，性能会暴跌 10-50 倍。
-    
-2.  **Drop 问题**:
-    我们在示例中使用了 `T: Copy`。如果 `T` 是 `String` 等需要 Drop 的类型，直接覆盖内存会导致内存泄漏（旧值没被 Drop）。
-    **解决**: 对于 Ring Buffer，最好只存 `Copy` 类型（如 `u64` ID, `f64` Price, 固定大小数组）。如果是复杂对象，存索引或指针。
+```text
+生产者写 slot
+   happens-before
+生产者 Release-store head
+   synchronizes-with（消费者读到该值）
+消费者 Acquire-load head
+   happens-before
+消费者读 slot
+```
 
-3.  **整数溢出**:
-    `head` 和 `tail` 是 `usize`。虽然 64 位整数溢出需要几百年，但最好使用 `wrapping_add` / `wrapping_sub` 来处理溢出逻辑。我们的代码已经这么做了。
+以及：
 
-## 5. 延伸阅读
+```text
+消费者移出 slot 中的 T
+   happens-before
+消费者 Release-store tail
+   synchronizes-with（生产者读到该值）
+生产者 Acquire-load tail
+   happens-before
+生产者复用 slot
+```
 
-- [LMAX Disruptor](https://lmax-exchange.github.io/disruptor/) - Java 高频交易领域的传奇。
-- [rigtorp/SPSCQueue](https://github.com/rigtorp/SPSCQueue) - C++11 实现的极简 SPSC 队列。
-- [Aeron](https://github.com/real-logic/aeron) - 这里的 Ring Buffer 设计更为复杂，支持多路复用。
+如果把两边都换成 `Relaxed`，缺少的不是“也许慢一点”，而是普通槽位内存的跨线程同步证明。反过来，把所有操作都换成 `SeqCst` 也不能修复“有两个 Producer”这种所有权错误。
+
+## 5. 性能优化应按这个顺序
+
+1. **先决定通信拓扑**：能用一组 SPSC，就不要急着让所有线程争一个 MPSC；
+2. **隔离热游标**：确认 head/tail 没有伪共享，并测目标 CPU；
+3. **缓存远端游标**：只在可能满/空时读取对方缓存行；
+4. **批量发布**：减少共享游标更新次数，但会增加单条消息等待时间；
+5. **调节等待策略**：忙轮询、退避、park 必须结合延迟预算和 CPU 预算；
+6. **最后才看指令细节**：在目标硬件测 P50/P99/P999，而不是引用别人的单一吞吐数字。
+
+批处理有一个容易忽略的正确性问题：如果 handler 处理中途 panic，哪些元素已经被移出、tail 应发布到哪里？工业实现需要 guard 记录已消费进度，不能只把 `tail.store` 随手挪到循环末尾。
+
+## 6. 满队列不是异常，而是架构决策
+
+固定容量必然会满。`try_push` 返回 `Err(value)` 是把决定交还给调用者：
+
+| 数据类型 | 常见策略 | 风险 |
+| :--- | :--- | :--- |
+| 订单请求 | 拒绝并报警，绝不能静默丢弃 | 上游必须处理失败 |
+| 行情增量 | 丢弃后触发 snapshot/recovery | 恢复逻辑必须可靠 |
+| 指标 | 可合并、采样或丢弃 | 监控会有误差 |
+| 审计日志 | 切换同步落盘或进入降级模式 | 关键线程尾延迟上升 |
+
+HFT 面试中，能说清“队列满了怎么办”通常比背出一个 CAS 循环更加分。无界队列只是把“满”推迟成 OOM 或不可控排队，并没有消灭背压。
+
+## 7. 常见陷阱
+
+1. **把 SPSC 当 MPSC 用**：这是内存安全问题，不只是性能下降；
+2. **只 padding，不验证布局**：使用包装类型，并用 `size_of`、地址或性能计数器在目标构建上验证；
+3. **忽略 Drop**：`MaybeUninit<T>` 不会自动 drop 内部的 `T`；
+4. **把空/满与序号回绕混为一谈**：使用单调 wrapping 序号和受限容量，不要只保存取模后的下标；
+5. **基准中没有生产者/消费者并发**：单线程 push/pop 测不到缓存行迁移；
+6. **只报平均吞吐量**：队列优化要同时报告分位延迟、CPU 占用、满队列次数和测试拓扑。
+
+## 8. 面试快问快答
+
+### Q1：SPSC 为什么不需要 CAS？
+
+因为 head 与 tail 各自只有一个写者，不存在多个线程抢同一个新值；原子 load/store 用于发布和观察进度。CAS 解决的是多写者竞争，不能替代槽位可见性的同步证明。
+
+### Q2：为什么 slot 用 `UnsafeCell<MaybeUninit<T>>`？
+
+`UnsafeCell` 是 Rust 允许通过共享容器进行内部修改的底层出口；`MaybeUninit` 表达槽位有时没有合法的 `T`。两者都不会自动保证安全，安全来自角色唯一和游标协议。
+
+### Q3：为什么 head/tail 要分缓存行？
+
+生产者频繁写 head、消费者频繁写 tail。若它们同处一条缓存行，即使访问不同字段，整条缓存行仍会在两个核心间反复取得独占权，形成伪共享。
+
+### Q4：无锁是否等于无等待？
+
+不等于。`try_push` 本身立即返回，但上层可能选择自旋等待空间；消费者若暂停，生产者仍会持续遇到满。进展保证、排队策略与线程调度要分别讨论。
+
+## 9. 本章小结
+
+- Ring Buffer 的核心是固定槽位的所有权交接，不只是取模；
+- SPSC 限制应由不可克隆的 Producer/Consumer 句柄编码，而不是写在注释里；
+- Release/Acquire 负责发布槽位，角色唯一负责避免并发访问；
+- Drop、回绕、背压与尾延迟都是完整实现的一部分。
+
+进一步阅读：[Rust 原子操作与内存顺序](atomics.md)、[SPSC/MPSC 队列](queues.md)、[rigtorp/SPSCQueue](https://github.com/rigtorp/SPSCQueue)。
 
 ---
 下一章：[SPSC/MPSC 队列 (Queues)](queues.md)

@@ -1,284 +1,234 @@
 # 订单簿管理 (Order Book Management)
 
-在交易引擎中，订单簿（Order Book）不仅是数据的容器，更是策略决策的核心依据。上一部分我们在 [L1/L2/L3 数据构建](../connectivity/order_book_data.md) 中讨论了底层的存储结构（如 FlatMap, Intrusive List）。本章将聚焦于如何在多线程环境下**安全、高效地管理**这些数据，并为策略提供极低延迟的访问接口。
+订单簿把带序号的行情事件还原成“当前市场状态”。策略读到的结果必须同时满足两点：**业务上连续**，并且**并发上没有数据竞争**。更底层的 L1/L2/L3 含义见 [L1/L2/L3 数据构建](../connectivity/order_book_data.md)。
 
-## 1. 核心挑战：读写并发 (Read-Write Concurrency)
+> 行情订单簿是对交易所状态的本地重建；交易所撮合订单簿则决定订单优先级。二者数据结构相似，但权威性和职责不同。
 
-在典型的 HFT 架构中，存在两种角色的线程：
-1.  **Writer (单写者)**: 网络线程（或专门的市场数据线程），负责接收交易所数据并更新订单簿。
-2.  **Reader (多读者)**: 策略线程，负责读取订单簿并做出决策。
+## 1. 先选所有权模型，再选锁
 
-### 1.1 架构图示
+最容易证明正确的起点是单写者：一个事件循环按交易所序号更新某个分片的订单簿，并在更新后调用同线程策略。这样既没有锁，也不会把半次更新暴露给策略。
 
 ```mermaid
-graph TD
-    MD[Market Data Feed] -->|Updates| Writer
-    subgraph Engine
-        Writer[Writer Thread]
-        OB[OrderBook (Shared Memory)]
-        Reader1[Strategy A]
-        Reader2[Strategy B]
-        Reader3[Risk Check]
-    end
-    Writer -->|Write (SeqLock)| OB
-    OB -.->|Read (Optimistic)| Reader1
-    OB -.->|Read (Optimistic)| Reader2
-    OB -.->|Read (Optimistic)| Reader3
-    
-    style Writer fill:#f96,stroke:#333,stroke-width:2px
-    style OB fill:#9cf,stroke:#333,stroke-width:2px
+flowchart LR
+    MD["行情消息"] --> G["序号与恢复门"]
+    G --> O["分片单写者"]
+    O --> B["订单簿"]
+    B --> S["同线程策略"]
+    B -. "不可变快照 / 事件" .-> R["其他读者"]
 ```
 
-### 1.2 锁的困境
-*   `Mutex<OrderBook>`: 绝对禁止。锁竞争会导致严重的延迟抖动（Jitter）。
-*   `RwLock<OrderBook>`: 依然不够好。Writer 必须等待所有 Readers 释放锁，导致行情更新被阻塞，这在高频场景下是不可接受的（行情更新优先级最高）。
+如果确实需要跨线程读写，可以比较：
 
-### 1.3 解决方案：SeqLock (Sequence Lock)
+| 方案 | 适用情况 | 主要代价 |
+| --- | --- | --- |
+| `Mutex` / `RwLock` | 先做正确基线、低竞争或冷路径 | 竞争和调度会增加尾延迟 |
+| 单写者 + 消息传递 | 状态能按标的/频道分片 | 跨分片查询和队列背压 |
+| 不可变 `Arc<Snapshot>` 发布 | 读者允许看到稍旧的完整快照 | 克隆/回收成本和快照构建 |
+| 原子字段小快照 | BBO 等少量固定宽度字段 | 只适合原子可表示的数据 |
 
-SeqLock 是一种乐观锁机制，允许 Writer 随时写入（不阻塞），而 Reader 需要检测在读取过程中是否发生了写入。如果发生了，Reader 重试。
+`Mutex` 不是“绝对禁止”；不经测量手写 `unsafe` 并发结构往往更危险。面试时应先给出正确基线，再用负载和 p99 证据说明是否需要替换。
 
-**适用场景**: 写操作非常快（更新几个字段），读操作也很快。
+## 2. Rust 中不要手写普通 `T` 的 SeqLock
 
-## 2. SeqLock 实现 (Implementation)
+经典 SeqLock 的思路是：写前把版本变奇数，写完变偶数；读者前后读取版本，不一致就重试。但下面这种做法在 Rust 中**不 sound**：
 
-SeqLock 是一种乐观锁机制，允许 Writer 随时写入（不阻塞），而 Reader 需要检测在读取过程中是否发生了写入。如果发生了，Reader 重试。
+```text
+Atomic version + UnsafeCell<T> + 读者直接读取 &T
+```
 
-**适用场景**: 写操作非常快（更新几个字段），读操作也很快。
+原因是 Writer 对 `T` 的普通写和 Reader 对 `T` 的普通读会并发发生。Rust/C++ 内存模型把这种非原子数据竞争视为未定义行为；“读完发现版本变了并丢弃结果”不能撤销已经发生的 UB。若 `T` 包含 `Vec`、引用或枚举，读到中间状态还可能先越界或解引用无效地址。
+
+安全选择包括：
+
+1. 所有共享字段本身都是原子类型；
+2. 发布不可变快照，使用经过验证的 RCU/Arc-swap 类实现处理生命周期；
+3. 通过通道把事件交给状态所有者；
+4. 使用标准锁，测到它确实是瓶颈后再优化。
+
+### 2.1 只发布 BBO 的安全教学例子
+
+下面每个共享字段都是原子的，因此不会产生普通内存数据竞争。为便于解释使用 `SeqCst`；生产中若要减弱内存序，必须给出 happens-before 证明并用并发模型测试验证。
 
 ```rust
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
-use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-pub struct SeqLock<T> {
-    seq: AtomicUsize,
-    data: UnsafeCell<T>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bbo {
+    pub bid_price_ticks: i64,
+    pub bid_qty: u64,
+    pub ask_price_ticks: i64,
+    pub ask_qty: u64,
 }
 
-unsafe impl<T: Send> Sync for SeqLock<T> {}
+pub struct AtomicBbo {
+    version: AtomicU64,
+    bid_price_ticks: AtomicI64,
+    bid_qty: AtomicU64,
+    ask_price_ticks: AtomicI64,
+    ask_qty: AtomicU64,
+}
 
-impl<T> SeqLock<T> {
-    pub fn new(val: T) -> Self {
-        Self {
-            seq: AtomicUsize::new(0),
-            data: UnsafeCell::new(val),
-        }
+impl AtomicBbo {
+    /// 架构约束：只有订单簿所有者调用 publish。
+    pub fn publish(&self, value: Bbo) {
+        self.version.fetch_add(1, Ordering::SeqCst); // odd
+        self.bid_price_ticks.store(value.bid_price_ticks, Ordering::SeqCst);
+        self.bid_qty.store(value.bid_qty, Ordering::SeqCst);
+        self.ask_price_ticks.store(value.ask_price_ticks, Ordering::SeqCst);
+        self.ask_qty.store(value.ask_qty, Ordering::SeqCst);
+        self.version.fetch_add(1, Ordering::SeqCst); // even
     }
 
-    /// Writer: 获取独占访问权
-    /// 
-    /// # Safety
-    /// 必须确保同一时间只有一个 Writer 调用此方法。
-    /// 通常通过架构设计（单线程写）来保证，或者在 SeqLock 外部再包一层 Mutex（如果需要多写者）。
-    pub fn write(&self, f: impl FnOnce(&mut T)) {
-        // 1. 增加序列号 (变为奇数)，表示正在写入
-        // Relaxed 即可，因为后续的 fence(Release) 会保证顺序
-        let seq = self.seq.load(Ordering::Relaxed);
-        self.seq.store(seq + 1, Ordering::Relaxed);
-
-        // 2. 内存屏障：保证之前的写操作不会重排到 seq 更新之后
-        // 同时也保证后续的 data 修改不会重排到 seq 更新之前
-        fence(Ordering::Release);
-
-        // 3. 执行修改
-        // SAFETY: 只有一个 writer，且 seq 为奇数时 reader 会重试
-        f(unsafe { &mut *self.data.get() });
-
-        // 4. 内存屏障：保证 data 修改全部完成
-        fence(Ordering::Release);
-
-        // 5. 增加序列号 (变为偶数)，表示写入完成
-        self.seq.store(seq + 2, Ordering::Relaxed);
-    }
-
-    /// Reader: 乐观读取
-    pub fn read<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
-        // 1. 读取开始序列号
-        let seq1 = self.seq.load(Ordering::Acquire);
-        
-        // 如果 seq 是奇数，说明正在写，直接失败（或由调用者决定自旋）
-        if seq1 & 1 != 0 {
+    pub fn try_read(&self) -> Option<Bbo> {
+        let before = self.version.load(Ordering::SeqCst);
+        if before & 1 == 1 {
             return None;
         }
 
-        // 2. 内存屏障：保证读取 data 发生在读取 seq1 之后
-        fence(Ordering::Acquire);
+        let value = Bbo {
+            bid_price_ticks: self.bid_price_ticks.load(Ordering::SeqCst),
+            bid_qty: self.bid_qty.load(Ordering::SeqCst),
+            ask_price_ticks: self.ask_price_ticks.load(Ordering::SeqCst),
+            ask_qty: self.ask_qty.load(Ordering::SeqCst),
+        };
 
-        // 3. 读取数据
-        let result = f(unsafe { &*self.data.get() });
-
-        // 4. 内存屏障：保证读取 data 发生在读取 seq2 之前
-        fence(Ordering::Acquire);
-
-        // 5. 读取结束序列号
-        let seq2 = self.seq.load(Ordering::Acquire);
-
-        // 6. 验证一致性
-        if seq1 == seq2 {
-            Some(result)
-        } else {
-            None
-        }
+        let after = self.version.load(Ordering::SeqCst);
+        (before == after).then_some(value)
     }
 }
 ```
 
-## 3. L3 Order Book 数据结构设计
+这仍不是完整通用 SeqLock：它要求单写者，读者可能在持续写入时一直失败，还要考虑版本回绕和重试上限。完整 L3 订单簿通常不适合拆成大量原子字段，因为读者很难得到一致的复杂结构。
 
-在 HFT 面试中，**"如何设计一个支持 O(1) Add/Cancel/Execute 的限价订单簿 (Limit Order Book)"** 是最经典的考题。这不仅考察数据结构，还考察对内存布局和缓存友好性的理解。
+示例为突出内存安全省略了 handle 构造器；生产 API 应只创建一个不可 `Clone` 的 Writer handle，把读者限制为只持有 `try_read` 能力，从类型层减少误用。
 
-### 3.1 核心需求
-*   **O(1) Order Lookup**: 根据 OrderId 快速找到订单（用于 Cancel/Modify）。
-*   **O(1) Price Level Access**: 快速找到最佳买卖价（BBO）以及特定的价格档位。
-*   **O(1) Order Insertion**: 在特定价格档位的队尾插入订单（时间优先）。
-*   **O(1) Order Deletion**: 从价格档位的任意位置删除订单。
+## 3. L3 订单簿的数据结构
 
-### 3.2 数据结构选型
-仅仅使用 `BTreeMap` 是不够的，因为查找是 O(log N)。我们需要组合多种数据结构。
+常见操作与复杂度取决于价格空间：
 
-1.  **HashMap<OrderId, NodePtr>**: 用于根据 ID 快速定位订单节点。
-2.  **Price Map (BTreeMap<Price, Level> 或 Vec<Level>)**: 用于管理价格档位。
-    *   如果是股票（价格稀疏），用 `BTreeMap`。
-    *   如果是期货（价格连续且密集），用预分配的 `Vec` 或数组（Direct Indexing）是更快的 O(1)。
-3.  **Doubly Linked List (Intrusive)**: 在每个价格档位内部维护订单队列。我们需要双向链表来实现 O(1) 的中间删除。
+| 操作 | 常见结构 | 典型复杂度 |
+| --- | --- | --- |
+| 按 Order ID 找订单 | `HashMap<OrderId, Slot>` | 平均 O(1)，不是最坏 O(1) |
+| 找稀疏价格档 | `BTreeMap<Price, Level>` | O(log L) |
+| 找紧密有界价格档 | 直接索引数组 | O(1)，但可能浪费内存 |
+| 同价队尾新增 | 档位的 head/tail 索引 | 已找到档位后 O(1) |
+| 删除已定位订单 | 双向索引链 | 已定位节点后 O(1) |
+| 找 best | 树的边界键，或维护 best index | 依结构而定 |
 
-### 3.3 Rust 实现架构
+因此，“所有 Add/Cancel/Best 都严格 O(1)”通常缺少前提。答案应说明平均/最坏复杂度、价格范围和 best 维护方式。
 
-为了极致性能，我们通常不使用标准库的 `LinkedList`（因为它分配内存且指针不暴露），而是使用**侵入式链表 (Intrusive Linked List)** 配合 **Object Pool (Arena)**。
+### 3.1 用索引式 Arena，避免悬空指针
 
 ```rust
-use std::ptr::NonNull;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-// 1. 订单节点 (Node)
+type Slot = u32;
+
 struct OrderNode {
-    id: u64,
-    price: u64,
-    qty: u32,
-    // 侵入式链表指针
-    prev: Option<NonNull<OrderNode>>,
-    next: Option<NonNull<OrderNode>>,
-    // 指向所属的价格档位，方便删除时更新档位统计
-    parent_level: NonNull<PriceLevel>,
+    order_id: u64,
+    price_ticks: i64,
+    remaining_qty: u64,
+    prev: Option<Slot>,
+    next: Option<Slot>,
 }
 
-// 2. 价格档位 (Level)
+#[derive(Default)]
 struct PriceLevel {
-    price: u64,
     total_qty: u64,
-    count: u32,
-    head: Option<NonNull<OrderNode>>,
-    tail: Option<NonNull<OrderNode>>,
+    order_count: u32,
+    head: Option<Slot>,
+    tail: Option<Slot>,
 }
 
-// 3. 订单簿 (Book)
 struct L3OrderBook {
-    // 所有的 OrderNode 实际上存储在一个预分配的 Arena 中
-    // 这里只存指针
-    orders: HashMap<u64, NonNull<OrderNode>>,
-    
-    // 价格档位表
-    // 对于期货，这里可以是 Vec<Option<NonNull<PriceLevel>>> 直接索引
-    levels: BTreeMap<u64, NonNull<PriceLevel>>,
-    
-    // 内存池 (Arena)
-    // 实际存储 OrderNode 和 PriceLevel 的地方
-    // 避免 malloc/free
-    order_arena: Vec<OrderNode>, 
-    level_arena: Vec<PriceLevel>,
+    by_order_id: HashMap<u64, Slot>,
+    levels: BTreeMap<i64, PriceLevel>,
+    nodes: Vec<Option<OrderNode>>,
+    free_slots: Vec<Slot>,
 }
 ```
 
-### 3.4 关键优化点
+索引在 `Vec` 扩容后仍指向同一逻辑槽位，而指向 `Vec` 元素的裸指针可能因扩容立即悬空。槽位复用时，若索引会暴露到模块外，应再附带 generation，组成 `(slot, generation)`，防止旧句柄误指向新订单。
 
-1.  **预分配 (Pre-allocation)**: `order_arena` 和 `level_arena` 在启动时分配足够的空间（如 100万个订单），运行时完全无 GC、无系统调用。
-2.  **缓存局部性 (Cache Locality)**: 由于 Arena 是连续内存，虽然逻辑上是链表，但在物理上相邻的订单可能在内存中也相邻（如果是顺序插入），这比散乱的堆内存要好得多。
-3.  **无指针解引用 (Pointer Swizzling)**: 在极致优化中，可以用 `u32` 索引代替 `usize` 指针（如果 Arena 大小 < 4G），减少内存占用并减轻 Cache 压力。
+更新必须同时维护：
 
-## 4. 双缓冲 (Double Buffering)
+- `by_order_id` 与槽位的一一对应；
+- `prev/next/head/tail` 链接；
+- 档位 `total_qty` 与 `order_count`；
+- 空档删除和 best 更新；
+- checked 数量运算和重复事件处理。
 
-如果读取操作非常耗时（例如策略需要遍历整个订单簿计算复杂指标），SeqLock 会导致 Reader 频繁重试，永远无法成功。
+## 4. 不可变快照与“双缓冲”的边界
 
-此时，**双缓冲**是更好的选择。
+“Writer 写 Back，交换指针后立刻改旧 Front”并不自动安全：慢 Reader 可能仍在读旧 Front。手写 `AtomicPtr` 还必须解决对象生命周期、ABA 和回收时机。
 
-### 4.1 机制
-维护两个完全一样的 `OrderBook` 实例：`Front` 和 `Back`。
-*   Reader 总是读取 `Front`。
-*   Writer 总是写入 `Back`。
-*   当 Writer 完成一批更新后，**原子地交换指针**。
+更稳妥的方案是：
+
+- 使用 `Arc<Snapshot>`，读者持有期间对象不会被释放；
+- 用经过验证的 Arc-swap/RCU 实现发布，而不是自己拼裸指针；
+- 或让每个 Reader 拥有副本，通过有界增量流追赶；
+- 全量复制太贵时，只发布策略真正需要的 BBO/特征快照。
+
+快照语义应明确：它代表哪个行情序号？读者最多允许落后多久？发生缺口时是否标记 `stale`？
+
+## 5. 衍生指标也要定义边界
+
+### 5.1 中间价
+
+订单簿任一侧为空时没有普通双边 mid，不应把缺失价格默认为 0。整数价格可以返回“两倍 mid”，保留半 tick：
 
 ```rust
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::ptr;
-
-struct DoubleBufferedOrderBook {
-    // 两个具体的 OrderBook 实例
-    books: [Box<OrderBook>; 2],
-    // 指向当前可读的那个
-    current_index: AtomicUsize, 
-}
-
-impl DoubleBufferedOrderBook {
-    pub fn update(&mut self, update: MarketDataUpdate) {
-        // 1. 获取后台 buffer 的索引
-        let back_index = 1 - self.current_index.load(Ordering::Relaxed);
-        
-        // 2. 更新后台 buffer
-        self.books[back_index].apply(update);
-        
-        // 3. 发布：切换前台索引
-        // 这里需要 Release 语义，保证 update 操作对 Reader 可见
-        self.current_index.store(back_index, Ordering::Release);
-        
-        // 4. 追赶：为了保持两个 buffer 一致，下次需要把这个 update 也应用到另一个 buffer 吗？
-        // 双缓冲通常有两种策略：
-        // A. Copy-on-Write: 每次 switch 前把 old front 复制到 back (太慢)
-        // B. Apply-Twice: update 需要应用两次。一次现在，一次在下次 switch 后。
-    }
-}
-```
-**Apply-Twice** 是 HFT 中的常用技巧。Writer 维护一个 `pending_updates` 队列，每次切换 buffer 后，把队列里的更新应用到新的 Back buffer 上。
-
-## 5. 衍生指标计算 (Derived Metrics)
-
-策略通常不需要原始的订单簿，而是需要经过计算的指标。
-
-### 5.1 中间价 (Mid Price)
-```rust
-pub fn mid_price(&self) -> f64 {
-    let best_bid = self.bids.first().map(|l| l.price).unwrap_or(0.0);
-    let best_ask = self.asks.first().map(|l| l.price).unwrap_or(0.0);
-    (best_bid + best_ask) / 2.0
+fn twice_mid_ticks(best_bid: Option<i64>, best_ask: Option<i64>) -> Option<i128> {
+    Some(i128::from(best_bid?) + i128::from(best_ask?))
 }
 ```
 
-### 5.2 加权平均价 (VWAP)
-计算前 N 层或前 V 量的 VWAP。
-**优化**: 增量计算。
-维护 `sum_prod = sum(price * qty)` 和 `total_qty`。
-当 Order Add 时，`sum_prod += p * q`。
-当 Order Delete 时，`sum_prod -= p * q`。
-这样查询 VWAP 是 O(1)。
+### 5.2 VWAP 与 Imbalance
 
-### 5.3 订单簿不平衡度 (Imbalance)
-$$ Imbalance = \frac{Q_{bid} - Q_{ask}}{Q_{bid} + Q_{ask}} $$
-用于预测短期价格走势。同样可以增量维护。
+全体集合的 `sum(price × qty)` 可以增量维护；但“前 N 档”或“前 V 数量”的边界会随 best 和数量变化，查询不一定 O(1)。乘法与累加使用足够宽的 checked 整数。
 
-## 6. 总结
+一种 L1 imbalance 为：
 
-## 7. 常见陷阱
+<div class="formula" role="math" aria-label="买卖盘不平衡等于买一数量减卖一数量，再除以两者数量之和">
+imbalance = (Q<sub>bid</sub> − Q<sub>ask</sub>) / (Q<sub>bid</sub> + Q<sub>ask</sub>)
+</div>
 
-### 7.1 脏读 (Dirty Reads)
-在使用 SeqLock 时，如果 Reader 读取了部分数据（比如 `price`），然后 Writer 修改了数据（`price` 变了），Reader 接着读取了 `quantity`。此时 Reader 读到的是 **新 Price + 旧 Quantity** 还是 **旧 Price + 新 Quantity**？
-SeqLock 只能保证事务的原子性（要么全旧，要么全新），前提是 Reader **不应该产生副作用**（如打印日志、发送网络包），并且在 `seq1 == seq2` 检查通过前，读取的数据都是**临时的**。
+分母为 0 时无定义。它只是当前可见订单簿特征，不保证价格方向。
 
-**危险**: 如果 Reader 基于脏数据除以零（Panic），或者数组越界（Panic），那么 SeqLock 的重试机制也救不了你。
-**解决**:
-1.  Reader 逻辑必须是 Panic-free 的。
-2.  对于数组索引，先做 clamp 或 check，即使数据是脏的。
+## 6. 订单簿不变量
 
-### 7.2 缓存行失效
-Writer 频繁写入会导致 Reader 的 Cache Line 失效（Ping-pong effect）。
-**解决**: 将 Reader 感兴趣的聚合数据（如 BBO, Imbalance）单独放在一个 Cache Line 中，与频繁变动的 L3 详细数据分开。
+- 行情序号连续，重复事件幂等处理；
+- 新增 Order ID 未存在，修改/删除的 ID 已存在；
+- 数量非负，减少量不超过剩余量；
+- 档位聚合量等于节点数量之和；
+- 双向链表前后关系一致，无环且首尾正确；
+- 正常连续交易状态下，两侧非空时 `best_bid < best_ask`；
+- 快照同时携带 `sequence` 和 `is_live`，策略不能只看价格。
+
+## 7. 面试追问
+
+**为什么不直接说 Mutex 太慢？**
+
+先用锁做正确基线；它是否影响目标 p99 取决于读写频率、临界区和部署。若有证据，再改成单写者或不可变快照，并比较复杂度和恢复语义。
+
+**L3 为什么不能安全地套用普通 SeqLock？**
+
+复杂 `T` 的普通并发读写在 Rust 中就是数据竞争；版本重试不能修复 UB。可发布不可变快照、传递事件，或把极小 POD 快照拆成原子字段。
+
+**只有 L2 时能恢复精确队列位置吗？**
+
+通常不能，因为聚合撤量无法说明发生在自己的前方还是后方，只能维护带假设的上下界。
+
+## 8. 易错点与验证方法
+
+- 不要保存指向可能扩容 `Vec` 元素的裸指针；
+- 不要把 HashMap 平均 O(1) 说成最坏 O(1)；
+- 不要让策略在 `stale` 订单簿上继续产生普通新单；
+- 不要在版本校验前产生发送订单等副作用；
+- 不要把特征与未来价格方向画等号。
+
+验证时使用协议 golden case、随机 Add/Cancel/Execute 性质测试、重复/缺口/快照恢复测试，并在每个事件后对小订单簿做全量不变量核对。并发发布可用 Loom 类模型测试；性能优化再用峰值回放比较端到端 p99。
 
 ---
+
 下一章：[风控系统 (Risk Management System)](risk.md)

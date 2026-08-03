@@ -20,9 +20,11 @@
 
 ## 2. 核心架构
 
-我们将构建一个全局配置管理器。
+我们将构建一个全局配置管理器。下面 2–3 节的三段代码属于**同一个 Cargo 项目**，依赖 `arc-swap`、`serde`（启用 `derive`）、`toml` 和 `anyhow`，单独复制其中一段并不完整，因此标为 `rust,ignore`。
 
-```rust
+验证时应把三段放进同一模块，在独立示例项目执行 `cargo add arc-swap toml anyhow`、`cargo add serde --features derive`，然后运行 `cargo check` 与包含并发读写、非法配置和文件替换的测试。`mdbook test` 本身不会替书中示例下载第三方依赖。
+
+```rust,ignore
 use arc_swap::ArcSwap;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -62,7 +64,7 @@ pub struct ConfigManager {
 
 读取路径必须极快。`ArcSwap::load` 返回一个 `Guard`，它类似于 `Arc`，但通常无需原子递增（取决于实现策略）。
 
-```rust
+```rust,ignore
 impl ConfigManager {
     pub fn new(initial_config: AppConfig) -> Self {
         Self {
@@ -86,7 +88,7 @@ impl ConfigManager {
 
 后台线程监控配置文件（如 `config.toml`），一旦变化，解析并原子替换。
 
-```rust
+```rust,ignore
 use std::fs;
 
 impl ConfigManager {
@@ -140,12 +142,44 @@ impl ConfigManager {
 例如，如果 `max_order_size` 被误设为 0，可能会导致除以零错误或无法下单。
 **Golden Rule**: 只有校验通过的配置才能被 swap 进去。
 
+下面把“先校验、后发布”写成独立的标准库示例，因此它会由 `mdbook test` 编译并执行断言：
+
 ```rust
-fn validate(&self) -> Result<(), String> {
-    if self.risk.max_order_size == 0 {
-        return Err("max_order_size cannot be 0".into());
+#[derive(Debug)]
+struct RiskConfig {
+    max_position: u32,
+    max_order_size: u32,
+}
+
+#[derive(Debug)]
+struct AppConfig {
+    risk: RiskConfig,
+}
+
+impl AppConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.risk.max_order_size == 0 {
+            return Err("max_order_size cannot be 0".into());
+        }
+        if self.risk.max_order_size > self.risk.max_position {
+            return Err("max_order_size cannot exceed max_position".into());
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+let valid = AppConfig {
+    risk: RiskConfig { max_position: 1_000, max_order_size: 100 },
+};
+assert!(valid.validate().is_ok());
+
+let invalid = AppConfig {
+    risk: RiskConfig { max_position: 1_000, max_order_size: 0 },
+};
+if let Err(message) = invalid.validate() {
+    assert_eq!(message, "max_order_size cannot be 0");
+} else {
+    panic!("zero order size must be rejected");
 }
 ```
 

@@ -1,240 +1,230 @@
 # 无锁数据结构 (Lock-Free Structures)
 
-在普通软件开发中，锁 (`Mutex`, `RwLock`) 是并发控制的基石。但在高频交易 (HFT) 系统中，锁是性能的毒药。
+锁不是“性能毒药”，无锁也不是“速度魔法”。两者首先是不同的**进展保证与状态协调方式**：Mutex 允许线程等待持锁者；lock-free 算法要求系统整体持续完成操作，即使某个参与者暂停。HFT 关心它们，是因为这种差异会影响尾延迟、调度依赖和缓存行争用。
 
-## 1. 为什么 HFT 痛恨锁？
+本章的目标是让你在面试中准确回答三个问题：lock-free 到底保证谁能前进？为什么它仍可能很慢？什么时候应当选择分片/SPSC，而不是继续堆 CAS？
 
-### 1.1 优先级反转 (Priority Inversion)
+## 1. 锁带来的风险，也要讲边界
 
-假设你有两个线程：
-- **线程 A (高优先级)**: 处理行情数据，延迟要求极高。
-- **线程 B (低优先级)**: 处理日志记录，延迟要求宽松。
+### 1.1 优先级反转
 
-如果 B 持有了一个锁（例如日志缓冲区的锁），此时 OS 调度器决定暂停 B（因为它优先级低）。接着 A 运行，试图获取同一个锁。A 将被阻塞，直到 OS 重新调度 B 并让 B 释放锁。
+假设低优先级日志线程 B 持有一把锁后被抢占，高优先级行情线程 A 随后请求同一把锁：
 
 ```mermaid
 sequenceDiagram
-    participant A as Thread A (High Prio)
-    participant B as Thread B (Low Prio)
-    participant L as Lock
-    
-    Note over B: Acquires Lock
-    B->>L: Lock()
-    Note over B: Preempted by OS
-    
-    Note over A: Wakes up (Market Data)
-    A->>L: Lock()
-    Note over A: BLOCKED! Waiting for B...
-    
-    Note over B: Resumes execution (eventually)
-    B->>L: Unlock()
-    
-    Note over A: Finally gets Lock
-    Note right of A: Huge Latency Spike!
+    participant A as High-priority A
+    participant B as Low-priority B
+    participant L as Mutex
+
+    B->>L: lock succeeds
+    Note over B: preempted while holding lock
+    A->>L: lock blocks
+    Note over A: waits for B to run and unlock
+    B->>L: unlock
+    L-->>A: lock succeeds
 ```
 
-结果：**高优先级的 A 被低优先级的 B 拖慢了**。在极端情况下，这可能导致数百微秒的延迟抖动。
+这叫**优先级反转**：高优先级任务的完成依赖低优先级持锁者先获得 CPU。优先级继承（priority inheritance）、缩短临界区和合理调度策略可以缓解，但无法把所有排队与缓存干扰变没。
 
-> **思考：无锁就能完全避免延迟吗？**
->
-> 答案是：**能避免"优先级反转"导致的死锁和挂起，但不能完全消除延迟抖动。**
->
-> 1.  **避免了挂起**: 无锁算法保证线程永远不会因为等待锁而被 OS 挂起。
-> 2.  **引入了"活锁"风险 (The Cost of CAS)**: 
->     无锁算法的核心是 **CAS (Compare-And-Swap, 比较并交换)**。
->     *   **原理**: 线程读取变量当前值 `A`，计算新值 `B`，然后告诉 CPU："如果内存里还是 `A`，就把它改成 `B`；否则告诉我失败"。
->     *   **场景**: 如果 10 个线程同时尝试修改同一个变量，同一时刻只有 1 个能成功，剩下 9 个都会失败。
->     *   **后果**: 失败的 9 个线程必须**重试 (Retry Loop)**。在高竞争下，高优先级线程可能连续失败多次，虽然它没有被 OS 挂起（Sleep），但它在 `while` 循环里空转浪费了 CPU 时间。这就是**无锁带来的特有延迟**（Mutex 的延迟来源是挂起，无锁的延迟来源是重试）。
-> 3.  **HFT 的终极方案**: 我们追求的是 **无等待 (Wait-Free)**。例如 **SPSC (Single Producer Single Consumer)** 队列，读写操作在不同的缓存行上，完全独立，没有任何竞争，连 CAS 都不需要。这才是真正的零抖动。
+无锁算法没有“持有互斥锁的线程”，因此能消除这类锁所有者依赖；但它不保证高优先级线程立刻成功：
 
-### 1.2 死锁与活锁 (Deadlock & Livelock)
+- 线程仍可能被操作系统抢占；
+- CAS 可能反复失败，单个线程可能饥饿；
+- 某些队列中，线程抢到槽位后被暂停，会留下尚未发布的洞，其他角色是否受影响取决于算法；
+- 缓存 miss、page fault、SMT 与 IRQ 仍然存在。
 
-虽然 Rust 的 `Mutex` 能防止数据竞争，但它不能防止逻辑死锁。在复杂的交易系统中，避免死锁的心智负担极重。
+所以准确说法是：**lock-free 给系统整体进展保证，不给单次操作固定延迟，也不等于“不会被 OS 挂起”。**
 
-*   **死锁 (Deadlock)**: 线程 A 持有锁 1 等锁 2，线程 B 持有锁 2 等锁 1，大家都卡死。
-    *   **无锁原理**: **把"互相等待"变成了"互相赛跑"**。
-    *   在无锁世界里，没有"持有"这一说。A 和 B 都在尝试修改同一个变量。CPU 硬件保证了同一时刻必然有一个人能 CAS 成功（赢家），另一个人失败重试（输家）。
-    *   既然总有一个赢家，系统就总能在前进，永远不会发生"大家都动不了"的情况。
-*   **活锁 (Livelock)**: 线程一直在运行，但一直在重试 (CAS 失败)，无法取得进展。
-    *   **无锁劣势**: 高竞争下，无锁算法容易退化为活锁。
+### 1.2 死锁、活锁与饥饿不是同一个词
 
-### 1.3 缓存行争用 (Cache Line Contention)
+- **死锁 (deadlock)**：参与者互相等待，形成无法自行打破的环；
+- **活锁 (livelock)**：线程一直执行、彼此响应，却没有任何操作完成；
+- **饥饿 (starvation)**：系统不断有操作完成，但某一个不走运的线程长期失败。
 
-**误区：无锁 = 无争用**。这是错误的。
+严格的 lock-free 算法不应出现“所有线程无限重试却没有任何完成”的永久活锁，否则它不满足系统整体进展定义；但它**允许个别线程饥饿**。面试中把“我的 CAS 连续失败”直接称为整个算法 livelock，容易暴露概念混淆。
 
-锁本质上是一个共享的原子变量。无锁算法中的 `AtomicU64` 也是一个共享的原子变量。当多个核心争抢这个变量时（无论通过 Mutex 还是 CAS），都会导致严重的 **Cache Line Bouncing**（缓存行在核心间跳来跳去），大幅降低吞吐量。
+### 1.3 无锁仍会严重争用
 
-**解决之道**:
-1.  **分片 (Sharding)**: 将一个热点计数器拆分为 N 个（每个 CPU 一个），最后求和。
-2.  **SPSC (单生产单消费)**: 唯一的 Wait-Free 且无争用的结构。Head 指针只被消费者改，Tail 指针只被生产者改，两者放在不同的 Cache Line 上。
+Mutex 的状态字和 CAS 热点本质上都可能成为被多个核心写的缓存行。竞争激烈时，缓存行会在核心之间反复取得独占权，导致：
 
+- CAS 失败与重试增多；
+- 互连和一致性流量上升；
+- 吞吐量不再线性扩展；
+- P99/P999 变差，即使平均延迟看起来不错。
 
-## 2. 什么是无锁 (Lock-Free)？
+HFT 常见的第一选择不是“把 Mutex 改成 CAS”，而是改变所有权拓扑：按 symbol/account 分片、单写者拥有状态、每个生产者使用独立 SPSC，再由消费者聚合。
 
-很多初学者认为 "无锁" 就是 "没有任何同步机制，大家随便跑"，这是完全错误的。无锁不仅有同步，而且通常比有锁更复杂。
+## 2. 四级进展保证
 
-### 2.1 直观比喻：悲观 vs 乐观
+“无锁”有严格含义，不是泛指代码里没出现 `Mutex`。
 
-想象一个会议室里有一块白板，大家都要去写字。
-
-*   **有锁 (Mutex) - 悲观策略**:
-    *   会议室门口有一把**唯一的钥匙**。
-    *   你想写字，必须先抢到钥匙。
-    *   抢到了：进去锁门，慢慢写，写完出来还钥匙。
-    *   没抢到：**在门口睡觉 (Sleep/Block)**，直到有人叫醒你。
-    *   **风险**: 如果拿钥匙的人在里面睡着了（线程挂起/崩溃），所有人都得在门口死等。
-
-*   **无锁 (Lock-Free) - 乐观策略**:
-    *   会议室**没有门**，大家随时都能进。
-    *   你想写字，先看一眼白板上现在的数字是 `A`。
-    *   你在脑子里计算好新数字 `B`。
-    *   你冲上去，对白板说：**"如果现在还是 A，就把它改成 B；如果不是 A（说明被别人改过了），告诉我现在的数字是什么，我重新算。"**
-    *   **结果**:
-        *   总有人能成功（系统在前进）。
-        *   失败的人不需要睡觉，而是**立即重试 (Retry)**。
-        *   **优势**: 即使你在里面睡着了，别人照样能改写白板，不会被你卡死。
-
-### 2.2 严谨定义
-
-> **Lock-Free 定义**: 只要还有一个线程在运行，系统整体就能一直取得进展 (System-wide Progress)。它保证了**没有死锁**，且**至少有一个线程能成功**。
-
-### 2.3 无锁解决了什么？没解决什么？
-
-回到开头提到的 HFT 三大痛点，无锁技术到底解决了哪些？
-
-| 痛点 | 锁 (Mutex) | 无锁 (Lock-Free) | 结果 |
+| 级别 | 保证 | 某线程暂停时会怎样 | 常见直觉 |
 | :--- | :--- | :--- | :--- |
-| **1. 优先级反转 (挂起)** | **严重**。高优先级线程会被 OS 挂起，等待低优先级线程。 | **完美解决**。线程永远不会被挂起，只会在用户态重试。 | ✅ 胜出 |
-| **2. 死锁 (Deadlock)** | **有风险**。需要小心设计锁顺序。 | **完美解决**。没有锁，自然没有死锁。 | ✅ 胜出 |
-| **3. 活锁 (Livelock)** | 无 (线程直接睡觉去了)。 | **新风险**。竞争激烈时，线程可能一直在重试，消耗 CPU 却无进展。 | ⚠️ 代价 |
-| **4. 缓存行争用 (Contention)** | **严重**。多核争抢同一个内存地址。 | **依然严重**。CAS 本质上还是争抢同一个内存地址，硬件开销一样大。 | ❌ 未解决 |
+| Blocking | 不提供非阻塞进展保证 | 持锁者暂停可能阻塞所有等待者 | 一把钥匙 |
+| Obstruction-free | 线程单独运行足够久可完成 | 持续冲突时可能无人完成 | 没人干扰就能做完 |
+| Lock-free | 系统整体在有限步骤内不断有操作完成 | 个别线程可饥饿 | 总有人完成 |
+| Wait-free | 每个操作都在有界步骤内完成 | 其他线程暂停不阻止本操作结束 | 每个人都有完成上界 |
 
-> **一句话总结**: 
-> *   **Mutex (悲观)**: "这块地盘是我的，你们都别动，也不准看，去睡觉等着。" -> **容易被单人卡死整个系统**。
-> *   **Lock-Free (乐观)**: "大家都能看，大家都能算。虽然只有一个人能提交成功，但没人会被堵住嘴，也没人会被赶去睡觉。" -> **保证了系统总是在流动**。
+这里的“步骤”是算法模型中的操作步数，不等于墙钟时间。wait-free 线程仍可能被 OS 抢占 10ms；算法只承诺它重新执行后不需要无限等待其他参与者。
 
-**结论**: 
-*   无锁消除了**操作系统调度 (OS Scheduling)** 带来的不确定性（解决了最致命的延迟尖峰）。
-*   但无锁**没有**消除**硬件物理争用 (Hardware Contention)**。
-*   **HFT 的终极方案**: 为了解决第 3 和第 4 点，我们必须更进一步，使用 **无等待 (Wait-Free)** 结构（如 SPSC 队列），彻底消除竞争。
+### 2.1 一个重要的 API 边界
 
-*   **Wait-Free (无等待)**: 比 Lock-Free 更强。它保证**每一个线程**都能在有限步数内完成操作，无论其他线程在做什么。这是 HFT 的终极目标（如 SPSC 队列）。
+有界 SPSC 的 `try_push` 可以在固定步骤内返回 `Ok` 或 `Full`，因此可具有 wait-free 风格的进展保证。但下面这个完整标准库示例把 `SyncSender::try_send` 包成自旋重试；只要消费者不腾出容量，它就不再有完成上界：
 
-```mermaid
-graph TD
-    subgraph Lock-Based [有锁: 悲观]
-        T1[线程 1] -- 等待锁 --> T2[线程 2 (持有者)]
-        T2 -- 被 OS 挂起 --> Stall[系统停滞 (没人能动)]
-    end
-    
-    subgraph Lock-Free [无锁: 乐观]
-        LF1[线程 1] -- CAS 失败 --> Retry[立即重试]
-        LF2[线程 2] -- CAS 成功 --> Progress[系统前进了]
-        Retry --> LF1
-    end
-    
-    style Stall fill:#f99,stroke:#333
-    style Progress fill:#dfd,stroke:#333
-```
+```rust,no_run
+use std::sync::mpsc::{SyncSender, TrySendError};
 
-### 2.4 深入思考：为什么 SPSC 是无争用的？(Why SPSC is Contention-Free?)
-
-这是一个极好的问题。既然生产者必须**读取** `head`（检查队列满没满），消费者必须**写入** `head`（通知我消费完了），这难道不是共享变量吗？为什么说是"无争用"？
-
-答案在于 **MESI 状态的非对称性**：
-
-1.  **生产者 (Core P)**:
-    *   **只写 Tail**: 它拥有 `Tail` 的 **M (Modified)** 状态。
-    *   **只读 Head**: 它只需要 `Head` 的 **S (Shared)** 状态。
-
-2.  **消费者 (Core C)**:
-    *   **只写 Head**: 它拥有 `Head` 的 **M (Modified)** 状态。
-    *   **只读 Tail**: 它只需要 `Tail` 的 **S (Shared)** 状态。
-
-**关键点**:
-*   虽然生产者要读 `Head`，但它**永远不会去写 Head**。
-*   虽然消费者要读 `Tail`，但它**永远不会去写 Tail**。
-
-这意味着：
-*   `Head` 的所有权 (Ownership) **永远稳定**在消费者手里。
-*   `Tail` 的所有权 (Ownership) **永远稳定**在生产者手里。
-
-**没有所有权争夺 (No Ownership Transfer)**。也就没有昂贵的 **RFO (Read-For-Ownership)** 广播。虽然数据依然需要在核心间传输（更新后的值要同步过去），但这比两个人都想**写**同一个变量（都要抢 M 状态）要便宜得多。
-
-此外，我们还可以通过 **Shadow Head/Tail** 进一步减少这种只读的同步频率（批量更新），这将在 [Ring Buffer](../infrastructure/ring_buffer.md) 章节详细展开。
-
-## 3. 核心工具：原子操作 (Atomics)
-
-Rust 通过 `std::sync::atomic` 提供了对 CPU 原子指令的直接访问。最著名的就是 **CAS (Compare-and-Swap)**。
-
-### 3.1 CAS 循环模式
-这是无锁编程中最常见的模式：
-
-```rust
-use std::sync::atomic::{AtomicU64, Ordering};
-
-fn add_to_atomic(atomic: &AtomicU64, val: u64) {
-    let mut current = atomic.load(Ordering::Relaxed);
+fn send_with_spin<T>(sender: &SyncSender<T>, mut value: T) -> Result<(), T> {
     loop {
-        let new_val = current + val;
-        // 尝试更新：如果当前值仍等于 current，则设为 new_val
-        // 否则返回当前的最新值（Err 中包含最新值）
-        match atomic.compare_exchange(
-            current, 
-            new_val, 
-            Ordering::Acquire, // 成功时的内存屏障
-            Ordering::Relaxed  // 失败时的内存屏障
-        ) {
-            Ok(_) => break, // 更新成功
-            Err(v) => current = v, // 更新失败，重试
+        match sender.try_send(value) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(returned)) => {
+                // try_send 失败时会归还所有权，下一轮才能再次提交。
+                value = returned;
+                std::hint::spin_loop();
+            }
+            Err(TrySendError::Disconnected(returned)) => return Err(returned),
         }
     }
 }
 ```
 
-### 3.2 内存顺序 (Memory Ordering)
-这是无锁编程中最难的部分。Rust 提供了 5 种顺序：
-- `Relaxed`: 只保证原子性，不保证顺序。最快。
-- `Acquire` / `Release`: 用于构建临界区。`Release` 之前的写操作对 `Acquire` 之后的读操作可见。
-- `AcqRel`: 同时包含上述两者。
-- `SeqCst`: 全局顺序一致。最慢。
+只要消费者不前进，循环就不会结束。分析进展保证时，必须明确讨论的是**单次 try 操作**、阻塞包装，还是整个业务请求。
 
-在 HFT 中，我们通常使用 `Acquire` / `Release` 来同步数据，使用 `Relaxed` 来处理单纯的计数器。
+## 3. 为什么 SPSC 快，但不是“零通信”
 
-## 4. 常见陷阱：ABA 问题
+本书统一约定：
 
-说实话，**在 HFT 中，ABA 问题通常是一个"伪命题"**。
+- 生产者独占写 `head`，消费者只读 `head`；
+- 消费者独占写 `tail`，生产者只读 `tail`。
 
-### 4.1 什么是 ABA？
-简单来说：你看到门是关着的（状态 A），你离开了一会儿，回来看到门还是关着的（状态 A）。你以为这期间没人进出，但实际上可能有人进去（B）又出来（A）了。
+它不需要 CAS，是因为每个游标只有一个写者，没有 write/write 抢占新序号。但读者要观察写者的新值，缓存行仍需跨核传播：写者修改后是独占/Modified 状态，另一核心读取会触发共享或转移；写者下一次修改时又需要写权限。
 
-对于 **CAS 指令** 来说，它只比较值是否相等。如果一个指针的值从 `0x1000` 变成了 `0x2000` 又变回 `0x1000`，CAS 会认为它没变，从而执行了错误的操作。这在实现 **无锁栈 (Lock-Free Stack)** 或 **链表** 时是致命的（可能导致内存被错误释放或重用）。
+因此更准确的描述是：
 
-### 4.2 为什么 HFT 不太关心？
-ABA 问题主要发生在 **动态内存分配** 的场景中（节点被释放后又被 malloc 出来，恰好地址一样）。
+1. SPSC 消除了**多写者 CAS 热点**；
+2. head 与 tail 分缓存行，避免两个游标互相伪共享；
+3. 生产者缓存远端 tail、消费者缓存远端 head，只在可能满/空时刷新，减少跨核读取；
+4. 数据槽位本身仍要从生产者发布给消费者，不可能完全没有一致性通信。
 
-但在 HFT 中，我们的核心原则是：**Zero Allocation (零分配)**。
-1.  我们不使用链表，只使用 **Ring Buffer**（数组）。
-2.  我们在启动时预分配所有内存。
-3.  我们不释放内存，只循环使用。
+```mermaid
+flowchart LR
+    P["Producer<br/>writes head"] -->|"Release publish"| H["head cache line"]
+    H -->|"Acquire observe"| C["Consumer"]
+    C -->|"Release return"| T["tail cache line"]
+    T -->|"Acquire observe"| P
+```
 
-**结论**: 如果你不做动态 `malloc/free`，就不太会遇到经典的 ABA 问题。我们在 Ring Buffer 中使用的是 `u64` 递增序列号（Head/Tail），这天然免疫 ABA（因为序列号只会增加，不会回头）。
+完整、安全的双句柄实现见 [Ring Buffer](ring_buffer.md)。
 
-> **面试指南**: 面试官问 ABA，你可以回答："我知道 ABA 是什么（通过版本号解决），但在我的 HFT 系统设计中，我通过预分配和 Ring Buffer 彻底规避了这个问题，因为我们不允许运行时动态分配节点。" 这会显得你非常专业。
+## 4. CAS：工具，不是 lock-free 证明
 
-### 4.3 通用解法 (仅作了解)
-如果你非要写动态数据结构：
-1.  **版本号 (Versioning)**: 将指针和版本号打包在一起（如 `AtomicU128` 或 `Tagged Pointer`）。每次修改版本号 +1。
-2.  **内存回收策略 (Reclamation)**:
-    - **Epoch-based Reclamation (EBR)**: 只有当所有线程都离开了当前的“纪元”，才真正释放内存。（Rust 库 `crossbeam-epoch` 就用了这个）。
-    - **Hazard Pointers**: 线程声明自己正在访问某个指针，其他线程即使要删也不能删。
+CAS（Compare-And-Swap）表达：“只有当前值仍等于我观察到的旧值，才写入新值。”多个线程竞争时，失败者根据新状态重试。
 
-## 5. 延伸阅读：缓存行争用与伪共享
+下面用 CAS 更新最大序号；这里只关心原子值本身，不发布其他数据，所以 `Relaxed` 足够：
 
-虽然无锁消除了 OS 调度延迟，但它无法消除硬件层面的 **Cache Line Contention**。特别是 **伪共享 (False Sharing)**，是无锁编程中的隐形杀手。
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
 
-关于 **MESI 协议**、**伪共享** 以及如何使用 `CachePadded` 进行优化的详细内容，请参考基础篇：
-👉 [内存布局与缓存效率 (Memory Layout & Cache Efficiency)](../foundations/memory_layout.md#12-mesi-协议与伪共享-mesi--false-sharing)
+fn update_max(max_seen: &AtomicU64, candidate: u64) {
+    let mut current = max_seen.load(Ordering::Relaxed);
+
+    while candidate > current {
+        match max_seen.compare_exchange_weak(
+            current,
+            candidate,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+```
+
+`compare_exchange_weak` 允许伪失败，放在循环中通常合适。若 CAS 成功还负责发布此前写入的数据，成功 Ordering 可能需要 `Release`/`AcqRel`；若失败后要读取对方发布的数据，失败 Ordering 可能需要 `Acquire`。
+
+> CAS 循环只是实现形状，不是 lock-free 证明。你还必须证明：所有可能交错中，只要线程持续执行，系统就会不断有操作完成；还要处理内存回收、ABA 和 panic/取消路径。
+
+Ordering 的完整推导见 [原子操作与内存顺序](atomics.md)。
+
+## 5. ABA 与内存回收
+
+### 5.1 什么是 ABA
+
+线程 1 读取状态 A 后暂停；线程 2 把状态改为 B，再改回数值相同的 A。线程 1 的 CAS 只比较比特，可能误以为“期间什么都没发生”。
+
+```text
+Thread 1: read A ---------------------- CAS(A -> C) succeeds?
+Thread 2:          A -> B -> A
+```
+
+在无锁栈/链表中，A 常是节点地址。节点被移除、释放并在同一地址重新分配后，地址相同但对象身份已变；更严重的是，线程 1 可能已经持有悬垂指针。
+
+### 5.2 预分配能降低风险，但不自动免疫
+
+固定 Ring Buffer 不回收链表节点，确实避开了经典的“地址释放后复用”问题。但 ABA 也可以发生在任何会回到旧比特模式的状态机中；有限位宽序号最终还会 wrapping。
+
+每槽位 generation/sequence 能区分不同轮次，配合容量不变量可把风险控制在算法证明内。不能只说“u64 只会增加所以天然免疫”：`u64` 会溢出，Rust 代码还常主动使用 wrapping 算术。工程上 64 位回绕可能极其遥远，数学证明仍需说明回绕为什么不会造成歧义。
+
+### 5.3 常见方案
+
+1. **Tagged pointer / 版本号**：把地址与 generation 一起比较；注意位宽与回绕；
+2. **Epoch-based reclamation (EBR)**：等所有相关线程离开旧 epoch 后再释放；
+3. **Hazard pointer**：线程先公布自己可能解引用的节点，回收者延迟释放；
+4. **所有权重构**：固定槽位、单写者或索引句柄，减少动态共享指针。
+
+内存回收通常比 CAS 本身更难。错误的 Ordering 也许在 ARM 压测才暴露，错误的回收则可能直接变成 use-after-free。
+
+## 6. 怎么选：Mutex、无锁还是分片
+
+| 场景 | 推荐起点 | 理由 |
+| :--- | :--- | :--- |
+| 冷路径、临界区短、竞争低 | Mutex | 最容易证明和维护，未必比复杂 CAS 慢 |
+| 配置快照、读多写少 | 不可变快照/RCU 风格 | 读路径简单，更新集中 |
+| 一对一流水线 | 有界 SPSC | 单写者、无 CAS、背压明确 |
+| 多生产者日志 | 每生产者 SPSC + 聚合，或成熟 MPSC | 避免共享 tail 热点，按复杂度取舍 |
+| 通用动态无锁容器 | 优先成熟库 | 回收、ABA、取消与 panic 安全很难自行覆盖 |
+
+评估时至少同时报告：吞吐量、P50/P99/P999、CPU 占用、CAS 失败次数、队列满/空次数、线程与 NUMA 拓扑。只展示单线程平均耗时，无法说明并发结构是否适合 HFT。
+
+## 7. 常见陷阱
+
+1. **把 lock-free 当 wait-free**：系统前进不代表我的订单能在固定步数完成；
+2. **把无锁当无调度**：线程照样会被抢占、迁核和中断；
+3. **自己写回收协议**：能通过功能测试远远不够，应使用 Loom 等模型测试小交错，并优先选择审计过的库；
+4. **忽略退避**：CAS 失败后所有线程立即猛冲，会加重缓存行流量；退避改善吞吐，却也会改变尾延迟与公平性；
+5. **无界重试没有过载策略**：系统过载时，自旋可能把宝贵 CPU 全耗在失败上；
+6. **把 x86 成功当跨平台证明**：弱内存架构更容易暴露错误 Ordering。
+
+## 8. 面试快问快答
+
+### Q1：Lock-free 是否保证当前线程不会饿死？
+
+不保证。它只保证系统整体持续有操作完成。保证每个操作在有界步骤内结束的是 wait-free。
+
+### Q2：无锁为什么仍可能比 Mutex 慢？
+
+高竞争 CAS 会制造失败重试和缓存行迁移；Mutex 在低竞争、短临界区时可能走很快的用户态路径。算法复杂度还会增加指令和 I-cache 压力。
+
+### Q3：SPSC 为什么不用 CAS？
+
+head 与 tail 各有唯一写者，不需要多个线程竞争“谁获得下一个值”。但游标和数据仍通过 Acquire/Release 跨核发布，并非没有同步成本。
+
+### Q4：预分配是否彻底解决 ABA？
+
+它能规避动态节点地址释放/复用这一经典来源，但任何状态回到旧比特模式都可能产生 ABA。仍需 generation、容量/回绕证明或其他协议。
+
+## 9. 本章小结
+
+- Lock-free 保证系统整体进展，wait-free 才保证每个操作的步骤上界；
+- 无锁减少对持锁者的依赖，却不消除调度、饥饿和缓存争用；
+- SPSC 的优势来自单写者和明确槽位所有权，不是“完全没有缓存通信”；
+- CAS、Ordering、ABA 与内存回收必须形成一条完整证明链；
+- HFT 中最有效的无锁优化常常是减少共享：分片、单写者和有界消息通道。
+
+进一步阅读：[内存布局与缓存效率](../foundations/memory_layout.md#12-mesi-协议与伪共享-mesi--false-sharing)、[Ring Buffer](ring_buffer.md) 与 [Rust Atomics and Locks](https://marabos.nl/atomics/)。
 
 ---
-下一章：[Ring Buffer 实现](ring_buffer.md) - 我们将动手实现一个高性能的无锁环形缓冲区。
+下一章：[Ring Buffer 实现](ring_buffer.md)。

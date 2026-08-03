@@ -1,57 +1,372 @@
-/* Generated Table of Contents in Sidebar */
+:root {
+    --book-accent: #0f766e;
+    --book-accent-strong: #0b5f59;
+    --book-accent-soft: rgba(15, 118, 110, 0.10);
+    --book-blue: #2563eb;
+    --book-amber: #b45309;
+    --book-border: color-mix(in srgb, currentColor 16%, transparent);
+    --book-panel: color-mix(in srgb, var(--bg) 94%, var(--book-accent) 6%);
+    --book-shadow: 0 14px 34px rgba(15, 23, 42, 0.08);
+}
+
+html {
+    scroll-behavior: smooth;
+}
+
+.content main {
+    max-width: 940px;
+    line-height: 1.78;
+}
+
+.content main > :first-child {
+    margin-top: 0;
+}
+
+.content main h1 {
+    margin-bottom: 1.1rem;
+    letter-spacing: -0.025em;
+    line-height: 1.25;
+}
+
+.content main h2 {
+    margin-top: 2.8rem;
+    padding-bottom: 0.45rem;
+    border-bottom: 1px solid var(--book-border);
+    letter-spacing: -0.015em;
+}
+
+.content main h3 {
+    margin-top: 2rem;
+}
+
+.content main p,
+.content main li {
+    text-wrap: pretty;
+}
+
+.content main a:not(.header) {
+    text-underline-offset: 0.18em;
+    text-decoration-thickness: 0.08em;
+}
+
+.content main a:not(.header):hover {
+    text-decoration-thickness: 0.14em;
+}
+
+/* Landing-page hero */
+.book-hero {
+    position: relative;
+    overflow: hidden;
+    margin: 0.6rem 0 2rem;
+    padding: clamp(1.35rem, 4vw, 2.6rem);
+    border: 1px solid rgba(15, 118, 110, 0.25);
+    border-radius: 18px;
+    background:
+        radial-gradient(circle at 90% 10%, rgba(37, 99, 235, 0.18), transparent 34%),
+        linear-gradient(135deg, rgba(15, 118, 110, 0.16), rgba(37, 99, 235, 0.07));
+    box-shadow: var(--book-shadow);
+}
+
+.book-hero::after {
+    content: "";
+    position: absolute;
+    width: 180px;
+    height: 180px;
+    right: -82px;
+    bottom: -105px;
+    border: 24px solid rgba(15, 118, 110, 0.09);
+    border-radius: 50%;
+    pointer-events: none;
+}
+
+.book-hero__eyebrow {
+    margin: 0 0 0.55rem;
+    color: var(--book-accent-strong);
+    font-size: 0.76rem;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+}
+
+.book-hero__lead {
+    max-width: 720px;
+    margin: 0;
+    font-size: clamp(1.08rem, 2.4vw, 1.38rem);
+    font-weight: 650;
+    line-height: 1.5;
+}
+
+.book-hero__badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 1.25rem;
+}
+
+.book-hero__badges span {
+    padding: 0.26rem 0.65rem;
+    border: 1px solid rgba(15, 118, 110, 0.28);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    font-size: 0.78rem;
+    font-weight: 650;
+}
+
+/* Blockquotes double as readable callout cards. */
+.content main blockquote {
+    margin: 1.4rem 0;
+    padding: 0.9rem 1.1rem 0.9rem 1.2rem;
+    border: 1px solid rgba(15, 118, 110, 0.22);
+    border-left: 4px solid var(--book-accent);
+    border-radius: 0 12px 12px 0;
+    background: var(--book-accent-soft);
+    color: inherit;
+}
+
+.content main blockquote > :first-child {
+    margin-top: 0;
+}
+
+.content main blockquote > :last-child {
+    margin-bottom: 0;
+}
+
+.content main blockquote strong:first-child {
+    color: var(--book-accent-strong);
+}
+
+/* Tables stay useful on narrow screens. */
+.table-scroll {
+    width: 100%;
+    margin: 1.35rem 0;
+    overflow-x: auto;
+    border: 1px solid var(--book-border);
+    border-radius: 12px;
+    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
+}
+
+.table-scroll table {
+    width: 100%;
+    min-width: 560px;
+    margin: 0;
+    border-collapse: collapse;
+}
+
+.content main table th {
+    background: var(--book-accent-soft);
+    font-weight: 700;
+    text-align: left;
+}
+
+.content main table th,
+.content main table td {
+    padding: 0.68rem 0.78rem;
+    border-color: var(--book-border);
+    vertical-align: top;
+}
+
+.content main table tbody tr:nth-child(even) {
+    background: color-mix(in srgb, var(--book-panel) 70%, transparent);
+}
+
+.content main table tbody tr:hover {
+    background: var(--book-accent-soft);
+}
+
+/* Code and diagrams */
+.content main :not(pre) > code {
+    padding: 0.08em 0.32em;
+    border: 1px solid var(--book-border);
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--bg) 86%, var(--book-accent) 14%);
+    font-size: 0.9em;
+}
+
+.content main pre {
+    border: 1px solid var(--book-border);
+    border-radius: 12px;
+    box-shadow: 0 7px 20px rgba(15, 23, 42, 0.06);
+}
+
+.content main .mermaid {
+    margin: 1.5rem 0;
+    padding: 1rem;
+    overflow-x: auto;
+    border: 1px solid var(--book-border);
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--bg) 97%, white 3%);
+    text-align: center;
+}
+
+.content main hr {
+    height: 1px;
+    margin: 2.8rem 0;
+    border: 0;
+    background: linear-gradient(90deg, transparent, var(--book-border), transparent);
+}
+
+/* Scroll progress gives long interview chapters a sense of position. */
+.book-reading-progress {
+    position: fixed;
+    z-index: 1000;
+    top: 0;
+    left: 0;
+    width: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--book-accent), var(--book-blue));
+    box-shadow: 0 0 8px rgba(15, 118, 110, 0.38);
+    pointer-events: none;
+}
+
+/* Generated table of contents inside the current sidebar chapter. */
 .sidebar .chapter-item.section-link {
-    margin-top: 0.2em;
-    margin-bottom: 0.2em;
+    margin: 0.08em 0;
     list-style: none;
 }
 
 .sidebar .generated-toc {
+    margin: 0.45em 0 0.7em 10px;
     padding-left: 0;
-    margin-left: 0;
+    border-left: 2px solid var(--book-border);
 }
 
 .sidebar .chapter-item.section-link a {
-    padding-left: 20px;
-    font-size: 0.9em;
-    color: var(--sidebar-fg);
-    opacity: 0.8;
-    transition: color 0.2s, opacity 0.2s;
-    text-decoration: none;
     display: block;
-    width: 100%;
     box-sizing: border-box;
-    padding-top: 3px;
-    padding-bottom: 3px;
-}
-
-/* H3 items indented further */
-.sidebar .chapter-item.section-link.h3-section a {
-    padding-left: 35px;
-    font-size: 0.85em;
-    opacity: 0.7;
-}
-
-/* Hover effects */
-.sidebar .chapter-item.section-link a:hover {
-    color: var(--sidebar-active);
-    opacity: 1;
-    background-color: var(--sidebar-hover-bg, rgba(0, 0, 0, 0.05));
+    width: 100%;
+    padding: 3px 8px 3px 14px;
+    color: var(--sidebar-fg);
+    font-size: 0.86em;
+    line-height: 1.35;
     text-decoration: none;
+    opacity: 0.72;
+    transition: color 0.16s, opacity 0.16s, background 0.16s;
 }
 
-/* Make sure the generated list looks like part of the sidebar */
-.sidebar ol.generated-toc {
-    margin-top: 0.5em;
-    margin-bottom: 0.5em;
-    border-left: 2px solid var(--sidebar-active, #ccc);
-    /* Visual cue connecting sections */
-    margin-left: 10px;
-    /* Indent the whole block slightly */
+.sidebar .chapter-item.section-link.h3-section a {
+    padding-left: 26px;
+    font-size: 0.81em;
 }
 
-/* Dark mode adjustments if needed (vars handle most of it) */
-@media (prefers-color-scheme: dark) {
-    .sidebar .chapter-item.section-link a {
-        color: var(--sidebar-fg);
+.sidebar .chapter-item.section-link a:hover,
+.sidebar .chapter-item.section-link a.current-section {
+    color: var(--sidebar-active);
+    background: var(--sidebar-hover-bg, rgba(15, 118, 110, 0.07));
+    opacity: 1;
+}
+
+/* Dark themes do not expose all colors as variables, so tune our accents. */
+html.coal,
+html.navy,
+html.ayu {
+    --book-accent: #5eead4;
+    --book-accent-strong: #99f6e4;
+    --book-accent-soft: rgba(45, 212, 191, 0.10);
+    --book-blue: #60a5fa;
+    --book-border: rgba(226, 232, 240, 0.16);
+    --book-shadow: 0 16px 38px rgba(0, 0, 0, 0.22);
+}
+
+html.coal .book-hero__badges span,
+html.navy .book-hero__badges span,
+html.ayu .book-hero__badges span {
+    background: rgba(15, 23, 42, 0.28);
+}
+
+/* Keyboard and mobile accessibility */
+a:focus-visible,
+button:focus-visible {
+    outline: 3px solid color-mix(in srgb, var(--book-accent) 70%, white 30%);
+    outline-offset: 3px;
+}
+
+/* Formulas are rendered locally: readable without a CDN or client-side math engine. */
+.content main .formula {
+    margin: 1.25rem 0;
+    padding: 0.9rem 1rem;
+    overflow-x: auto;
+    border: 1px solid var(--book-border);
+    border-radius: 10px;
+    background: var(--book-panel);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 1.05em;
+    line-height: 1.65;
+    text-align: center;
+    white-space: nowrap;
+}
+
+.content main .formula sub,
+.content main .formula sup {
+    line-height: 0;
+}
+
+@media (max-width: 700px) {
+    .content main {
+        line-height: 1.7;
+    }
+
+    .content main h1 {
+        font-size: 2.8rem;
+        line-height: 1.28;
+    }
+
+    .book-hero {
+        border-radius: 13px;
+    }
+
+    .content main h2 {
+        margin-top: 2.25rem;
+    }
+
+    .content main table th,
+    .content main table td {
+        padding: 0.58rem 0.65rem;
+    }
+
+    .content main .mermaid svg {
+        min-width: 720px;
+        max-width: none;
+    }
+
+    .content main .mermaid::before {
+        content: "← 左右滑动查看完整图 →";
+        position: sticky;
+        left: 0;
+        display: block;
+        width: max-content;
+        margin: 0 0 0.6rem;
+        padding: 0.18rem 0.5rem;
+        border-radius: 999px;
+        background: var(--book-accent-soft);
+        color: var(--book-accent-strong);
+        font-size: 0.72rem;
+        font-weight: 700;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    html {
+        scroll-behavior: auto;
+    }
+
+    * {
+        transition-duration: 0.01ms !important;
+    }
+}
+
+@media print {
+    .book-reading-progress,
+    .sidebar .generated-toc {
+        display: none !important;
+    }
+
+    .book-hero,
+    .content main blockquote,
+    .table-scroll,
+    .content main pre {
+        box-shadow: none;
+    }
+
+    .table-scroll {
+        overflow: visible;
     }
 }

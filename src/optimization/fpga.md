@@ -1,8 +1,8 @@
 # FPGA 交互 (Rust Bindings)
 
-在极致的 HFT 军备竞赛中，通用 CPU (x86) 即使经过所有优化，也面临物理瓶颈（PCIe 往返延迟、OS 调度、缓存未命中）。当软件优化达到极限（~2-5µs Tick-to-Trade），下一步就是硬件加速。
+通用 CPU 即使经过优化，也会受到 PCIe、调度和缓存未命中的影响。对延迟价值足够高、逻辑足够稳定的路径，团队可能评估 FPGA；这不是软件达到某个固定微秒数后的自动“下一步”。
 
-现场可编程门阵列 (FPGA) 允许我们将网络协议解析、预交易风控甚至核心执行逻辑“烧录”到硬件电路中，实现 **< 1µs** 甚至 **< 200ns** 的线速延迟。
+现场可编程门阵列 (FPGA) 可以把协议解析、预交易风控和部分执行逻辑实现为确定的数据通路。延迟可能达到亚微秒级，但数字取决于测量边界：wire-to-wire、MAC-to-MAC、PCIe 往返和完整 tick-to-trade 不能混着比较。
 
 本章不讨论 Verilog/VHDL 编写，而是聚焦于 **Rust 如何高效地与 FPGA 交互**。
 
@@ -33,10 +33,11 @@ Rust 与 FPGA 的通信通常通过 **PCIe** 总线，涉及两种主要机制�
 
 假设 FPGA 暴露了一个控制寄存器（Bar 0, Offset 0x100），写入 1 表示启动，写入 0 表示停止。
 
-```rust
+下面代码依赖外部 `memmap2`、`libc` crate、Unix 的 `OpenOptionsExt`，以及真实 UIO 设备/驱动 ABI，因此不作为普通 doctest。把依赖锁入项目后，先用 mock 映射测试 offset/边界逻辑，再在隔离测试机上用厂商寄存器测试设计验证读写；不要在开发机上随意写真实 BAR。
+
+```rust,ignore
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::AsRawFd;
 use memmap2::{MmapOptions, MmapMut};
 
 pub struct FpgaDevice {
@@ -48,7 +49,7 @@ impl FpgaDevice {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_SYNC) // 确保写入不被 CPU 缓存
+            .custom_flags(libc::O_SYNC)
             .open(uio_path)
             .expect("Failed to open UIO device");
 
@@ -66,97 +67,120 @@ impl FpgaDevice {
     /// offset 必须是 4 的倍数
     #[inline(always)]
     pub unsafe fn write_reg(&mut self, offset: usize, value: u32) {
-        let ptr = self.bar0.as_mut_ptr().add(offset) as *mut u32;
-        // 使用 volatile 写入，防止编译器优化
-        std::ptr::write_volatile(ptr, value);
+        assert_eq!(offset % std::mem::align_of::<u32>(), 0);
+        let end = offset
+            .checked_add(std::mem::size_of::<u32>())
+            .expect("register offset overflow");
+        assert!(end <= self.bar0.len());
+        let ptr = unsafe { self.bar0.as_mut_ptr().add(offset).cast::<u32>() };
+        // SAFETY: 调用者保证 offset 对应可写 MMIO 寄存器；边界与对齐已检查。
+        unsafe { std::ptr::write_volatile(ptr, value) };
     }
 
     /// 读取 32 位寄存器
+    ///
+    /// # Safety
+    /// 调用者必须确认 offset 对应允许读取的寄存器，并理解读取副作用。
     #[inline(always)]
-    pub fn read_reg(&self, offset: usize) -> u32 {
-        let ptr = self.bar0.as_ptr() as *const u8;
-        unsafe {
-            let reg_ptr = ptr.add(offset) as *const u32;
-            std::ptr::read_volatile(reg_ptr)
-        }
+    pub unsafe fn read_reg(&self, offset: usize) -> u32 {
+        assert_eq!(offset % std::mem::align_of::<u32>(), 0);
+        let end = offset
+            .checked_add(std::mem::size_of::<u32>())
+            .expect("register offset overflow");
+        assert!(end <= self.bar0.len());
+        let reg_ptr = unsafe { self.bar0.as_ptr().add(offset).cast::<u32>() };
+        // SAFETY: offset 对应可读 MMIO 寄存器；边界与对齐已检查。
+        unsafe { std::ptr::read_volatile(reg_ptr) }
     }
 }
 ```
+
+`volatile` 只阻止编译器删除或合并这次访问，不自动提供跨线程同步、DMA 可见性或平台所需的 device-memory barrier。寄存器宽度、端序、读写副作用和 barrier 顺序必须来自 FPGA/驱动 ABI。
 
 ### 2. 零拷贝 DMA 环形缓冲区
 
 对于高吞吐量的行情数据，FPGA 会通过 DMA 直接将数据写入主机的 RAM。我们需要在 Rust 中分配一块对齐的内存，并将其物理地址告诉 FPGA。
 
-```rust
-#[repr(C, align(64))] // 缓存行对齐
-struct DmaDescriptor {
-    // 硬件定义的描述符格式
-    addr: u64,
-    len: u32,
-    flags: u32,
-}
+普通 `Vec<u8>` 不能直接当 DMA buffer：虚拟地址不等于设备可使用的地址，物理页也不保证连续或已 pin。读取 `/proc/self/pagemap` 再把“物理地址”交给设备既不可靠，也绕开了 IOMMU 隔离。
 
-struct RingBuffer {
-    buffer: Vec<u8>,
-    descriptors: Vec<DmaDescriptor>,
-}
+生产方案通常由内核驱动、VFIO 或厂商 SDK 完成：
 
-impl RingBuffer {
-    pub fn new(size: usize) -> Self {
-        // 在生产环境中，这里需要使用 hugepages (大页内存)
-        // 并通过 /proc/self/pagemap 获取物理地址
-        let buffer = vec![0u8; size]; 
-        
-        // ... 初始化逻辑
-        Self { buffer, descriptors: vec![] }
-    }
-    
-    // 轮询是否有新数据
-    pub fn poll(&self) -> Option<&[u8]> {
-        // 检查描述符状态位 (Owned by Host?)
-        // ...
-        None
-    }
+1. 分配并 pin DMA 内存。
+2. 在 IOMMU 中映射为 IOVA（I/O Virtual Address）。
+3. 把 IOVA、长度和 ownership 写入硬件定义的 descriptor。
+4. 按 ABI 执行 DMA memory barrier，再更新 producer index/doorbell。
+5. 设备完成后读取 completion，并在归还 descriptor 前执行对应 acquire/barrier。
+
+下面是 **DMA provider 接口骨架**，其中 `DmaError` 与具体 region 类型由 VFIO 或厂商驱动封装提供。先用内存 mock 验证 descriptor ownership/ring wrap，再在带 IOMMU 的目标机运行驱动集成测试；不能用普通单元测试宣称 DMA 已正确。
+
+```rust,ignore
+// 教学接口：具体实现必须来自经过审查的 VFIO/厂商驱动封装。
+trait DmaProvider {
+    type Region;
+
+    fn alloc_pinned(&self, len: usize, alignment: usize) -> Result<Self::Region, DmaError>;
+    fn iova(region: &Self::Region) -> u64;
 }
 ```
+
+“zero-copy”也不代表没有同步成本。CPU 和 FPGA 仍需通过 descriptor ownership、cache coherency 与 memory ordering 协议移交缓冲区。
 
 ## 实战案例：FPGA 辅助的订单发送
 
 在这个场景中，Rust 策略决定下单，但为了节省 PCI 往返时间，我们只发送核心参数（Price, Qty, Side），由 FPGA 填充协议头（FIX/OUCH）并计算校验和。
 
-```rust
-#[repr(C, packed)]
+下面同样是多模块**集成骨架**：`FpgaDevice`、`command_ring`、`driver` 和 `DOORBELL_OFFSET` 必须来自已验证的驱动层。完成实现后，应分别运行 descriptor 编解码单测、mock ring 测试和真实硬件 loopback/抓包测试。
+
+```rust,ignore
+#[repr(C, align(64))]
 struct FastOrderCmd {
     symbol_index: u16,
-    side: u8, // 'B' or 'S'
-    padding: u8,
-    price: u64, // 定点数
-    qty: u32,
+    side: u8,
+    reserved0: [u8; 5],
+    price_le: u64,
+    qty_le: u32,
+    reserved1: [u8; 44],
 }
 
 impl FpgaDevice {
     pub fn send_order(&mut self, cmd: FastOrderCmd) {
-        // 将命令直接写入 FPGA 的命令队列寄存器 (Doorbell)
-        // 这通常比通过网卡发包快得多
-        unsafe {
-            let cmd_ptr = &cmd as *const _ as *const u64;
-            // 假设命令队列位于 BAR0 偏移 0x2000，且支持 64 位原子写入
-            self.write_reg64(0x2000, *cmd_ptr); 
-            self.write_reg64(0x2008, *cmd_ptr.add(1));
-        }
+        // 1. 把完整 descriptor 写入驱动提供的 DMA command ring。
+        // 2. 执行硬件 ABI 要求的 DMA write barrier。
+        // 3. 通过合法的 BAR offset 写 producer index/doorbell。
+        self.command_ring.push(cmd).expect("bounded ring has capacity");
+        self.driver.dma_write_barrier();
+        unsafe { self.write_reg(DOORBELL_OFFSET, self.command_ring.tail()) };
     }
 }
 ```
 
+这里用显式 `reserved` 固定 64 字节布局，并在字段名中标出 endian。真实项目还应使用 compile-time size/offset 断言和 Rust/C/RTL 共享 schema。不要把 packed struct 转成 `*const u64` 解引用：地址可能未对齐，而且一次 MMIO 写只发送了结构体的一部分。
+
 ## 常见陷阱
 
-1.  **内存序 (Memory Ordering)**: CPU 和 FPGA 之间的内存交互必须小心处理内存屏障 (`std::sync::atomic::fence`)。
-2.  **缓存一致性 (Cache Coherency)**: DMA 写入通常是 coherent 的，但如果不小心，CPU 可能会读取到 L3 缓存中的旧数据。
-3.  **对齐 (Alignment)**: PCIe 传输通常要求 64 字节甚至 4KB 对齐。
+1.  **内存序 (Memory Ordering)**: Rust atomic fence 不一定等同于驱动 ABI 要求的 DMA/MMIO barrier；必须按平台与驱动文档实现 descriptor → barrier → doorbell 顺序。
+2.  **缓存一致性 (Cache Coherency)**: 一些服务器平台的 DMA coherent，另一些设备/映射模式需要显式 sync。不能把“通常”当契约。
+3.  **对齐与边界**: descriptor、DMA buffer、BAR 寄存器都有各自要求，不是统一的 64B 或 4KB。
+4.  **错误与超时**: completion 丢失、设备 reset、PCIe AER、ring wrap 和错误 descriptor 都需要状态机与降级路径。
+5.  **风控一致性**: FPGA 与 CPU 两边的限制版本必须原子切换并可审计，不能出现一边已更新、一边仍用旧值。
 
 ## 现有生态
 
 - **Xilinx XDMA / QDMA**: 官方提供了 Linux 驱动，Rust 可以通过 `ioctl` 与之交互。
-- **ExaSock / Solarflare**: 提供了基于 Socket API 的透明加速，但如果需要更细粒度的控制，仍需直接操作硬件。
+- **VFIO/UIO**: Linux 提供的用户态设备访问机制；VFIO 具备 IOMMU 隔离能力，UIO 更简单但保护能力较弱。
 
-FPGA 开发周期长且昂贵，但在某些 winner-takes-all 的策略中，它是唯一的生存方式。
+## 面试高频问答
+
+### Q1：MMIO 与 DMA 的区别是什么？
+
+MMIO 让 CPU 读写设备寄存器，适合配置、状态和 doorbell；DMA 让设备直接读写主机内存，适合批量数据。低延迟设计常用 DMA ring 放 descriptor，再用一次 MMIO doorbell 通知设备。
+
+### Q2：为什么 `write_volatile` 不够？
+
+它只约束编译器对该访问的优化，不完整约束 CPU、PCIe、DMA 与设备观察顺序。还需要 ABI 规定的 memory barrier、ownership 位和 completion 协议。
+
+### Q3：Rust 在 FPGA host code 中解决了什么、没解决什么？
+
+Rust 能封装资源生命周期、边界、状态机和 FFI，减少 use-after-free 等错误；但 `unsafe` MMIO/DMA、硬件 coherency、IOMMU 配置和 RTL 协议仍需人工证明与硬件测试。
+
+FPGA 开发周期、验证和运维成本很高。是否采用应由完整 wire-to-action 延迟、策略价值、变更频率与失效风险共同决定，而不是只追求一个漂亮的纳秒数字。

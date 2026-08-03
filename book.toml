@@ -1,8 +1,9 @@
 [book]
-authors = ["HFT Engineer"]
+authors = ["AI · Rust · HFT 学习团队"]
 language = "zh-CN"
 src = "src"
-title = "高性能Rust：方法、实现与优化"
+title = "AI、Rust、HFT基础宝典"
+description = "面向零基础求职者的 HFT、低延迟 Rust 与系统设计面试宝典"
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
@@ -10,6 +11,6 @@ command = "mdbook-mermaid"
 [output.html]
 site-url = "/hft-book-rs/"
 additional-css = ["theme/custom.css"]
-additional-js = ["theme/custom.js", "mermaid.min.js", "mermaid-init.js"]
-git-repository-url = "https://github.com/yxz/hft-book-rs"
-edit-url-template = "https://github.com/yxz/hft-book-rs/edit/main/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js", "theme/custom.js"]
+git-repository-url = "https://github.com/xizheyin/hft-book-rs"
+edit-url-template = "https://github.com/xizheyin/hft-book-rs/edit/main/{path}"

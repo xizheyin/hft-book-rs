@@ -10,7 +10,9 @@
 ### 1.1 加入多播组
 要接收多播数据，你需要加入特定的 IP 组（如 `239.0.0.1`）。
 
-```rust
+下面使用第三方 `socket2`，因为它能暴露地址复用和接收缓冲等底层选项。代码依赖真实网卡、路由与组播环境，所以标为 `ignore`；验证时在独立 Cargo 项目执行 `cargo add socket2`、`cargo check`，再在隔离 network namespace/VLAN 中用发送端与抓包/计数器做集成测试。
+
+```rust,ignore
 use socket2::{Socket, Domain, Type, Protocol};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -32,15 +34,16 @@ fn join_multicast(interface_ip: Ipv4Addr, multicast_ip: Ipv4Addr, port: u16) -> 
 ```
 
 ### 1.2 SO_RCVBUF
-UDP 缓冲区溢出是丢包的头号杀手。如果你的程序处理不过来，内核缓冲区满了，新来的包就会被静默丢弃。
-**建议**: 设置为系统允许的最大值（如 16MB 或更大）。
+Socket 缓冲区溢出是常见丢包原因之一；包也可能丢在交换机、NIC ring 或内核 backlog。接收缓冲要能吸收实测 microburst，但不是无脑设为系统最大值：过大的队列会积压过期行情并掩盖应用长期处理不过来的事实。
 
 ```bash
 # 系统层面
 sysctl -w net.core.rmem_max=16777216
 ```
 
-```rust
+下面一行延续上一段的 `socket2::Socket`，不是独立程序；系统还可能把请求值翻倍或受 `rmem_max` 限制，因此启动时应读回实际值并记录。
+
+```rust,ignore
 // 代码层面
 socket.set_recv_buffer_size(16 * 1024 * 1024).unwrap();
 ```
@@ -75,7 +78,7 @@ impl GapDetector {
 ### 2.2 恢复策略
 1.  **Snapshot (快照)**: 如果丢包严重，直接请求最新的全量快照（如 TCP 连接）。
 2.  **Retransmission (重传)**: 向交易所的 TCP 重传服务器请求特定的 Seq 范围（如 "Give me 103"）。
-3.  **Ignore (忽略)**: 如果只是 Level 2 的某个价格更新丢了，且后续包覆盖了该价格，可能可以忽略。
+3.  **按协议降级或跳过**: 只有 feed 规范明确说明后续消息能完整覆盖缺失状态时才可跳过。维护订单簿的增量消息通常不能随意忽略，否则本地状态会永久错误。
 
 ## 3. A/B 通道仲裁 (Arbitration)
 
@@ -85,17 +88,19 @@ impl GapDetector {
 
 ### 3.1 实现思路
 - **单线程轮询**: 在一个线程中轮询 socket A 和 socket B。
-- **序列号去重**: 维护一个 `max_seq_processed`。如果收到一个 seq <= max，说明是重复包，直接丢弃。
+- **序列号仲裁**: 按协议的 packet sequence 与 message count 维护下一个期望范围。不能只用 `max_seq_processed`：一包可能包含多条消息，A/B 还可能乱序，必须保留有限窗口并在确认两路都缺失后触发恢复。
 
-```rust
+下面是**教学骨架**：`socket_a/socket_b`、buffer、频道枚举和仲裁状态由完整应用提供。它只表达“两路都要轮询”，不能直接用于生产；验证应注入重复、乱序、单路/双路丢包和 sequence wrap，并检查只应用一次且能进入恢复状态。
+
+```rust,ignore
 loop {
     // 非阻塞读取 A
-    if let Ok((size, _)) = socket_a.recv_from(&mut buf) {
-        process(buf, &mut state);
+    if let Ok((size, _)) = socket_a.recv_from(&mut buf_a) {
+        process(&buf_a[..size], Channel::A, &mut state);
     }
     // 非阻塞读取 B
-    if let Ok((size, _)) = socket_b.recv_from(&mut buf) {
-        process(buf, &mut state);
+    if let Ok((size, _)) = socket_b.recv_from(&mut buf_b) {
+        process(&buf_b[..size], Channel::B, &mut state);
     }
 }
 ```
@@ -107,10 +112,10 @@ loop {
     **解决**: 始终显式指定 `join_multicast_v4` 的 `interface` 参数。
 
 2.  **IGMP Snooping**:
-    交换机通常会开启 IGMP Snooping。如果你不发送 IGMP Join 报文，交换机不会把多播包转发给你。确保你的程序正确调用了 `join_multicast`。
+    程序加入组后由内核发送 IGMP membership report，交换机可以通过 snooping 学习成员端口。还要检查 VLAN、querier、组播路由和 membership 是否过期，不能只确认 `join_multicast` 返回成功。
 
 3.  **大包分片 (Fragmentation)**:
     尽量避免 IP 分片。如果 UDP 包超过 MTU (1500)，会被分片。只要其中一个分片丢了，整个 UDP 包就废了。
 
 ---
-下一章：[协议解析 (Protocols)](../protocols/README.md) - 我们将学习如何解析 ITCH, SBE, FIX 等二进制协议。
+下一章：[交易所协议详解](../connectivity/protocols.md) —— 继续学习 FIX、ITCH、SBE、OUCH 等文本或二进制协议如何编码与解析。

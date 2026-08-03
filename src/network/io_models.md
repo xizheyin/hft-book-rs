@@ -22,12 +22,26 @@
 
 最原始的模型。当你调用 `read()` 时，如果内核缓冲区没有数据，你的线程就会被挂起 (Sleep)，直到数据到达。
 
-```rust
-// 伪代码
-let mut buf = [0u8; 1024];
-// 线程在此处阻塞，直到有数据
-let n = socket.read(&mut buf).unwrap(); 
-process(&buf[..n]);
+下面是可编译的标准库函数。它标为 `no_run`，因为实际运行需要一条已经连接的 TCP 流，测试环境不能凭空提供对端。
+
+```rust,no_run
+use std::io::{self, Read};
+use std::net::TcpStream;
+
+fn read_and_process(stream: &mut TcpStream) -> io::Result<()> {
+    let mut buffer = [0_u8; 1024];
+    // 阻塞模式下，这里可能等待到数据到达、连接关闭或发生错误。
+    let received = stream.read(&mut buffer)?;
+    if received == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
+    }
+    process(&buffer[..received]);
+    Ok(())
+}
+
+fn process(bytes: &[u8]) {
+    println!("received {} bytes", bytes.len());
+}
 ```
 
 - **优点**：编程简单，数据来了就处理。
@@ -37,18 +51,32 @@ process(&buf[..n]);
 
 我们可以将 Socket 设置为非阻塞模式 (`O_NONBLOCK`)。此时调用 `read()`，如果没数据，内核会立即返回 `EWOULDBLOCK` 错误，而不是挂起线程。
 
-```rust
-socket.set_nonblocking(true).unwrap();
+这个版本同样只编译不运行，因为它需要真实 socket。注意 `Ok(0)` 表示对端关闭，不能把空 slice 当普通消息处理：
 
-loop {
-    match socket.read(&mut buf) {
-        Ok(n) => process(&buf[..n]),
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            // 没数据，稍后再试
-            std::thread::yield_now(); 
+```rust,no_run
+use std::io::{self, Read};
+use std::net::TcpStream;
+
+fn poll_nonblocking(stream: &mut TcpStream) -> io::Result<()> {
+    stream.set_nonblocking(true)?;
+    let mut buffer = [0_u8; 1024];
+
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed")),
+            Ok(received) => process(&buffer[..received]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                // 这里只为演示让出时间片；生产系统通常交给 epoll/mio 等就绪机制。
+                std::thread::yield_now();
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
-        Err(e) => panic!("IO Error: {}", e),
     }
+}
+
+fn process(bytes: &[u8]) {
+    println!("received {} bytes", bytes.len());
 }
 ```
 

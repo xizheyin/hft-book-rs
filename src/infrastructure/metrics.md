@@ -1,132 +1,153 @@
 # 指标监控与遥测 (Metrics & Telemetry)
 
-在 HFT 系统中，"You can't improve what you don't measure" 是至理名言。但矛盾的是，**测量本身也会带来延迟**。
+指标用于回答“系统现在是否健康、容量是否足够、变化从何时开始”。它不是订单审计账本：计数和采样可以聚合，但任何采样、溢出或上报缺口都必须可见。
 
-传统的监控方案（如 Prometheus Client）通常涉及锁、内存分配和字符串格式化，这在热路径（Hot Path）中是绝对禁止的。我们需要一套专门针对低延迟场景设计的监控系统。
+Prometheus、InfluxDB 或其他后端不是天然“禁止进入 HFT”。通常做法是让热路径只更新本地/原子状态，由后台线程转换成后端格式；是否满足延迟目标要靠测量。
 
-## 1. HFT 监控的核心原则
+## 1. 分层架构
 
-1.  **零分配 (Zero Allocation)**: 所有的计数器、直方图必须预先分配。
-2.  **无锁 (Lock-Free)**: 记录指标时不能争用全局锁。
-3.  **极低开销 (Low Overhead)**: 单次记录操作必须在几十纳秒内完成。
-4.  **分层架构**:
-    *   **热路径**: 仅做原子累加或写入 Thread-local 缓冲区。
-    *   **冷路径**: 后台线程负责聚合、格式化和发送。
+```mermaid
+flowchart LR
+    H["热路径"] --> C["本地计数 / 有界样本"]
+    C --> S["快照或消息交接"]
+    S --> A["后台聚合"]
+    A --> E["Prometheus / 时序库 / 告警"]
+    C -. "溢出、采样率、最后成功交接" .-> A
+```
 
-## 2. 关键指标类型
+设计目标不是“测量完全隐形”，而是开销有预算、缺口可检测、关闭或降采样后行为可预测。
 
-### 2.1 计数器 (Counter) & 仪表盘 (Gauge)
-最简单的指标。使用 `AtomicU64` 即可实现，配合 `Relaxed` 内存序即可满足大部分需求。
+## 2. Counter、Gauge 与复合状态
 
 ```rust
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub struct Metrics {
-    pub orders_sent: AtomicU64,
-    pub bytes_received: AtomicU64,
+pub struct Counters {
+    orders_sent: AtomicU64,
+    diagnostic_samples_dropped: AtomicU64,
 }
 
-impl Metrics {
-    #[inline(always)]
-    pub fn inc_orders(&self) {
+impl Counters {
+    pub fn record_order(&self) {
         self.orders_sent.fetch_add(1, Ordering::Relaxed);
     }
 }
 ```
 
-### 2.2 延迟直方图 (Latency Histogram)
-这是 HFT 中最重要的指标。我们需要知道 P50, P99, P99.9, P99.99 的延迟分布。
-标准的 `HdrHistogram` 库非常好用，但它是非线程安全的（为了性能）。
+`Relaxed` 可用于“只关心这个计数最终值”的独立统计；它不发布其他业务状态，也不能让 `orders_sent` 与 `bytes_sent` 形成同一时刻的一致快照。如果告警依赖多个字段的不变量，应由单一所有者生成快照，或使用带版本的安全发布机制。
 
-**最佳实践**: 使用 **Thread-Local Histogram**。
+全局原子计数器在多核高写入下可能造成缓存行争用。可使用每线程/每分片计数，后台求和；代价是快照可能不是严格同一时刻。面试时应先说明一致性要求。
 
-每个交易线程维护自己的直方图，后台线程定期轮询并合并所有线程的直方图。
+Gauge 还要定义语义：队列 depth 是瞬时值，高水位是窗口最大值，最老消息 age 才能说明数据有多陈旧。
 
-```rust
-use hdrhistogram::Histogram;
-use std::cell::RefCell;
+## 3. 延迟直方图不是“神器”
 
-thread_local! {
-    static LATENCY_HIST: RefCell<Histogram<u64>> = RefCell::new(
-        Histogram::<u64>::new(3).unwrap()
-    );
-}
+HdrHistogram 是一种有用的近似直方图实现，但仍需配置和验证：
 
-pub fn record_latency(ns: u64) {
-    LATENCY_HIST.with(|h| {
-        // 记录延迟，开销极小
-        h.borrow_mut().record(ns).ok();
-    });
-}
+- 最小/最大可记录值；
+- 有效数字带来的精度与内存权衡；
+- 超范围值是报错、钳制还是另计；
+- 直方图单位是 ns、µs 还是 cycle；
+- 不同线程合并时配置是否一致；
+- reset/快照期间样本是否遗漏或重复。
+
+不要对 `record()` 的错误直接 `.ok()`。至少增加 `histogram_out_of_range`，否则真正的极端尾延迟可能恰好被静默丢掉。
+
+### 3.1 Thread-local 的安全交接
+
+线程局部直方图避免多个生产者争同一结构，但后台线程不能直接借用别的线程的 `RefCell`。常见安全方案：
+
+1. 生产者在安全点把完整快照发送到有界队列；
+2. 使用双缓冲，每次只交换“已封存、不再写”的缓冲区，并正确管理生命周期；
+3. 每线程维护固定 buckets，聚合器读取原子 bucket（接受非同时快照）；
+4. 使用库提供的同步 recorder。
+
+不要为省一次消息交接就手写未经证明的 `unsafe` 跨线程访问。
+
+### 3.2 不能平均百分位数
+
+两个分片各自的 p99 不能取平均后当作全局 p99。应合并原始直方图/bucket 计数，再从合并分布计算百分位。百分位还要同时报告：
+
+- 样本数和观察窗口；
+- 测量边界、负载与消息类型；
+- 最大值和超范围计数；
+- 时钟来源与精度；
+- 是否采样、采样概率和采样方式。
+
+只有 1,000 个样本时，讨论 p99.99 没有足够分辨率；稳定估计极端尾部通常需要远多于“分位点倒数”数量的样本。
+
+## 4. Coordinated Omission（协调遗漏）
+
+这是延迟测试最常见的陷阱之一。
+
+假设系统应每 1ms 收到一个事件，但处理一个事件突然卡住 100ms。若负载生成器必须等上一个请求完成才发下一个，它只记录一个 100ms 慢样本；现实中原本计划到达的约 99 个事件也会排队等待，却没有被发送和计入。
+
+```text
+闭环生成器：完成一个 -> 再发一个      容易少记排队等待
+开放环生成器：按计划时间持续到达      能暴露过载与排队
 ```
 
-## 3. 遥测架构设计
+应按目标到达计划发压，记录 `scheduled_time → completion` 或真实 ingress → egress，并监控队列 age。某些直方图库提供 coordinated-omission correction，但它依赖“期望间隔”等假设；不能不说明模型就打开一个选项。
 
-为了不阻塞交易线程，数据的发送必须异步进行。
+生产请求本身如果有自然闭环，仍应如实报告该业务模型；关键是不要把生成器的自我降速误称为系统在固定负载下的尾延迟。
 
-```mermaid
-graph TD
-    T1[Trading Thread 1] -->|Atomic Write| SM[Shared Memory / Atomic Stats]
-    T2[Trading Thread 2] -->|Atomic Write| SM
-    
-    T1 -->|Local Record| H1[Thread-Local Histogram]
-    T2 -->|Local Record| H2[Thread-Local Histogram]
-    
-    M[Metrics Thread] -->|Read & Reset| H1
-    M -->|Read & Reset| H2
-    M -->|Read| SM
-    
-    M -->|Aggregate| G[Global State]
-    M -->|Push/Pull| DB[InfluxDB / Prometheus]
-```
+## 5. 采样与开销
 
-### 3.1 实现代码示例
+| 方法 | 适合 | 风险 |
+| --- | --- | --- |
+| 精确计数器 | 订单数、错误数、丢包数 | 共享原子争用 |
+| 固定概率采样 | 高频阶段耗时 | 可能漏掉稀有尾部 |
+| 每 N 条采样 | 开销可控 | 与周期性负载产生偏差 |
+| 慢事件全采 + 正常事件抽样 | 排查尾部 | 需要先有低成本慢事件判定 |
+| 动态降采样 | 过载保护 | 时间段之间不可直接比较 |
 
-```rust
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+采样必须记录分母和当前概率。若缓冲区满导致的丢样与高负载相关，剩余样本会产生系统性偏差；不能只把它当随机丢失。
 
-pub struct MetricsSystem {
-    // 使用 ArcSwap 或 RCU 更新配置
-    // 使用 Per-CPU 结构存储直方图
-}
+时间戳读取、trace ID、缓存写入和聚合都有成本。用开启/关闭遥测的 A/B 测试量化 p50/p99、吞吐和缓存计数变化，而不是规定“每次必须几十纳秒”。
 
-impl MetricsSystem {
-    pub fn start_background_reporter(&self) {
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                
-                // 1. 收集：遍历所有注册的线程局部直方图
-                // 注意：这需要一些 unsafe 的技巧或者使用 crossbeam 的 epoch 机制来安全访问其他线程的数据
-                // 或者使用消息队列将快照发送出来
-                
-                // 2. 聚合
-                let mut global_hist = Histogram::<u64>::new(3).unwrap();
-                // global_hist.add(&thread_hist);
-                
-                // 3. 报告
-                println!("P99 Latency: {} ns", global_hist.value_at_quantile(0.99));
-            }
-        });
-    }
-}
-```
+## 6. Prometheus 与标签基数
 
-## 4. 常用性能指标
+Prometheus 客户端可以放在后台导出路径。热路径更新何种 recorder，要根据库实现和基准选择。更常见的实际风险是高基数：
 
-在 HFT 系统中，除了业务指标（PnL, Position），必须监控以下系统指标：
+- 不要把 `order_id`、`execution_id` 或完整错误文本作为 label；
+- `symbol`、`strategy`、`venue` 的组合也要预算时间序列数量；
+- 单笔追踪进入受控日志/trace，而不是无限指标标签；
+- scrape 失败和最后成功上报时间本身要监控。
 
-1.  **Tick-to-Trade Latency**: 从收到行情包到发出订单包的时间差。
-2.  **Order-to-Ack Latency**: 发单到收到交易所确认的时间。
-3.  **Queue Depth**: 内部 Ring Buffer 的堆积程度（反映处理能力是否饱和）。
-4.  **TCP Retransmissions**: 网络质量恶化的先兆。
-5.  **Context Switches**: 线程是否被异常抢占。
+Pull 还是 Push 主要是部署与故障语义选择，不决定热路径是否安全。
 
-## 5. 总结
+## 7. 最小指标集
 
-HFT 的监控系统必须是“隐形”的。它不能成为瓶颈。
-*   **首选**: Atomic 操作, Thread-Local 数据结构。
-*   **避免**: 在热路径中进行 Socket I/O 或 复杂计算。
-*   **工具**: `HdrHistogram` 是 Rust 生态中的神器。
+| 类别 | 建议指标 |
+| --- | --- |
+| 行情 | 序号缺口、消息 age、恢复状态、每类型速率 |
+| 订单 | Pending/Unknown 数量、Reject 原因、Fill/Cancel 速率、ACK RTT |
+| 风控 | 额度使用、拒绝数、kill 状态、配置版本 |
+| 队列 | depth、高水位、最老事件 age、push 失败 |
+| 延迟 | 明确定义的端到端和分阶段 p50/p99/p99.9、max、样本数 |
+| 主机 | CPU、迁核、上下文切换、IRQ/softirq、page fault、NIC drop、NUMA |
+| 遥测自身 | 采样率、丢样、超范围、聚合落后、最后成功导出 |
+
+PnL/持仓指标还要带估值来源和新鲜度，不能替代成交审计与对账。
+
+## 8. 面试追问与验证清单
+
+**Prometheus 能否用于低延迟系统？** 可以把抓取、格式化和网络发送放在后台；热路径 recorder 是否可接受要测量。不要在每笔订单上构造高基数字符串标签。
+
+**怎样合并多个线程的 p99？** 合并相同配置的直方图/bucket，再算全局 p99，不能平均线程 p99。
+
+**什么是 coordinated omission？** 负载生成器等待响应后才继续发，系统越慢它发得越少，从而漏记本应排队的请求延迟。
+
+验证清单：
+
+- [ ] 每个延迟指标写清起点、终点、单位、时钟和负载；
+- [ ] p99 同时报告窗口、样本数、max 与超范围数；
+- [ ] 直方图交接不会数据竞争、重复或静默漏样；
+- [ ] 开放环突发测试能暴露排队；
+- [ ] 高基数预算和遥测自身健康指标已配置；
+- [ ] 开启/关闭遥测的端到端 A/B 已完成；
+- [ ] 缓冲区满时采样偏差与降级动作已演练。
+
+---
+
+返回：[高性能日志](logging.md)

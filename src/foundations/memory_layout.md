@@ -6,13 +6,13 @@
 
 ```mermaid
 flowchart LR
-    A[寄存器 Register] -->|~1 cycle| B[L1 Cache]
-    B -->|~4 cycles| C[L2 Cache]
-    C -->|~12 cycles| D[L3 Cache]
-    D -->|~40-70 cycles| E[DRAM]
+    A[寄存器 Register] -->|最快| B[L1 Cache]
+    B -->|更高延迟| C[L2 Cache]
+    C -->|继续增加| D[Last-Level Cache]
+    D -->|通常最慢| E[DRAM]
 ```
 
-上图给出一个简化延迟层级。不同 CPU 具体数值会有差异，但数量级关系基本稳定：越远离核心，访问延迟越高。所谓“缓存友好”，本质上就是把热点访问尽量限制在 L1/L2，并减少不必要的跨层访问。
+上图只表达相对层级，不给出固定周期数：缓存是否 inclusive、命中延迟、内存控制器与负载都会随微架构变化。所谓“缓存友好”，本质上就是提高热点数据的局部性，并减少不必要的缓存行与地址转换开销。
 
 ## 1. 理论背景 (Theory & Context)
 
@@ -26,8 +26,8 @@ CPU 并不是按字节从内存读取数据，而是按块（Block）读取，�
 要理解为什么"内存布局决定性能"，必须理解 CPU 核心之间是如何保持缓存一致性的。
 
 #### 1.2.1 MESI 协议
-CPU 核心之间通过 **MESI 协议** 来保证缓存一致性。每个 Cache Line (通常 64 字节) 有四种状态：
-*   **M (Modified)**: 已修改。脏数据，独占。**这是唯一允许写入的状态。**
+许多 CPU 使用 **MESI 或其扩展协议**（如 MOESI）保证缓存一致性。下面用简化 MESI 模型建立直觉；真实数据路径和状态可能因微架构不同而变化。每个 Cache Line 有四类基础状态：
+*   **M (Modified)**: 已修改。脏数据，独占；在这个简化模型中可直接写入。
 *   **E (Exclusive)**: 独占。干净数据，只有我有。
 *   **S (Shared)**: 共享。干净数据，大家都有。
 *   **I (Invalid)**: 无效。我的数据过期了。
@@ -43,7 +43,7 @@ stateDiagram-v2
     S --> I: Core B 被 Invalidate
 ```
 
-> **HFT 启示**: 写操作的代价主要来自一致性通信。若多个核心高频写同一缓存行（即便是不同字段），总线会被 RFO/Invalidate 流量占满，系统就会出现典型的 Ping-Pong 抖动。
+> **HFT 启示**: 多个核心高频写同一缓存行（即便是不同字段）会增加 RFO/Invalidate 等一致性流量，形成典型的 Ping-Pong 抖动。是否成为主要瓶颈应结合目标 CPU 的性能计数器与延迟分布判断。
 
 #### 1.2.2 伪共享 (False Sharing)
 这是多核编程中最隐蔽的性能杀手。
@@ -64,22 +64,24 @@ sequenceDiagram
 ```
 
 ### 1.3 Rust 中的解决方案：Padding
-我们需要通过 **Padding (填充)** 强行把 `A` 和 `B` 隔开，确保它们分别处于不同的 Cache Line。
+若 profiling 证实两个不同核心高频写相邻字段，可以用 **Padding (填充)** 将它们放进独立的隔离单元。对齐粒度必须结合目标架构验证；并非所有数据都值得这样浪费空间。
 
 #### 方案 A: 使用 `#[repr(align(N))]`
 ```rust
-#[repr(align(64))] // 强行对齐到 64 字节边界
+#[repr(align(64))] // 选择 64B 作为本目标平台的隔离粒度
 struct AlignedCounter {
     value: std::sync::atomic::AtomicU64,
 }
-// 这样数组中的每个元素都会独占一个 Cache Line
+// 该类型的 size 会按 alignment 向上取整；是否等于目标 CPU 的 cache line 仍需确认。
 // let counters: [AlignedCounter; 16]; 
 ```
 
 #### 方案 B: 使用 `crossbeam::utils::CachePadded`
-这是社区的标准做法，自动适配不同架构的 Cache Line 大小。
+这是常用的社区封装。它按 crate 对目标架构的保守规则选择 padding，并非在运行时探测当前 CPU 的真实缓存行大小；升级 crate 或更换目标后仍应验证布局与效果。
 
-```rust
+下面片段需要在 `Cargo.toml` 中加入 `crossbeam`；mdBook 的单文件标准库测试不会自动下载第三方依赖，因此将其作为依赖示例展示而不执行。
+
+```rust,ignore
 use crossbeam::utils::CachePadded;
 use std::sync::atomic::AtomicU64;
 
@@ -91,25 +93,25 @@ struct SharedState {
 }
 ```
 
-> **HFT 黄金法则**: 永远不要让两个频繁竞争的变量处于同一个 Cache Line。特别是 SPSC 队列的 `head` 和 `tail` 指针，必须隔离。
+> **实践建议**: 不同核心高频写的游标应优先隔离，例如 SPSC 的 `head` 与 `tail`。但只读字段、同一线程拥有的字段或冷数据未必需要 padding；过度对齐会降低缓存密度。
 
 ## 2. 核心实现：控制结构体布局 (Struct Layout)
 
-Rust 默认不承诺源代码中的字段顺序（除非显式指定 `repr`），编译器会基于对齐规则重排或插入填充。多数业务开发中这不是问题，但在低延迟系统里，字段布局直接影响缓存密度、跨行概率与伪共享风险，因此我们需要把“结构体怎么排”当作性能设计的一部分。
+Rust 默认布局不承诺源代码字段顺序、偏移或稳定 ABI；编译器可以选择布局并插入填充。多数业务开发中这不是问题，但在低延迟系统里，字段布局直接影响缓存密度、跨行概率与伪共享风险，因此需要用 `size_of`、`align_of`、偏移检查或布局工具验证具体构建，而不是只靠肉眼推断。
 
 ```mermaid
 flowchart TB
-    subgraph Bad["BadOrder: 字段顺序导致中间填充"]
+    subgraph Bad["repr(C) BadOrder: 声明顺序导致填充"]
         B1["offset 0..7  id: u64 (8B)"] --> B2["offset 8     is_buy: bool (1B)"]
         B2 --> B3["offset 9..15 padding (7B)"]
         B3 --> B4["offset 16..23 price: f64 (8B)"]
-        B4 --> B5["总大小: 24B"]
+        B4 --> B5["offset 24 is_ioc: bool + 7B tail padding<br/>总大小: 32B"]
     end
 
-    subgraph Good["字段重排后: 无中间填充"]
+    subgraph Good["repr(C) GoodOrder: 同对齐字段放在一起"]
         G1["offset 0..7  id: u64 (8B)"] --> G2["offset 8..15 price: f64 (8B)"]
-        G2 --> G3["offset 16    is_buy: bool (1B)"]
-        G3 --> G4["尾部填充由对齐规则决定"]
+        G2 --> G3["offset 16..17 两个 bool"]
+        G3 --> G4["offset 18..23 tail padding<br/>总大小: 24B"]
     end
 
     B3 -.无效字节占用缓存带宽.-> G2
@@ -117,7 +119,7 @@ flowchart TB
 
 ### 2.1 填充与对齐 (Padding & Alignment)
 
-为了避免跨越缓存行边界（这会导致两次内存访问），我们需要对关键数据结构进行对齐。
+若一个热点对象频繁跨越缓存行边界，访问可能涉及两条缓存行。可对确有需要的结构进行对齐；这会增加对象大小，因此必须同时评估缓存密度。
 
 ```rust
 use std::mem;
@@ -140,24 +142,36 @@ fn check_alignment() {
 对于大量的只读数据（如历史行情），我们希望尽可能紧凑，以提高缓存密度。
 
 ```rust
-// 不良布局：包含大量 padding
+// 用 repr(C) 固定声明顺序，便于演示 padding；默认 Rust 布局不能这样手算。
+#[repr(C)]
 struct BadOrder {
     id: u64,        // 8 bytes
     is_buy: bool,   // 1 byte
     // padding: 7 bytes
     price: f64,     // 8 bytes
+    is_ioc: bool,   // 1 byte + 7 bytes tail padding，总大小 32 bytes
 }
 
-// 紧凑布局
-#[repr(packed)] // 警告：直接访问 packed 字段引用是 unsafe 的
+// 先按对齐需求重排：总大小降为 24 bytes，且字段仍自然对齐。
+#[repr(C)]
+struct CompactOrder {
+    id: u64,
+    price: f64,
+    is_buy: bool,
+    is_ioc: bool,
+}
+
+// 只有线格式确实要求逐字节紧凑时才考虑 packed。
+#[repr(C, packed)] // 警告：不能直接创建指向未对齐字段的引用
 struct PackedOrder {
     id: u64,
     price: f64,
     is_buy: bool,
+    is_ioc: bool,
 }
 ```
 
-`#[repr(packed)]` 适合“存储或协议格式优先”的场景，例如二进制协议解析、冷数据归档；这些场景的主要目标是字节级紧凑，而非高频随机访问。对热路径计算而言，packed 往往得不偿失，因为未对齐访问可能跨缓存行，带来额外访存成本。涉及原子类型时风险更高，原子读写对对齐有严格要求，错误使用会造成运行时异常或未定义行为。
+`#[repr(packed)]` 只应在外部 ABI/存储格式确实要求该布局时考虑；解析不可信二进制协议时，逐字段读取字节并显式处理端序通常更稳妥。对 packed 字段创建未对齐引用属于未定义行为，应使用按值访问或 `read_unaligned` 等明确的未对齐操作。原子操作要求正确对齐，不应把原子字段塞进 packed 热路径结构。
 
 > **最佳实践**: 在 HFT 热路径中，优先通过字段重排减少 padding，而不是依赖 `packed`。前者通常同时满足“紧凑 + 对齐 + 可维护”。
 
@@ -203,7 +217,9 @@ impl OrderBookSoA {
 
 ### 3.1 基准测试代码
 
-```rust
+下面是 Criterion 基准入口，需要 `criterion` 开发依赖，并放入 Cargo 的 `benches/` 目标中运行；它不是普通的单文件程序，所以 mdBook 不执行该代码块。
+
+```rust,ignore
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 struct OrderAoS {
@@ -245,7 +261,7 @@ fn bench_memory_layout(c: &mut Criterion) {
     }));
 
     group.bench_function("SoA Sum", |b| b.iter(|| {
-        // Cache Hit 极高：连续读取 f64，预取器（Prefetcher）工作完美
+        // 连续读取 f64，通常更利于缓存行利用和硬件预取
         soa.prices.iter().sum::<f64>()
     }));
     
@@ -261,10 +277,10 @@ fn bench_memory_layout(c: &mut Criterion) {
 
 SoA 的胜利不仅仅是因为数据密度。**硬件预取器** 是关键。
 
-CPU 有专门的电路来检测内存访问模式。当你按顺序访问 `prices[0], prices[1], prices[2]...` 时，预取器会立刻识别出这个线性模式，并提前将 `prices[3], prices[4]...` 从主存拉取到 L1 Cache。
+CPU 使用硬件预取器识别一部分连续或固定步长访问。当你按顺序访问 `prices[0], prices[1], prices[2]...` 时，预取器可能提前请求后续缓存行，从而隐藏部分访存延迟；是否触发、预取到哪级缓存以及准确率都取决于微架构和访问上下文。
 
-- **SoA**: 完美的线性访问。预取器工作效率 100%。
-- **AoS**: 跳跃式访问 (`addr`, `addr+56`, `addr+112`...)。虽然现代预取器也能识别步长（Stride Prefetcher），但效率远不如纯线性访问高，且浪费了宝贵的内存带宽加载无用的 padding。
+- **SoA**: 对单字段扫描形成连续访问，通常更容易利用缓存行与预取；
+- **AoS**: 固定步长访问也可能被 stride prefetcher 识别，但若当前计算只用少数字段，会加载更多无关字节。若业务每次恰好需要一个对象的大多数字段，AoS 反而可能更自然。
 
 ## 4. 高级话题：Huge Pages 与 TLB (Translation Lookaside Buffer)
 
@@ -274,10 +290,10 @@ CPU 有专门的电路来检测内存访问模式。当你按顺序访问 `price
 
 CPU 使用虚拟地址，而内存使用物理地址。每次访问内存，CPU 都需要查表（页表）进行转换。为了加速这个过程，CPU 有一个专门的缓存叫 TLB。
 
-- **默认页大小**: Linux 默认使用 **4KB** 的页。
-- **TLB 容量**: 典型的 L1 TLB 只有 64 个条目（指令）和 100 个条目（数据）。L2 TLB 可能有 1500 个。
+- **基础页大小**: 常见 x86_64 Linux 配置使用 **4 KiB**，其他架构或内核配置可能不同；
+- **TLB 容量**: 指令/数据 TLB 的层级、条目数和支持页大小均由具体 CPU 决定，应查目标处理器手册或用工具探测。
 
-**问题**: 如果你的程序频繁访问 1GB 的随机内存，你需要 $1GB / 4KB = 262,144$ 个页表项。TLB 根本装不下。结果是每次内存访问都会触发 **TLB Miss**，导致额外的内存延迟（通常几十纳秒）。
+**问题**: 若程序随机访问 1 GiB 且使用 4 KiB 页，其工作集涉及 262,144 个页面，远超常见 TLB 容量，因此 TLB miss 与 page walk 的比例可能明显上升。但不能断言“每次访问必然 miss”或固定增加多少纳秒；page-walk cache、访问分布与并发负载都会影响结果。
 
 ### 4.2 Huge Pages (大页)
 
@@ -297,24 +313,24 @@ CPU 使用虚拟地址，而内存使用物理地址。每次访问内存，CPU 
 你必须先告诉 Linux 内核预留一部分物理内存作为大页。否则 `mmap` 会失败。
 
 ```bash
-# 查看当前大页情况
-cat /proc/sys/vm/nr_hugepages
+# 查看默认 HugeTLB 页大小与当前预留量
+grep -E 'Hugepagesize|HugePages_Total|HugePages_Free' /proc/meminfo
 
-# 预留 128 个 2MB 大页（共 256MB 内存）
+# 若 Hugepagesize 显示 2048 kB，预留 128 个就是 256 MiB
 # 这部分内存会被立即锁定，普通程序无法使用
 sudo sysctl -w vm.nr_hugepages=128
 ```
 
 #### 步骤 2: Rust 代码实现
 
-我们可以使用 `libc` crate 直接调用 `mmap`。
+我们可以使用 `libc` crate 直接调用 `mmap`。该示例只面向 Linux，还要求系统预留 HugeTLB 大页；它依赖第三方 crate、操作系统配置和相应权限，因此 mdBook 不执行它。
 
-```rust
+```rust,ignore
 use std::ptr;
 use std::slice;
 
 fn allocate_huge_page() {
-    // 2MB 是 x86_64 上默认的大页大小
+    // 本示例假设 /proc/meminfo 中 Hugepagesize 为 2 MiB。
     const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
     let len = HUGE_PAGE_SIZE;
 
@@ -349,12 +365,13 @@ fn allocate_huge_page() {
         libc::munmap(ptr, len);
     }
 }
+```
 
 ### 4.4 Rust 风格的 RAII 封装
 
-为了避免手动管理内存导致泄漏，我们应该利用 Rust 的 `Drop` trait 来自动管理大页的生命周期。
+为了避免手动管理内存导致泄漏，我们应该利用 Rust 的 `Drop` trait 来自动管理大页的生命周期。下面是建立在上一段 Linux/`libc` 实现上的 **RAII 结构骨架**，省略了通用错误类型和平台分支，并非独立示例，因此 mdBook 不执行它。
 
-```rust
+```rust,ignore
 struct HugePageBuffer {
     ptr: *mut u8,
     len: usize,
@@ -395,7 +412,7 @@ impl Drop for HugePageBuffer {
 }
 ```
 
-> **注意**: 在生产环境中，我们通常使用 `HugeTLB` 文件系统或者透明大页 (THP)。但对于延迟敏感的 HFT，**显式分配 (Explicit Allocation)** 是最可控的。
+> **注意**: HugeTLB 匿名映射、HugeTLB 文件系统和透明大页 (THP) 的预留、失败与回收行为不同。延迟敏感路径常偏好可在启动期确认成功的显式 HugeTLB，但是否收益更好仍要用 TLB 事件、page fault 和尾延迟验证。
 
 ## 5. 常见陷阱 (Pitfalls)
 
@@ -405,7 +422,11 @@ impl Drop for HugePageBuffer {
 
 最后，即使采用了 SoA，也不代表编译器一定能完成自动向量化。循环体中的分支、复杂依赖和不可预测访问模式都会削弱向量化收益。工程上应把“布局优化”和“循环结构优化”一起考虑，才能稳定获得可复现收益。
 
-## 5. 延伸阅读
+## 6. 面试追问：`align(64)` 是否就彻底消除了伪共享？
+
+不一定。它只保证类型起始地址满足 64B 对齐，是否有效还取决于类型大小、数组步长、目标 CPU 的缓存行/相邻行行为，以及是否真的有多个核心高频写。正确回答应包含三步：验证布局、确认写者拓扑、在目标机器测量缓存一致性事件与尾延迟。
+
+## 7. 延伸阅读
 
 - [CPU Caches and Why You Care](https://www.youtube.com/watch?v=WDIkqP4JbkE) - Scott Meyers 的经典演讲。
 - [What Every Programmer Should Know About Memory](https://people.freebsd.org/~lstewart/articles/cpumemory.pdf) - Ulrich Drepper 的必读论文。

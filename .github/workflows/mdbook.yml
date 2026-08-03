@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MDBOOK_VERSION: 0.5.2
+      MDBOOK_MERMAID_VERSION: 0.17.0
     steps:
       - uses: actions/checkout@v4
       - name: Install mdBook
@@ -37,12 +38,25 @@ jobs:
           curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf -y | sh
           rustup update
           cargo install --locked --version ${MDBOOK_VERSION} mdbook
-          cargo install --locked mdbook-mermaid
+          cargo install --locked --version ${MDBOOK_MERMAID_VERSION} mdbook-mermaid
       - name: Setup Pages
         id: pages
         uses: actions/configure-pages@v5
+      - name: Check book structure
+        run: python3 scripts/check_book.py
+      - name: Compile runnable Rust examples
+        run: mdbook test
       - name: Build with mdBook
         run: mdbook build
+      - name: Verify noindex output
+        run: |
+          test -f book/robots.txt
+          missing="$(find book -name '*.html' -type f -exec sh -c 'grep -qi '\''<meta name="robots"[^>]*noindex'\'' "$1" || printf "%s\n" "$1"' _ {} \;)"
+          if [ -n "$missing" ]; then
+            echo "Pages missing noindex:"
+            echo "$missing"
+            exit 1
+          fi
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

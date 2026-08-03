@@ -1,256 +1,210 @@
-# io_uring 深度解析
+# io_uring 深度解析：提交了，不等于上网线了
 
-Linux 5.1 引入的 `io_uring` 是异步 I/O 的革命。在它之前，我们有 `epoll`。
-虽然 `epoll` 解决了 C10K 问题，但它本质上还是**同步**的：你告诉内核你想读，内核告诉你“可以读了”，然后你再发起 `read` 系统调用——这里仍然涉及系统调用开销和数据拷贝。
+`io_uring` 是 Linux 的异步 I/O 接口。与 `epoll` 常见的“先等 readiness，再调用 `recv`/`send`”不同，它允许应用直接提交读写操作，再从完成队列取得结果。
 
-`io_uring` 旨在通过**提交队列 (SQ)** 和 **完成队列 (CQ)** 两个环形缓冲区，实现真正的**异步**和**零系统调用**（在理想情况下）。
+它的主要价值是批量提交、减少 syscall 次数、注册资源和统一 completion 模型。它不会自动绕过 TCP/IP 协议栈，也不承诺运行期间完全避免 syscall 或 payload copy。
 
-## 1. 原理：环形缓冲区 (Ring Buffers)
+## 1. 先分清四种状态
 
-`io_uring` 的核心是两个共享内存的 Ring Buffer：
+HFT 面试很爱追问“完成到底完成了什么”。先记住这条阶梯：
 
 ```mermaid
-graph TD
-    subgraph UserSpace
-        App[Application]
-        SQ[Submission Queue (SQ)]
-        CQ[Completion Queue (CQ)]
-    end
-    subgraph KernelSpace
-        Kernel[Kernel Thread]
-        Device[Hardware / Driver]
-    end
-
-    App -- "1. Push SQE" --> SQ
-    SQ -- "2. Read SQE (No Syscall)" --> Kernel
-    Kernel -- "3. Execute I/O" --> Device
-    Device -- "4. Interrupt/Poll" --> Kernel
-    Kernel -- "5. Push CQE" --> CQ
-    CQ -- "6. Poll/Read CQE" --> App
-
-    style SQ fill:#dfd,stroke:#333
-    style CQ fill:#fdd,stroke:#333
-    style Kernel fill:#f96,stroke:#333
+flowchart LR
+    A[应用写好 SQE] --> B[内核接受操作]
+    B --> C[产生该 opcode 的 CQE]
+    C --> D[用户 Buffer 可复用]
+    D --> E[报文在线路可见]
+    E --> F[对端收到/协议确认]
+    F --> G[交易所业务处理]
 ```
 
-1.  **Submission Queue (SQ)**: 用户进程将 I/O 请求（SQE, Submission Queue Entry）写入此队列。
-2.  **Completion Queue (CQ)**: 内核完成 I/O 后，将结果（CQE, Completion Queue Entry）写入此队列。
+这些状态可能重合，也可能相隔很远：
 
-### 1.1 零系统调用 (Zero Syscall)
-在 `IORING_SETUP_SQPOLL` 模式下，内核会启动一个内核线程 (Kernel Thread) 专门轮询 SQ。
-这意味着：
-1. 用户进程把请求写入 SQ。
-2. 更新 SQ 尾指针。
-3. **无需任何系统调用**，内核线程就会看到新请求并处理。
-4. 用户进程轮询 CQ 获取结果。
+- **SQE 已写入**：只代表用户态 ring 中有一个请求。
+- **CQE 已产生**：代表该 opcode 按内核定义完成，具体语义要看是 `read`、`send` 还是 `send_zc`。
+- **Buffer 可复用**：内核不再引用这块用户内存；对 zero-copy send 往往需要额外 notification。
+- **线上可见**：应由 NIC TX hardware timestamp 或外部设备测量，不能从普通 CQE 推断。
+- **对端/业务确认**：分别依靠 TCP ACK、会话 ACK、订单 ACK/Fill 等不同证据。
 
-这对于高频交易中的**日志落盘**和**非关键路径网络 I/O** 具有极大的吸引力。
+## 2. SQ、CQ 与系统调用
 
-## 2. Rust 生态与网络编程实战
+```mermaid
+sequenceDiagram
+    participant App as User App
+    participant SQ as Submission Queue
+    participant K as Kernel
+    participant CQ as Completion Queue
 
-Rust 提供了低层级的 `io-uring` crate，以及基于它的异步运行时 `glommio` 和 `tokio-uring`。虽然 `io_uring` 最常被提及的是文件 I/O，但它在网络编程（特别是 TCP/UDP 处理）上同样强大。
-
-### 2.1 基础用法示例：文件读取
-
-```rust
-use io_uring::{IoUring, opcode, types};
-use std::os::unix::io::AsRawFd;
-
-fn read_file_with_iouring(fd: i32, buf: &mut [u8]) -> std::io::Result<()> {
-    let mut ring = IoUring::new(8)?; // 队列深度 8
-
-    // 1. 准备 SQE (Read 请求)
-    let read_e = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
-        .build()
-        .user_data(0x42); // 标记请求 ID
-
-    // 2. 提交请求
-    unsafe {
-        ring.submission()
-            .push(&read_e)
-            .expect("submission queue is full");
-    }
-
-    // 3. 通知内核 (如果不使用 SQPOLL)
-    ring.submit_and_wait(1)?;
-
-    // 4. 处理 CQE
-    let cqe = ring.completion().next().expect("completion queue is empty");
-    assert_eq!(cqe.user_data(), 0x42);
-    
-    if cqe.result() < 0 {
-        return Err(std::io::Error::from_raw_os_error(-cqe.result()));
-    }
-
-    Ok(())
-}
+    App->>SQ: 写入一个或多个 SQE
+    App->>K: io_uring_enter 批量提交<br/>或由活跃 SQPOLL 发现
+    K->>K: 执行/等待 I/O
+    K->>CQ: 写入 CQE(result, flags, user_data)
+    App->>CQ: 消费 CQE 并归还资源
 ```
 
-### 2.2 网络 I/O 模型演进 (原理篇)
+- **SQE（Submission Queue Entry）**描述操作、fd、buffer、长度和 `user_data`。
+- **CQE（Completion Queue Entry）**通常用 `result` 返回字节数或负 errno，用 `flags` 表达 multishot、buffer ID、notification 等附加语义。
 
-为了理解 `io_uring` 的革命性，我们需要先回顾它是如何解决 `epoll` 模型的固有缺陷的。
+普通模式下，应用写 SQE 后仍需 `io_uring_enter`，crate 通常用 `submit`/`submit_and_wait` 封装。一次 enter 可以提交一批请求，所以重点是**摊薄** syscall，而不是假装 syscall 不存在。
 
-#### 阶段 1: Epoll + Non-blocking I/O (Reactor 模型)
-这是大多数现代高性能网络库（如 Rust 的 `mio` / `tokio`, C++ 的 `libevent`）的工作方式。
+### 2.1 SQPOLL 何时仍会 syscall
 
-1.  **注册**: 告诉 `epoll` 关注某个 socket 的 `EPOLLIN` (可读) 事件。
-2.  **通知**: `epoll_wait` 返回，告诉用户“Socket A 有数据了”。
-3.  **执行**: 用户发起 `recv(Socket A)` 系统调用。
-    *   CPU 陷入内核。
-    *   内核将数据从网卡/内核缓冲区**拷贝**到用户缓冲区。
-    *   `recv` 返回。
+`IORING_SETUP_SQPOLL` 使用内核线程轮询 SQ。线程活跃时，它可以主动发现新请求；但线程可能睡眠。当 ring 标记 `IORING_SQ_NEED_WAKEUP` 时，应用仍需 enter 唤醒。
 
-**痛点**:
-*   **割裂**: `epoll` 只管通知，不管数据搬运。真正的搬运工作（`recv`）仍然是**同步**的系统调用。
-*   **系统调用开销**: 处理 N 个活跃连接，至少需要 N 次 `epoll_wait` (批量) + N 次 `recv`。如果是小包高频通信，syscall 开销巨大。
+还要确认：
 
-#### 阶段 2: io_uring (Proactor 模型)
-`io_uring` 将“通知”和“执行”合二为一，实现了真正的**异步 I/O**。
+- 目标内核及发行版是否支持所需 flag/opcode，是否有 backport 差异。
+- 创建 SQPOLL ring 的权限、cgroup、`RLIMIT_MEMLOCK` 和安全策略。
+- poll thread 的 CPU affinity、功耗与 housekeeping 规划。
+- CQ 满、SQ 满或 poll thread 被抢占时的背压策略。
 
-1.  **提交**: 用户不仅告诉内核“我想读 Socket A”，还直接把**空缓冲区**交给内核（写入 SQ）。
-2.  **异步执行**: 用户无需等待，继续处理其他逻辑。内核在后台自动等待数据到达，并直接将数据**拷贝**到用户提供的缓冲区中。
-3.  **完成**: 内核通过 CQE 告诉用户“操作完成了，数据已经在你的 Buffer 里了”。
+所以正确说法是：“SQPOLL 在特定状态下可省掉部分提交 syscall”，而不是把整个生命周期描述成不进入内核。
 
-**为什么 io_uring 能做到“零系统调用”？**
-你说得对，`epoll_wait` 是系统调用，传统的 `io_uring_enter` 也是系统调用。但 `io_uring` 有两个杀手锏是 `epoll` 做不到的：
+## 3. Rust 中的 buffer 生命周期
 
-1.  **共享内存 (Shared Memory Ring Buffers)**:
-    SQ 和 CQ 位于内核与用户态共享的内存区域。用户写 SQE、内核写 CQE 都不需要进入内核。只有在**通知**内核处理时才需要系统调用。
-2.  **SQPOLL 模式 (内核线程轮询)**:
-    这是 `io_uring` 真正的绝招。你可以配置一个内核线程专门盯着 SQ。
-    - 用户：写 SQE -> 更新 tail 指针（纯用户态内存操作）。
-    - 内核线程：发现 tail 变了 -> 自动捡起请求执行。
-    - **全程 0 系统调用**。相比之下，`epoll_wait` 永远无法摆脱系统调用，因为你必须通过它来向内核“索要”事件。
+下面示例同步等待一个文件读取，仅用于展示所有权边界。它依赖第三方 `io-uring` crate、Linux 内核和有效文件描述符，因此标为 `ignore`；验证时应固定 crate/内核版本，在独立项目执行 `cargo add io-uring`、`cargo check`，再用临时文件覆盖短读、错误 CQE、取消和 ring 满等集成测试。
 
-**对比**:
-*   **Epoll**: "告诉我什么时候可以读" -> 用户发起 `epoll_wait` (Syscall) -> 内核返回 -> 用户发起 `recv` (Syscall) -> 内核拷贝。
-*   **io_uring (SQPOLL)**: "帮我把数据读到这里" -> 用户写 SQ (0 Syscall) -> 内核线程搬运数据 -> 用户读 CQ (0 Syscall)。
-
-### 2.3 实战：UDP 高效收发
-
-在 HFT 中，行情数据通常通过 UDP 组播传输。使用 `io_uring` 处理 UDP 包可以显著减少系统调用开销。
-
-#### 关键 Opcode: `RecvMsg` 与 `SendMsg`
-
-```rust
+```rust,ignore
 use io_uring::{opcode, types, IoUring};
-use std::os::unix::io::AsRawFd;
-use std::net::UdpSocket;
+use std::io;
 
-fn receive_market_data(socket: &UdpSocket) -> std::io::Result<()> {
-    let mut ring = IoUring::new(128)?;
-    let fd = types::Fd(socket.as_raw_fd());
-
-    // 准备接收缓冲区
-    let mut buf = vec![0u8; 1500]; // 标准 MTU
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut _,
-        iov_len: buf.len(),
-    };
-    
-    // 构造 msghdr 结构体 (用于 recvmsg)
-    let mut msg_hdr: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg_hdr.msg_iov = &mut iov;
-    msg_hdr.msg_iovlen = 1;
-
-    // 1. 提交 RecvMsg 请求
-    let recv_op = opcode::RecvMsg::new(fd, &mut msg_hdr)
+fn read_once(fd: i32, buf: &mut [u8]) -> io::Result<usize> {
+    let mut ring = IoUring::new(8)?;
+    let sqe = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
         .build()
-        .user_data(1001); // Tag
+        .user_data(0x42);
 
+    // SAFETY: buf 的地址在 CQE 到来前保持有效，且没有其他代码并发访问它。
     unsafe {
-        ring.submission().push(&recv_op).expect("SQ full");
+        ring.submission().push(&sqe).map_err(|_| io::Error::other("SQ full"))?;
     }
-    
-    // 2. 提交并等待
-    ring.submit_and_wait(1)?;
 
-    // 3. 处理完成事件
-    if let Some(cqe) = ring.completion().next() {
-        if cqe.result() > 0 {
-            println!("Received {} bytes of market data", cqe.result());
-            // 处理 buf 中的数据...
-        }
+    ring.submit_and_wait(1)?;
+    let cqe = ring.completion().next().ok_or_else(|| io::Error::other("CQ empty"))?;
+    if cqe.result() < 0 {
+        return Err(io::Error::from_raw_os_error(-cqe.result()));
     }
-    
-    Ok(())
+
+    // read 的成功 CQE 表示这些字节已写入 buf；短读是合法结果。
+    Ok(cqe.result() as usize)
 }
 ```
 
-#### 进阶：多路复用 (Multishot Recv)
+低层 crate 接受裸指针，Rust borrow checker 无法自动知道异步操作何时结束。安全封装至少要保证：
 
-Linux 5.19+ 引入了 `IORING_RECV_MULTISHOT`。这是一个杀手级特性，它解决了“请求补充速度赶不上发包速度”的问题。
+- 在途期间 buffer 地址稳定，不能移动、释放或被另一请求重用。
+- 读操作完成前，应用不能读取内核正在写的区域。
+- 写操作允许复用的时点按 opcode 区分。
+- 取消请求也要等到明确 completion 后再回收相关内存。
 
-**工作原理**:
-1.  用户提交**一个**带有 `MULTISHOT` 标志的 `recv` 请求。
-2.  该请求在内核中保持**激活状态 (Armed)**，不会因为接收到一个包就从 SQ 中移除。
-3.  每当网卡有新数据到达，内核直接写入数据，并生成一个 CQE。
-4.  这个过程一直持续，直到出错或被显式取消。
+## 4. 网络收发的完成语义
 
-**对比**:
-- **One-Shot**: 1 SQE -> 1 Packet -> 1 CQE. (瓶颈在 SQE 提交速度，如果应用处理慢了，SQ 空了，就会丢包)
-- **Multi-Shot**: 1 SQE -> N Packets -> N CQEs. (瓶颈仅在处理 CQE 速度，内核自动驱动接收循环)
+### 4.1 `recv` / `recvmsg`
 
-这完美匹配了 HFT 中的行情流特征：突发、高频、单向。
+成功 CQE 的 `result = n` 表示内核把 `n` 字节交付到所提供的用户 buffer，应用现在可以解析 `buf[..n]`。它不表示 CQE 的时刻就是 NIC DMA 完成时刻；此前还经过驱动、NAPI、协议栈与 socket 队列。
 
-```rust
-// 伪代码示例 (需较新内核与 crate 支持)
-let multi_recv = opcode::RecvMsg::new(fd, &mut msg_hdr)
-    .flags(libc::IORING_RECV_MULTISHOT) // 关键标志
-    .build();
+对 UDP，单次 completion 对应一个数据报读取，但仍要检查 truncation、control message 和真实报文长度。对 TCP，它只是一段字节流，可能是半条或多条应用消息。
+
+### 4.2 普通 `send` / `sendmsg`
+
+成功 CQE 通常表示 socket send 操作接受了若干字节进入内核发送路径。它不证明：
+
+- NIC 已经读取 descriptor 或完成 DMA。
+- 报文已经在线路或交换机可见。
+- TCP 对端已经 ACK。
+- 交易所会话或订单网关已经处理。
+
+非阻塞语义仍可能出现 short send。应用必须保存剩余 offset，不能把整帧从头再提交。
+
+## 5. Multishot receive 与 provided buffers
+
+Multishot receive 允许一个 armed 请求产生多个 CQE，减少不断补 SQE 的成本。真正使用时通常要配合 provided-buffer ring/buffer selection：内核为每次接收选择一个可用 buffer，CQE 返回其 ID。
+
+关键规则：
+
+- CQE 带 `IORING_CQE_F_MORE` 才表示请求仍然 armed。
+- CQE 带 buffer flag 时，按 flags 解析 buffer ID。
+- 处理完数据后，应用要把 buffer 安全归还 buffer ring。
+- buffer 耗尽、CQ 溢出、取消或错误都会终止/阻塞接收路径。
+- One-shot 补充慢不必然立刻丢包，socket queue 可能暂存；queue 最终溢出才丢 UDP 数据。
+
+下面明确是**教学骨架**，函数名不是某个 crate 的稳定 API。落地时要按固定版本的 `io-uring` 文档替换，并在目标内核探测 opcode/flag 后，用 buffer 耗尽、CQ overflow、取消和 UDP microburst 测试验证。
+
+```rust,ignore
+// 教学骨架：实际 API 随 crate 与内核能力变化。
+let request = build_multishot_recv(socket_fd, buffer_group_id)?;
+submit(request)?;
+
+while let Some(cqe) = next_completion() {
+    let buffer_id = buffer_id_from_flags(cqe.flags())?;
+    process(provided_buffers.get(buffer_id), cqe.result())?;
+    provided_buffers.recycle(buffer_id)?;
+
+    if cqe.flags() & IORING_CQE_F_MORE == 0 {
+        rearm_multishot_receive()?;
+    }
+}
 ```
 
-### 2.4 零拷贝网络 (Zero-Copy Networking)
+这可能适合突发行情流，但必须用目标内核、NIC 驱动、buffer 数量和真实 microburst 验证 P99.99 与丢包。
 
-Linux 6.0+ 引入了 `io_uring` 的 `send_zc` (Zero Copy Send)。
+## 6. `send_zc`：两个 CQE 解决两个问题
 
-**原理**:
-传统的 `send` 会将数据从用户态 Buffer `memcpy` 到内核态的 `sk_buff`。
-`send_zc` 通过**页面锁定 (Page Pinning)** 技术，让网卡 DMA 直接读取用户态内存。
-- **发送阶段**: 内核记录用户内存地址，直接通知网卡发送。
-- **完成阶段**: 只有当网卡真正发送完毕（DMA 完成），内核才会生成 CQE。在此之前，用户**绝对不能**修改该 Buffer，否则会发送错误数据。
+Zero-copy send 尝试避免把用户 payload 复制进内核 buffer。内核或驱动可能因协议、对齐、设备能力等原因回退到复制路径，因此“请求了 zc”不等于硬件一定 DMA 用户页。
 
-**HFT 意义**: 
-对于发送大包（如回放历史行情）或高频发送小包（如订单指令），能显著降低 CPU 占用和内存带宽压力。但对于极小的包（< 1KB），页面锁定的开销可能超过拷贝数据的开销，需要 Benchmark 验证。
+概念上要区分：
 
-## 3. HFT 场景分析
+1. **发送操作 CQE**：给出 send 的字节数或错误。
+2. **notification CQE**：带 notification flag，表示内核不再引用该用户 buffer，此后才能修改、释放或用于另一条消息。
 
-### 3.1 适用场景
-- **异步日志落盘**: 使用 `io_uring` 批量写入日志文件，完全不阻塞交易线程，且比后台线程 `write` 更高效。
-- **行情记录 (Market Data Recording)**: 将海量 UDP 包直接 dump 到磁盘。
-- **网关服务器**: 处理大量并发 TCP 连接（类似于 Nginx 的角色）。
+notification 解决的是**内存所有权**，不是 wire-time 证明。即使 buffer 已可复用，也不能直接断言交易所已收到。如果需要不同层证据：
 
-### 3.2 不适用场景 (陷阱)
-- **极低延迟交易**:
-    虽然 `io_uring` 很快，但在**单次小包**的延迟上，它通常不如 **Busy Polling + Userspace Networking (DPDK/OpenOnload)**。
-    因为 `io_uring` 仍然经过内核的文件系统层或网络栈层，路径比 Kernel Bypass 长。
-    且 `SQPOLL` 线程引入了额外的调度不确定性。
+| 问题 | 更合适的证据 |
+| :--- | :--- |
+| 用户 buffer 何时可复用？ | zero-copy notification CQE |
+| 报文何时离开 NIC？ | NIC TX hardware timestamp/设备文档 |
+| TCP 对端是否收到字节？ | TCP ACK（仍不是业务处理） |
+| 交易所是否接受订单？ | 协议 Order ACK/Reject |
 
-## 4. 高级特性：Fixed Buffers & Files
+大块回放可能受益于减少复制；极小订单的 notification、注册与 bookkeeping 成本可能抵消收益。不要设固定包长分界，应该实测。
 
-为了进一步减少开销，`io_uring` 允许预先注册缓冲区和文件描述符。
+## 7. Registered buffers 与 files
 
-- **Registered Buffers**: 预先将用户态内存映射到内核，避免每次 I/O 时的 `get_user_pages` 调用（锁住内存页）。
-- **Registered Files**: 避免每次通过 fd 查找内核 file 结构体（原子引用计数开销）。
+- **Registered buffers**：预先注册地址稳定的内存，减少每次映射/固定页面的工作；它会占用锁页等资源，并强化生命周期约束。
+- **Registered files**：减少每次从 fd table 查找 file 的工作；更新、注销和关闭顺序需要明确。
+- **Fixed/provided buffer**不是同一个概念：前者给请求指定已注册 buffer index，后者由内核从 buffer group 选择。
 
-```rust
-// 注册缓冲区示例
-let mut buf = vec![0u8; 4096];
-let iovec = libc::iovec {
-    iov_base: buf.as_mut_ptr() as *mut _,
-    iov_len: buf.len(),
-};
+注册通常发生在初始化阶段，但并不代表系统运行期绝无注册、更新、取消或唤醒 syscall。
 
-// 这是一个系统调用，但在初始化阶段做一次即可
-ring.submitter().register_buffers(&[iovec])?;
+## 8. HFT 选型表
 
-// 之后使用 opcode::ReadFixed 代替 Read
-```
+| 方案 | 优势 | 关键边界 | 常见用途 |
+| :--- | :--- | :--- | :--- |
+| epoll + socket | 生态成熟、语义清晰 | readiness 后仍要 partial recv/send | 多连接网关 |
+| io_uring 普通模式 | 批量 SQE/CQE，多类 I/O 统一 | enter/wait、ring 背压、版本 | 持久化、记录、网关 |
+| io_uring SQPOLL | 某些状态减少提交 syscall | 权限、NEED_WAKEUP、专用 CPU | 高频提交且可承担运维成本 |
+| multishot + buffer ring | 减少接收请求补充 | F_MORE、buffer/CQ 回收 | 突发 UDP 接收 |
+| send_zc | 可能降低复制与内存带宽 | 双 completion、fallback、所有权 | 大块/高带宽发送 |
+| 用户态网络 | 更直接控制 NIC queue | 驱动接管、协议栈、权限与工具 | 极端数据路径 |
 
-## 5. 总结
+## 9. 面试追问
 
-`io_uring` 是 Linux I/O 的未来。
-在 HFT 系统中，它可能不会直接用于**核心策略逻辑**（那里我们用自旋锁和共享内存），但在**数据持久化**、**历史回放**和**非核心网关**中，它是无与伦比的利器。
+### Q1：SQPOLL 能否让整个生命周期都不调用 syscall？
+
+不是。它在 poll thread 活跃时可省掉部分提交 syscall；线程睡眠且出现 `NEED_WAKEUP` 时仍需 enter。初始化、注册、等待、取消和资源管理也可能进入内核。
+
+### Q2：收到 send CQE 能不能复用 buffer？
+
+普通 copy send 通常可以在操作返回后复用，因为内核已经复制/接受了数据；`send_zc` 要等额外 notification，不能只看首个发送 CQE。具体必须按 opcode 文档和 flags 实现。
+
+### Q3：CQE 是否等于 NIC DMA completion？
+
+不能这样概括。CQE 表示内核定义的操作完成。`recv` CQE 表示字节已在用户 buffer；send CQE/notification 各有自己的语义。线上可见性需硬件时间戳或外部测量。
+
+## 10. 总结
+
+`io_uring` 的价值是可批量的 operation/completion 模型，而不是一个“自动更快”的标签。选择前要固定内核、crate、权限、驱动和 opcode 能力，设计 SQ/CQ 与 buffer 背压，并用真实流量测量完整延迟分布。
 
 ---
-下一章：[第四部分：市场连接 (Market Connectivity)](../connectivity/protocols.md)
+
+下一章：[市场连接：协议概述](../connectivity/protocols.md)

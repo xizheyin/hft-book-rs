@@ -1,6 +1,6 @@
-# 第2章：CPU 微架构原理与低延迟优化 (CPU Microarchitecture and Low-Latency Optimization)
+# CPU 微架构原理与低延迟优化 (CPU Microarchitecture and Low-Latency Optimization)
 
-在设计和实现纳秒级延迟的交易系统时，仅仅理解编程语言的语法与抽象是远远不够的。软件的本质是驱动硬件状态的变迁。为了在现代复杂处理器上获得极致且确定的性能，开发者必须深刻理解 CPU 的微架构（Microarchitecture）设计。
+在分析低延迟交易系统时，语言层面的代码只是起点。同一段代码在不同处理器、编译选项和数据分布下可能产生不同表现，因此理解 CPU 微架构有助于提出假设、选择指标并解释基准结果。
 
 本章将从计算机体系结构的核心概念出发，系统探讨指令流水线（Instruction Pipeline）、分支预测（Branch Prediction）、乱序执行（Out-of-Order Execution）以及硬件级高精度计时（Hardware Timers）的底层原理，并展示如何通过 Rust 编写与硬件高度契合的低延迟代码。
 
@@ -10,7 +10,7 @@
 
 ### 2.1.1 经典流水线模型与数据冒险 (Pipeline Model and Data Hazards)
 
-指令的执行过程在微架构层面通常被划分为多个离散的阶段。以经典的五级流水线为例，一条指令的生命周期包括：取指（Fetch, IF）、译码（Decode, ID）、执行（Execute, EX）、访存（Memory, MEM）和写回（Writeback, WB）。
+指令执行可以用多个阶段来理解。经典教学模型把一条指令分为取指（Fetch, IF）、译码（Decode, ID）、执行（Execute, EX）、访存（Memory, MEM）和写回（Writeback, WB）。现代高性能 CPU 的实际前端、后端和流水线远比五级模型复杂，下面的图只用于建立直觉。
 
 ```mermaid
 gantt
@@ -32,43 +32,45 @@ gantt
     WB :b6, 6, 7
 ```
 
-虽然流水线通过重叠指令的执行阶段显著提升了吞吐量（Throughput），但它极易受到**数据冒险（Data Hazards）**的干扰。当后一条指令（如上述图表中的指令 2）的执行依赖于前一条指令（指令 1）尚未写回的结果时，流水线必须暂停（Stall），从而产生流水线气泡（Pipeline Bubble），导致 CPU 周期的浪费。
+流水线通过重叠不同指令的阶段提高吞吐量，但会遇到**数据冒险（Data Hazards）**。当后一条指令需要的结果尚未就绪时，简单流水线需要暂停（Stall），形成流水线气泡。真实处理器还会使用旁路/转发、寄存器重命名和乱序执行来消除或隐藏一部分等待，因此消费者不一定要等到教学模型中的“写回阶段”。
 
 ### 2.1.2 超标量架构与循环展开 (Superscalar Architecture and Loop Unrolling)
 
-为了突破流水线单个时钟周期最多完成一条指令（IPC ≤ 1）的理论极限，现代 CPU 引入了超标量架构。在执行阶段（EX），CPU 配备了多套功能单元（如多个 ALU 整数运算单元、FPU 浮点运算单元）。这意味着在没有数据依赖的前提下，CPU 可以在同一个时钟周期内发射并执行多条指令。
+为了突破单发射流水线模型每周期至多发射一条指令的限制，现代高性能 CPU 使用超标量设计。在后端，CPU 配备多种执行端口和功能单元（如整数、浮点和加载/存储单元）。在依赖和资源允许时，一个周期可以发射或执行多个微操作；发射、执行与退休的宽度也不一定相同。
 
 在工程实践中，**循环展开（Loop Unrolling）** 是充分利用超标量架构的经典技术。
 
 ```rust
 // 代码清单 2.1：通过循环展开打破依赖链，提升 IPC
 
-/// 普通累加：由于每次迭代都强依赖上一次的 `acc` 结果，
-/// 数据依赖链导致 CPU 只能串行执行加法，大量 ALU 处于空闲状态。
-pub fn sum_sequential(data: &[u32]) -> u32 {
-    let mut acc = 0;
+/// 普通累加只有一条 `acc` 依赖链，可能限制加法并行度。
+pub fn sum_sequential(data: &[u32]) -> u64 {
+    let mut acc = 0_u64;
     for &val in data {
-        acc += val;
+        acc += u64::from(val);
     }
     acc
 }
 
-/// 循环展开（4路）：打破了单一的依赖链。
-/// 此时 acc1, acc2, acc3, acc4 的计算是相互独立的。
-/// 超标量 CPU 会将这 4 个加法操作分配到不同的 ALU 上并行执行。
-pub fn sum_unrolled(data: &[u32]) -> u32 {
-    let mut acc1 = 0;
-    let mut acc2 = 0;
-    let mut acc3 = 0;
-    let mut acc4 = 0;
+/// 循环展开（4 路）提供四条独立依赖链；编译器和 CPU
+/// 是否利用这些并行机会，要看最终机器码和目标微架构。
+pub fn sum_unrolled(data: &[u32]) -> u64 {
+    let mut acc1 = 0_u64;
+    let mut acc2 = 0_u64;
+    let mut acc3 = 0_u64;
+    let mut acc4 = 0_u64;
     
-    // 假设 data 的长度是 4 的倍数
     let mut iter = data.chunks_exact(4);
-    for chunk in iter {
-        acc1 += chunk[0];
-        acc2 += chunk[1];
-        acc3 += chunk[2];
-        acc4 += chunk[3];
+    for chunk in &mut iter {
+        acc1 += u64::from(chunk[0]);
+        acc2 += u64::from(chunk[1]);
+        acc3 += u64::from(chunk[2]);
+        acc4 += u64::from(chunk[3]);
+    }
+
+    // 处理长度不是 4 的倍数时留下的 0～3 个元素。
+    for &val in iter.remainder() {
+        acc1 += u64::from(val);
     }
     
     acc1 + acc2 + acc3 + acc4
@@ -76,27 +78,26 @@ pub fn sum_unrolled(data: &[u32]) -> u32 {
 ```
 
 **代码解析**：
-在 `sum_unrolled` 中，通过引入多个独立的累加器变量，我们在软件层面消除了控制流中的串行数据依赖（Read-After-Write, RAW）。这使得编译器和 CPU 的指令调度器能够将这些不相关的加法指令并行发射，显著提升 IPC，降低总体计算延迟。
+在 `sum_unrolled` 中，多个累加器把一条长依赖链拆成四条较短的链，为编译器和 CPU 调度器提供了更多并行机会。但这不保证更快：编译器可能已经自动展开或向量化普通版本，小输入还可能被额外的循环与归并开销抵消。应在 release 构建中检查机器码，并用真实长度分布做基准测试。
 
 ## 2.2 控制流冒险与分支预测机制 (Control Flow Hazards and Branch Prediction)
 
-除了数据依赖，流水线面临的最严重威胁是控制冒险（Control Hazards），主要由条件分支指令（如 `if` 语句对应的机器码）引起。
+除了数据依赖，控制冒险（Control Hazards）也是限制流水线效率的重要因素，常见来源是条件分支指令。需要注意，Rust 源码中的 `if` 不一定对应最终机器码中的跳转。
 
 ### 2.2.1 预测惩罚的代价 (Misprediction Penalty)
 
 当取指单元（Fetch Unit）遇到条件跳转指令时，分支条件的计算结果通常需要数个周期后才能在执行单元（EX）中得出。为了防止流水线停顿，现代 CPU 必须使用**分支预测器（Branch Predictor）**猜测未来的执行路径，并进行推测执行（Speculative Execution）。
 
-如果预测失败（Misprediction），CPU 必须丢弃所有在错误路径上推测执行的指令（即清空流水线，Pipeline Flush），并从正确的地址重新取指。在现代拥有十几至二十几级深度的流水线架构中，一次分支预测失败通常会导致 15 到 20 个时钟周期的极高惩罚。
+如果预测失败（Misprediction），CPU 要丢弃错误路径上的推测结果，并从正确地址继续。代价与处理器微架构、分支在流水线中的解析位置以及周围指令有关，可能是十余个或更多核心周期，但不存在适用于所有 CPU 的固定数字。可以结合目标机器上的基准和 PMU 分支事件判断影响。
 
-### 2.2.2 工程实践：无分支编程 (Branchless Programming)
+### 2.2.2 工程实践：分支与无分支的取舍
 
-在核心交易循环中，对于概率分布不可预测的条件分支，最佳策略是通过位运算或算术运算彻底消除条件跳转指令，这种技术被称为**无分支编程**。
+对难以预测的条件，使用数据选择而不是跳转有时能降低抖动；但“无分支”不是默认最优方案。预测稳定的分支可能非常便宜，而无分支写法可能让两侧工作都执行、延长依赖链，或者妨碍其他优化。
 
 ```rust
-// 代码清单 2.2：消除条件分支以保证确定性延迟
+// 代码清单 2.2：两种等价源码写法，最终机器码需要检查
 
-/// 传统的分支实现
-/// 汇编通常包含 CMP (比较) 和 JNE/JE (条件跳转)
+/// 源码写成 if/else；最终是否有跳转由编译器决定。
 pub fn process_order_branched(price: i32) -> i32 {
     if price > 0 {
         1
@@ -105,19 +106,18 @@ pub fn process_order_branched(price: i32) -> i32 {
     }
 }
 
-/// 无分支实现 (Branchless)
-/// 汇编中没有任何跳转指令，通常编译为 SETG 等指令
+/// 源码写成布尔值转换；编译器可能使用 SETcc，也可能选择其他形式。
 pub fn process_order_branchless(price: i32) -> i32 {
     (price > 0) as i32
 }
 ```
 
 **代码解析**：
-`process_order_branchless` 利用了 Rust 中布尔类型安全转换为整数的特性。编译器通常会将其优化为直接的寄存器操作（如利用比较指令的标志位）。虽然这种做法在某些情况下可能比预测正确的分支多执行一两条简单的算术指令，但它彻底消除了预测失败带来的 20 个周期惩罚，从而极大地降低了尾部延迟（Tail Latency）的抖动。
+`process_order_branchless` 利用了 Rust 中布尔值到整数的转换。不过，这两个源码版本很可能被优化成相同机器码，也可能因目标 CPU 和上下文不同而使用条件跳转、条件移动或 `SETcc`。源码形状不能证明“汇编没有分支”；请检查最终二进制并用与生产相同的数据分布测试尾延迟。
 
 ### 2.2.3 编译器提示 (Compiler Hints)
 
-对于那些具有极高预测确定性（例如错误处理路径）的分支，我们可以通过提示编译器来优化指令缓存（I-Cache）的局部性。
+对于不常执行的函数（例如严重错误处理），可以给编译器提供冷路径提示，让优化器在认为合适时调整内联或代码布局。
 
 ```rust
 // 代码清单 2.3：使用 cold 属性优化冷路径
@@ -141,19 +141,19 @@ pub fn process_data(is_valid: bool) {
 ```
 
 **代码解析**：
-`#[cold]` 属性向 Rust 编译器及 LLVM 后端传递了强烈的静态分支概率信号。编译器不仅会将 `is_valid` 假设为 `true`，还会将 `handle_fatal_error` 的机器码放置在内存的远端区域（Out-of-line）。这保证了热路径（Hot Path）的机器码紧凑地排列在一起，最大化了 L1 指令缓存的命中率。
+`#[cold]` 告诉编译器该函数不太可能被调用，`#[inline(...)]` 也只是内联提示。它们可能影响内联、代码布局和调用边的概率信息，但 Rust 明确允许编译器忽略这些提示；不能据此保证 `is_valid` 一定被假设为 `true`，也不能保证函数会被放到某个特定地址。使用前后应比较最终机器码和基准结果。
 
 ## 2.3 乱序执行引擎 (Out-of-Order Execution Engine)
 
-为了掩盖主存访问（DRAM Access）带来的巨大延迟（通常高达 200-300 个时钟周期），现代高端处理器采用了基于 Tomasulo 算法的乱序执行（Out-of-Order Execution, OoO）架构。
+为掩盖缓存未命中和长延迟运算带来的等待，许多现代高性能处理器采用乱序执行（Out-of-Order Execution, OoO）。访问 DRAM 的代价可能达到数十到数百个核心周期，但会随平台、NUMA 距离、频率、内存负载和访问模式显著变化。
 
-CPU 在译码阶段后，会将指令放入**重排序缓冲区（Reorder Buffer, ROB）**。调度器（Scheduler）会持续扫描 ROB，一旦发现某条指令的操作数已经准备就绪（即使它在程序顺序中位于后面），就会立即将其发射到执行单元。
+在一种常见的抽象模型中，指令被译码为微操作并完成寄存器重命名，随后进入调度器/发射队列等待操作数就绪；就绪的微操作可以不按程序顺序发射。**重排序缓冲区（Reorder Buffer, ROB）**主要跟踪尚未提交的操作，使结果最终按程序顺序退休，并支持精确异常。具体队列是否分离、如何选择就绪操作，属于微架构实现细节。
 
 ```mermaid
 graph TD
     A[顺序取指 In-Order Fetch] --> B[顺序译码 In-Order Decode]
     B --> C[寄存器重命名 Register Renaming]
-    C --> D[重排序缓冲区 ROB & 保留站 Reservation Station]
+    C --> D[ROB 与调度器 / 发射队列]
     D --> E{操作数就绪? Operands Ready?}
     E -->|Yes| F[乱序发射与执行 Out-of-Order Execute]
     E -->|No| D
@@ -161,57 +161,89 @@ graph TD
 ```
 
 **架构意义**：
-虽然乱序执行是硬件自动完成的，但作为底层开发者，我们需要确保代码中存在足够的**指令间独立性**。如果代码中存在冗长且严格串行的数据依赖链，ROB 很快就会被阻塞的指令填满，导致整个乱序引擎停顿（Stall）。
+乱序执行由硬件完成，但代码中的**指令间独立性**决定了硬件有多少可调度空间。长依赖链、缓存未命中或执行资源争用都可能让乱序窗口逐渐填满并限制吞吐；哪一种因素占主导，应通过硬件性能计数器和基准定位。
 
-## 2.4 微秒级硬件精确计时：TSC (Time Stamp Counter)
+## 2.4 x86 短区间计时：TSC (Time Stamp Counter)
 
-在高频交易中，性能剖析（Profiling）通常需要测量纳秒（ns）级别的代码执行时间。标准的操作系统调用（如 `std::time::Instant::now()` 底层调用的 `clock_gettime`）即使经过 vDSO 优化，仍可能引入 20-50 纳秒的开销与上下文切换抖动。这对于评估耗时仅数十纳秒的热路径是不可接受的。
+短区间基准有时需要比应用级时钟更低层的观测手段。`std::time::Instant::now()` 的实现依赖操作系统和平台：它可能使用 vDSO、共享时钟页或硬件计数器，并不必然发生系统调用，更不会因为一次读时钟就必然触发上下文切换。很多场景应优先使用它或成熟的基准框架；只有在受控的 x86 实验中，才考虑直接读取 TSC，并先实测计时器自身开销。
 
 ### 2.4.1 RDTSC 指令与序列化 (RDTSC and Serialization)
 
-x86_64 架构提供了一个名为 TSC（Time Stamp Counter）的 64 位硬件寄存器，它记录了自处理器复位以来的时钟周期数。读取该寄存器的 `rdtsc` 指令仅需不到 10 纳秒的开销。
+x86 提供 64 位 TSC（Time Stamp Counter）。`RDTSC` 读取的是 TSC **刻度**，不是“这段代码实际消耗的核心周期数”；支持 invariant TSC 时，其增长速率通常也不随当前核心升降频变化。指令延迟和吞吐依处理器而异，不能承诺固定的纳秒开销。
 
-然而，由于上述提到的**乱序执行引擎**，普通的 `rdtsc` 指令可能会被 CPU 重排（Reorder）到被测代码段的中间甚至后面执行，从而导致测量结果严重失真。因此，必须结合序列化指令（Serializing Instructions）或内存屏障（Memory Barriers），或者使用自带序列化语义的 `rdtscp` 指令。
+`RDTSC` 不是序列化指令：较早指令未全部完成时它就可能读取计数器，较晚指令也可能提前开始。还要单独防止编译器把被测运算移出边界。因此，严谨测量需要同时设计编译器边界与 CPU 执行边界，而不是笼统地加一个“内存屏障”。
 
 ```rust
-// 代码清单 2.4：Rust 中高精度的硬件计时器封装
+// 代码清单 2.4：受控实验中的有序 TSC 读取
 
 #[cfg(target_arch = "x86_64")]
 pub mod hardware_timer {
-    use std::arch::x86_64::{_rdtsc, _rdtscp};
+    use std::arch::asm;
 
-    /// 在代码块开始前读取时间戳。
-    /// 使用 LFENCE 充当轻量级指令屏障，防止乱序执行导致后续指令被提前执行。
-    #[inline(always)]
-    pub fn start_tsc() -> u64 {
-        unsafe {
-            std::arch::asm!("lfence", options(nostack, nomem, preserves_flags));
-            _rdtsc()
-        }
+    #[derive(Debug, Clone, Copy)]
+    pub struct TscStamp {
+        pub ticks: u64,
+        pub aux: u32,
     }
 
-    /// 在代码块结束后读取时间戳。
-    /// rdtscp 保证在此之前的所有指令（包括内存访问）均已在逻辑上执行完毕。
-    #[inline(always)]
-    pub fn end_tsc() -> u64 {
-        let mut aux: u32 = 0;
+    /// RDTSCP 等待更早的指令与 load 完成，再读取 TSC 和 TSC_AUX；
+    /// 随后的 LFENCE 阻止更晚的指令越过这个读取点。
+    ///
+    /// 调用前必须确认 CPU 支持 RDTSCP。
+    #[inline]
+    pub fn ordered_tsc() -> TscStamp {
+        let low: u32;
+        let high: u32;
+        let aux: u32;
+
         unsafe {
-            let tsc = _rdtscp(&mut aux);
-            std::arch::asm!("lfence", options(nostack, nomem, preserves_flags));
-            tsc
+            asm!(
+                "rdtscp",
+                "lfence",
+                lateout("eax") low,
+                lateout("edx") high,
+                lateout("ecx") aux,
+                // 故意不写 `nomem`：还需要阻止编译器把内存访问移过边界。
+                options(nostack, preserves_flags),
+            );
+        }
+
+        TscStamp {
+            ticks: (u64::from(high) << 32) | u64::from(low),
+            aux,
         }
     }
 }
 ```
 
 **代码解析**：
-- 在 `start_tsc` 中，`lfence`（Load Fence）不仅作为内存屏障，在现代 Intel 架构中也作为指令调度屏障，阻止了编译器和 CPU 将被测代码重排到 `rdtsc` 之前。
-- `end_tsc` 使用了 `_rdtscp`。虽然 `rdtscp` 会等待先前的指令执行完成，但它不阻止其后的指令被提前执行。因此，紧接着附加一个 `lfence` 可以确保整个测量边界的绝对严格性。
+- `RDTSCP` 会等待之前的指令执行完成以及之前的 load 全局可见，然后读取 TSC；它**不保证之前的 store 已经对其他核心全局可见**。若测量目标包含“store 对外可见”的时间，需要在结束读数前使用适合该语义的 `MFENCE`，并接受额外测量开销。
+- `RDTSCP` 自身不阻止之后的指令提前执行，所以后接 `LFENCE`。如果用 `RDTSC` 作为起点，常见有序序列是 `LFENCE; RDTSC; LFENCE`；若还要求起点前的 store 全局可见，则需要更强的顺序设计。
+- 示例故意没有给 `asm!` 标注 `nomem`。CPU fence 不能自动约束编译器；若告诉编译器汇编与内存无关，它仍可能移动周围的内存操作。
+- `TSC_AUX` 的含义由操作系统设置，常被用来辅助发现测量期间是否迁移到另一逻辑 CPU。生产基准仍应绑定 CPU，并比较起止 `aux`；虚拟机中还要验证 hypervisor 的 TSC 行为。
+- `RDTSCP` 是可选特性，运行前要用 CPUID 检查支持情况。上述 `unsafe` 表示调用者和部署环境必须维护这些前提，而不是说读取时间戳会修改 Rust 内存。
+
+上面的屏障说明采用 Intel 当前架构文档中的语义。AMD 或其他 x86 实现也要查目标厂商对应型号的架构手册，不能只因指令名字相同就假设所有微架构细节完全一致。
 
 ### 2.4.2 恒定 TSC (Invariant TSC)
 
-早期的处理器在触发功耗管理（如降频）时，TSC 的增长率会随主频波动。现代架构（Intel Nehalem 之后）全面支持了 **Invariant TSC（恒定 TSC）**，无论 CPU 处于何种 P-State（性能状态）或休眠深度，TSC 均以固定的基准频率（Base Frequency）稳定增长，这使得将其转换为精确的纳秒时间成为可能（通过公式：`时间(纳秒) = 周期数 * (1_000_000_000 / 基准频率)`）。
+处理器可通过 CPUID 声明 **Invariant TSC**：TSC 以固定速率跨 ACPI P-/C-/T-state 运行。这仍不能让代码假设“所有 Nehalem 之后的机器、所有 socket 和所有虚拟机都天然同步”。部署时应检查特性、操作系统时钟源、跨核同步和虚拟化环境。
+
+TSC 频率也不应直接用当前核心频率或宣传的 base frequency 代替。可优先读取平台提供的频率信息（例如可用时的 CPUID 叶），或用可靠的单调时钟校准。换算时使用已确认的 `tsc_hz`：
+
+```text
+纳秒 = TSC 刻度差 × 1_000_000_000 / tsc_hz
+```
+
+### 2.4.3 最小测量清单
+
+1. release 构建，确认被测代码没有被常量折叠或整体删除；
+2. 预热代码与数据，分别报告冷缓存和热缓存结果；
+3. 固定线程到一个逻辑 CPU，并记录调度、抢占和中断造成的离群值；
+4. 先测空计时边界的分布，不盲目用一个常数相减；
+5. 报告中位数与 p95/p99 等分位数，而不只给最小值；
+6. 写明 CPU 型号、微码、频率策略、内核、编译器和编译参数。
 
 ---
 
-通过深刻理解并顺应 CPU 的流水线、分支预测器和乱序执行机制，开发者可以编写出硬件友好的低延迟代码。然而，计算仅仅是整个系统的一个环节。在下一章 [内存布局与缓存效率](memory_layout.md) 中，我们将探讨由于“存储墙（Memory Wall）”带来的更为严峻的延迟挑战，以及如何通过数据局部性（Data Locality）来攻克这一难题。
+流水线、分支预测和乱序执行为性能现象提供了分析模型，但优化结论仍要由目标机器上的测量支持。下一章 [内存布局与缓存效率](memory_layout.md) 将继续讨论数据布局与局部性如何影响缓存行为。

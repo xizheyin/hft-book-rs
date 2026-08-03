@@ -1,130 +1,142 @@
 # 执行算法 (Execution Algos)
 
-策略层决定了“买什么”和“买多少”，而执行层（Execution Layer）决定了“怎么买”。
+策略产生“希望完成什么”的目标，执行层决定怎样把目标拆成受控订单，并处理成交、撤单和剩余量。它通常在成交概率、价格、市场冲击、费用、库存风险和完成时间之间权衡；没有一种算法能同时保证最优价格和全部成交。
 
-在 HFT 中，执行不仅仅是简单的发单，更是一场关于**微观结构**和**博弈论**的战斗。优秀执行算法的目标是：
-1.  **最小化冲击成本 (Impact Cost)**: 不要因为你的买入把价格推高。
-2.  **最大化成交概率 (Fill Rate)**: 想买的时候能买到。
-3.  **捕获价差 (Spread Capture)**: 尽量以 Bid 买入，以 Ask 卖出（做市商模式）。
+> 本章讨论工程和面试概念，不构成交易建议，也不承诺执行效果。订单语义和合规要求以对应场所规则为准。
 
-## 1. 挂单类型 (Order Types)
+## 1. 订单属性的准确边界
 
-### 1.1 Limit Order (限价单)
-最基本的类型。但在 HFT 中，我们需要更高级的属性：
-*   **Post-Only (只做 Maker)**: 如果该订单会立即成交（Taker），则自动撤单或调整价格。这保证了你总是获得 Maker Rebate（交易所返佣）。
-*   **IOC (Immediate or Cancel)**: 立即成交否则撤销。用于 Taker 策略探测流动性。
-*   **FOK (Fill or Kill)**: 全部成交否则撤销。
+- **Limit**：限制最差成交价，不保证成交；
+- **IOC**：立即成交可成交部分，取消剩余，不等于“全部或取消”；
+- **FOK**：通常要求立即全部成交，否则整单取消；
+- **Post-only**：若到达时会获取流动性，场所按规则拒绝、取消或调整。它不保证一定获得返佣，费率和最终成交状态另行决定；
+- **Iceberg/Reserve**：只显示部分数量。刷新优先级和隐藏量语义因场所而异；公开行情中的补量只能支持推断，不能证明他人完整订单或意图；
+- **Pegged**：价格参考 BBO/mid 等变化，并受 cap/floor 约束；是否重排队取决于规则。
 
-### 1.2 Iceberg (冰山单)
-隐藏真实数量，只显示一小部分（Display Qty）。
-**HFT 对抗**: HFT 算法会通过探测（Ping）来发现冰山单，并利用这一信息（例如，如果发现大买单，HFT 会抢先买入推高价格）。
+完整撮合算例见 [订单类型与撮合优先级](../hft/orders_matching.md)。
 
-## 2. 常见执行算法
+## 2. 常见执行方式及适用边界
 
-### 2.1 Pegging (挂钩策略)
-始终跟随 BBO (Best Bid Offer)。
-*   **Peg to Best Bid**: 永远挂在买一价。如果买一价上涨，自动改单跟进。
-*   **Peg to Mid**: 挂在中间价（通常用于暗池）。
+### 2.1 被动报价与 Pegging
 
-**实现难点**: 当大量 HFT 同时 Peg 时，会引发“改单风暴” (Quote Flickering)。你需要控制改单频率，避免被交易所限流 (Throttling)。
+被动订单可以等待对手方成交，可能减少跨价差成本，但面临不成交、队列等待和逆向选择。跟随 BBO 的 pegging 会频繁改价；必须设置最小变动、最短驻留时间或速率预算，并遵守场所消息限制。改单通常会影响优先级，规则需逐场所配置。
 
-### 2.2 Sniper (狙击手)
-当发现明显的套利机会或错误定价时，不计成本地吃掉流动性。
-**关键**: 速度。谁快谁赢。通常使用 IOC 订单。
+### 2.2 主动获取流动性
 
-### 2.3 TWAP / VWAP (时间/成交量加权平均)
-用于大单拆分。HFT 通常作为这种算法的**对手方**（识别出有人在跑 VWAP，然后进行掠夺性交易）。但 HFT 自己平仓时也会用到微缩版的 TWAP（在 1 秒内拆成 100 单）。
+可成交限价单或 IOC 可用于对完成时间要求较高、存在明确价格上限的场景。速度只是因素之一：还要检查行情新鲜度、可见深度、费用、限价保护和单边未成交风险。所谓“市价机会明显便不计成本”不是安全的执行原则。
 
-## 3. 队列位置估计 (Queue Position Estimation)
+### 2.3 TWAP / VWAP
 
-在 L3 数据中，你可以确切知道自己在队列的哪个位置。但在 L2 数据中，你只能估计。
+- TWAP：按时间计划拆分目标量；
+- VWAP：让执行节奏参考市场成交量分布。
 
-假设当前 Best Bid 有 1000 手。你挂了 10 手在后面。
-1.  **保守估计**: 你在第 1010 位。
-2.  **进阶估计**: 如果有人撤单，你前面的队伍会缩短吗？
-    *   如果是 FIFO 撮合：前面的撤单让你前进。
-    *   如果是 Pro-Rata 撮合（如期货）：按比例分配。
+它们是执行基准/调度方式，不保证成交价优于基准。固定节奏可能被市场变化打断；生产实现需要参与率、最大子单、价格保护、结束时间和暂停条件。识别其他参与者并不授权误导、操纵或利用非公开信息。
 
-**算法**:
-维护一个变量 `position_in_queue`。
-*   当 Trade 发生且 Price == MyPrice: `position_in_queue -= trade_qty`。
-*   当 Cancel 发生且 Price == MyPrice:
-    *   在 L2 中无法确定撤单是谁的。通常假设撤单均匀分布，或者假设撤单主要发生在队尾（对你有利）。
+### 2.4 多场所路由
 
-## 4. 延迟套利与对冲 (Latency Arbitrage & Hedging)
+SOR 会综合各场所价格、可见量、费用、延迟、订单状态和适用的最佳执行/订单保护规则。多个子单无法保证“同时到达”；路径延迟与场所处理不同，先到订单还可能改变市场。系统必须管理：
 
-### 4.1 跨交易所套利
-A 交易所价格 100，B 交易所价格 101。
-**执行**:
-1.  并发发送：同时发单买 A 卖 B。风险：单边成交 (Legging Risk)。
-2.  被动-主动 (Passive-Aggressive): 先在 A 挂买单（Maker）。成交后，立即去 B 吃单（Taker）。
+- 每个子单独立 Client ID 和状态；
+- 总目标量与各子单 leaves 的守恒；
+- 一处成交、另一处失败的 leg risk；
+- 行情陈旧和路由途中价格变化；
+- 全局风险预占与释放；
+- 可审计的路由理由。
 
-### 4.2 智能路由 (Smart Order Routing - SOR)
-如果你要在多个交易所买入 1000 股。
-SOR 会根据各交易所的流动性和延迟，决定分配多少数量。
-**目标**: 让所有子订单**同时**到达各交易所，防止先到达的订单惊动市场，导致其他交易所价格瞬间逃离。
+## 3. 队列位置是估计，不是承诺
 
-## 5. 代码实现模式：执行状态机
+即使有 L3，隐藏量、特殊优先级、消息延迟和自身订单映射也会限制“精确位置”。只有 L2 时，同档撤量无法说明来自你前方还是后方，最好维护边界：
 
-执行逻辑通常独立于策略逻辑，使用有限状态机（FSM）管理订单生命周期。
+```text
+ahead_min = 假设同档撤单都发生在你前方
+ahead_max = 假设同档撤单都发生在你后方
+```
+
+FIFO 下同价成交会消耗前方量，但更新需使用饱和/检查减法，避免 `position - trade_qty` 下溢。Pro-rata 市场更关心按规则估计的分配份额，而不是单一“第几位”。模型要用真实回报校准，不能把估计成交概率写成保证。
+
+## 4. 子订单状态机
+
+`send()` 成功只说明本地接受/发送动作完成，不表示场所 ACK，更不表示 Fill。撤单请求也不表示订单已经取消。
 
 ```rust
-enum ExecutionState {
-    Idle,
-    PendingNew(u64), // 等待交易所确认
-    Working(u64),    // 挂单中 (OrderID)
-    PendingCancel(u64), // 等待撤单确认
-    Filled,
-    Rejected(RejectReason),
+#[derive(Debug, Clone, Copy)]
+enum ChildState {
+    PendingNew,
+    Working,
+    PendingCancel,
+    Done,
+    Rejected,
+    Unknown,
 }
 
-struct ExecutionAlgo {
-    target_qty: u32,
-    filled_qty: u32,
-    state: ExecutionState,
-}
-
-impl ExecutionAlgo {
-    fn on_tick(&mut self, ctx: &mut Context) {
-        match self.state {
-            ExecutionState::Idle => {
-                if self.filled_qty < self.target_qty {
-                    // 发出第一笔子订单
-                    let child_qty = self.calc_child_qty();
-                    let oid = ctx.send_order(child_qty);
-                    self.state = ExecutionState::PendingNew(oid);
-                }
-            }
-            ExecutionState::Working(oid) => {
-                // 检查是否需要改单 (Reprice)
-                if self.need_reprice(ctx) {
-                    ctx.cancel_replace(oid, self.new_price(ctx));
-                    self.state = ExecutionState::PendingCancel(oid); // 或 PendingReplace
-                }
-            }
-            // ... 处理其他状态
-            _ => {}
-        }
-    }
-    
-    fn on_order_ack(&mut self, oid: u64) {
-        if let ExecutionState::PendingNew(pending_oid) = self.state {
-            if oid == pending_oid {
-                self.state = ExecutionState::Working(oid);
-            }
-        }
-    }
+struct ChildOrder {
+    client_id: u64,
+    original_qty: u64,
+    cum_filled_qty: u64,
+    leaves_qty: u64,
+    state: ChildState,
 }
 ```
 
-## 6. 执行优化技巧
+| 当前状态 + 事件 | 关键动作 |
+| --- | --- |
+| PendingNew + ACK | 进入 Working；持仓不变 |
+| PendingNew/Working + Fill | 幂等增加 cum fill，减少 leaves；更新持仓与风险 |
+| Working + send Cancel | 进入 PendingCancel；不释放 leaves |
+| PendingCancel + Partial Fill | 仍可成交，减少 leaves，通常继续等取消结果 |
+| PendingCancel + Cancel ACK | 释放权威确认的 leaves，进入 Done |
+| 任意非终态 + 连接断开且结果不明 | 进入 Unknown，保留最坏风险并查询/对账 |
 
-1.  **Cancel-Replace vs Modify**: 
-    *   某些交易所支持 `OrderModify` 请求，这通常比先 Cancel 后 New 更快，且可能保留部分队列优先权（如果只减少数量）。
-    *   如果只改价格，通常会失去队列位置。
-    
-2.  **批处理 (Batching)**:
-    *   如果你需要同时调整 10 个订单，尽量将它们打包在一个 TCP 包中发送（如果协议允许），或者使用 `io_uring` 批量提交系统调用。
+执行目标的 `filled_qty` 必须由子单 Fill 汇总，不能由 ACK 或本地发送数量更新。执行 ID 用于去重；重复回报不得重复增加目标完成量。
 
-3.  **预分配订单 ID**:
-    *   不要等交易所返回 OrderID。在本地生成唯一的 OrderID（ClientOrderID），以此作为索引。这样可以在收到 ACK 之前就开始处理后续逻辑。
+### 4.1 Reprice 不是一条无条件操作
+
+场所可能支持 Modify，也可能要求 Cancel/Replace。减量、增量和改价是否保留优先级各不相同。若先 Cancel 再 New：
+
+1. Cancel 确认前旧单仍可能成交；
+2. 过早发新单可能让新旧两单同时有效；
+3. 等确认再发会产生无报价窗口；
+4. 选择取决于风险预算、场所原子替换语义和业务目标。
+
+所以 `PendingCancel` 和 `PendingReplace` 不应随意混用。
+
+## 5. 批处理、限流与陈旧订单
+
+批处理可以摊薄系统调用或协议开销，但第一条消息要等待凑批，可能增加尾延迟。TCP 本身是字节流，应用不能仅凭“放入同一个包”获得原子语义；分帧、Nagle、场所协议和网关调度都要考虑。
+
+场所限流下，不应无限排队改撤单。更稳妥的办法包括：
+
+- 合并尚未发送的重复目标更新；
+- 给意图设置过期时间和行情版本；
+- 优先保留 Cancel/kill 能力；
+- 队列高水位时阻止新的非减险动作；
+- 对每次丢弃/合并保留原因指标。
+
+本地预分配 Client Order ID 有助于在 ACK 前关联请求、风险和日志，但该订单仍是 `PendingNew`，不能按 Working 处理。
+
+## 6. 执行质量怎样验证
+
+至少记录：决策时参考价和行情序号、订单到达/ACK/Fill 时间、每笔成交价量、费用、队列估计、未完成量和取消原因。评估时按产品与目标选择到达价、VWAP、完成率、market impact 等口径，并说明观察窗口。
+
+测试包括：
+
+- IOC 部分成交、FOK 不足量、Post-only 交叉时的场所语义；
+- Partial Fill 与 Cancel 竞态；
+- ACK/Fill 重复、乱序和断线重放；
+- 多子单成交量守恒，不超过目标和风险预占；
+- 限流、队列满和意图过期；
+- L2 队列估计上下界与真实 Fill 的回放校准。
+
+## 7. 面试追问与易错点
+
+**Post-only 是否保证 maker rebate？** 不保证。它约束到达时的流动性角色处理；订单可能被拒绝/取消，且费率资格、成交和场所规则另行决定。
+
+**Cancel 发出后能否发替代单？** 可以设计，但要承认旧单仍可能成交，并同时预占两者最坏风险；若预算不允许，就等权威 Cancel ACK 或使用场所原子替换语义。
+
+**L3 是否给精确成交概率？** 不给。它提供更细的公开队列事件，仍有隐藏量、延迟、特殊优先和未来订单流不确定性。
+
+易错点包括：IOC/FOK 混淆、把本地 send 当 ACK、把 ACK 当 Fill、撤单即释放风险、默认 Modify 保序、宣称子单能同时到达、只看返佣而忽略逆向选择，以及把执行模型输出包装成收益保证。
+
+---
+
+上一章：[信号生成](signals.md)

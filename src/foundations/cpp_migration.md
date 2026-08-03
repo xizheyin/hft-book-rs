@@ -4,10 +4,10 @@
 
 ## 1. 迁移策略：绞杀植物模式 (Strangler Fig Pattern)
 
-不要试图一次性重写整个交易系统（Big Bang Rewrite）。这在工程上几乎注定失败。
+一次性重写整个交易系统（Big Bang Rewrite）会同时放大语义差异、验证范围和回滚风险。除非系统很小且已有完整的可重复验收环境，更稳妥的起点通常是可独立替换、可影子运行的边界。
 
 **推荐路线**：
-1.  **外围组件**: 从非关键路径开始，如风控网关 (Risk Gateway)、行情解析 (Market Data Decoder)、日志系统。
+1.  **可隔离组件**: 优先选择有清晰输入输出、可回放且能快速回滚的模块，例如日志、报表或旁路校验；行情解析等数据面组件只有在具备完整回放与影子验证时才适合作为早期目标。
 2.  **核心库**: 将通用的算法（如期权定价、无锁队列）提取为 Rust 库，供 C++ 调用。
 3.  **核心逻辑**: 最后替换策略执行引擎 (Strategy Engine)。
 
@@ -20,7 +20,9 @@
 *   **机制**: 使用 `build.rs` + `cc` crate 编译 C++ 代码并静态链接。
 *   **优势**: 享受 Cargo 的依赖管理和测试工具。
 
-```rust
+下面是多文件构建脚本，需要 `cxx-build` 构建依赖和对应的 C++ 源码/头文件；mdBook 的单文件测试无法构造这套工程，因此不执行该片段。
+
+```rust,ignore
 // build.rs
 fn main() {
     cxx_build::bridge("src/lib.rs")
@@ -50,22 +52,24 @@ add_executable(hft_system main.cpp)
 target_link_libraries(hft_system PUBLIC rust_lib)
 ```
 
-## 2. 交互工具选择：为什么 HFT 必须用 `cxx`？
+## 2. 交互工具选择：何时使用 `cxx`？
 
 | 工具 | 适用场景 | 优点 | 缺点 |
 | :--- | :--- | :--- | :--- |
-| **[bindgen](https://github.com/rust-lang/rust-bindgen)** | 调用纯 C 接口 / 简单的 C++ 类 | 自动生成，省事 | 生成的代码全是 `unsafe`；对复杂的 C++ 模板/继承支持有限。 |
-| **[cxx](https://github.com/dtolnay/cxx)** | **HFT 推荐**。双向调用 (Rust <-> C++) | **安全**！自动处理 `std::string` <-> `String`, `std::vector` <-> `Vec` 转换；生成的接口是 safe 的。 | 需要手写 schema 定义；不支持所有 C++ 特性（如复杂的模板元编程）。 |
-| **[autocxx](https://github.com/google/autocxx)** | 高度自动化的 `cxx` | 尝试自动生成 `cxx` 绑定 | 还在实验阶段，不如 `cxx` 稳定。 |
+| **[bindgen](https://github.com/rust-lang/rust-bindgen)** | 调用 C 接口或可由 Clang 解析的部分 C++ 头文件 | 自动生成底层声明，减少手抄 ABI | 主要提供低层 FFI，仍需自行封装和审计 unsafe 边界；复杂模板/继承难以直接形成自然 Rust API。 |
+| **[cxx](https://github.com/dtolnay/cxx)** | 受支持类型范围内的双向 Rust/C++ 调用 | 用 bridge schema 显式描述边界，并为受支持签名生成较安全的封装 | 需要手写 schema；不能直接表达任意 C++ API，边界外的 C++ 安全性仍需调用者保证。 |
+| **[autocxx](https://github.com/google/autocxx)** | 希望从 C++ 头文件生成较高层绑定 | 在 `cxx` 等组件之上减少部分手工桥接 | 支持范围与生成结果随版本变化，采用前应针对真实头文件做原型验证。 |
 
-**HFT 场景强烈推荐使用 `cxx`**。它不仅仅是一个 FFI 库，更是一个**边界安全检查器**。它在编译期就能捕获大部分所有权混淆问题。
+`cxx` 常适合希望显式收窄接口、且类型落在其支持范围内的项目；已有稳定 C ABI 时，手写 C façade + `bindgen` 可能更简单。选择标准应是：能否表达现有 API、生成代码能否审计、所有权是否清晰、构建链是否可复现，而不是工具名称本身。
 
 ## 3. 实战：数据类型映射与传递
 
 ### 3.1 字符串与向量 (Strings & Vectors)
-`cxx` 会自动处理内存布局转换。
+`cxx` 会为受支持的桥接类型生成两侧胶水代码。某个参数是借用、移动还是发生转换，应以该签名和生成代码为准，不能笼统假设“全部零拷贝”。
 
-```rust
+下面代码依赖 `cxx` 宏、`anyhow` 和生成的跨语言胶水，只有放进完整 Cargo/C++ 工程才有意义，因此 mdBook 不执行它。
+
+```rust,ignore
 // src/lib.rs
 #[cxx::bridge]
 mod ffi {
@@ -76,7 +80,7 @@ mod ffi {
 
 fn process_market_data(symbols: &Vec<String>, prices: &Vec<f64>) -> Result<(), anyhow::Error> {
     for (sym, price) in symbols.iter().zip(prices) {
-        // Rust String 自动转为 C++ string view (zero-copy)
+        // 这里只在 Rust 侧按引用读取；跨边界的具体表示由 bridge 签名决定。
         println!("Symbol: {}, Price: {}", sym, price);
     }
     Ok(())
@@ -86,7 +90,9 @@ fn process_market_data(symbols: &Vec<String>, prices: &Vec<f64>) -> Result<(), a
 ### 3.2 复杂结构体 (Structs)
 在 FFI 边界定义共享结构体。
 
-```rust
+该 bridge 还依赖 `cxx`、C++ 头文件和其中定义的 `OrderManager`；这是多文件 FFI 接口定义，不是标准库独立示例，mdBook 不执行它。
+
+```rust,ignore
 #[cxx::bridge]
 mod ffi {
     struct Order {
@@ -112,7 +118,7 @@ mod ffi {
 *   `SharedPtr<T>` -> `std::shared_ptr<T>`: 共享所有权。
 *   `Box<T>` -> Rust 堆对象传给 C++ 管理。
 
-**规则**: 谁创建，谁负责。尽量不要在 C++ 中 `delete` Rust 创建的对象，反之亦然。使用智能指针自动管理生命周期。
+**规则**: 为每种对象明确唯一的销毁 API 与分配器边界。不要在 C++ 中直接 `delete` Rust 分配的对象，反之亦然；即使使用智能指针，也要确认最终析构发生在哪一侧、哪个线程，以及所用运行库是否匹配。
 
 ## 4. 技术挑战与“深水区” (The Deep Water)
 
@@ -120,7 +126,7 @@ mod ffi {
 
 ### 4.1 模板元编程 (Template Metaprogramming)
 HFT 的 C++ 代码通常大量使用模板来实现编译期多态（CRTP, SFINAE, Concepts），以消除虚函数开销。
-*   **挑战**: `bindgen` 和 `cxx` **完全不支持** C++ 模板。你无法直接调用 `OrderBook<NYSE>`。
+*   **挑战**: 绑定工具通常不能把任意模板定义原样暴露为 Rust 泛型。像 `OrderBook<NYSE>` 这样的具体实例，通常需要在 C++ 侧先实例化并包装成普通函数或不透明类型。
 *   **解决**:
     *   **手动特化 (Manual Monomorphization)**: 在 C++ 侧写辅助函数，实例化特定类型的模板，导出为普通函数。
         ```cpp
@@ -128,7 +134,7 @@ HFT 的 C++ 代码通常大量使用模板来实现编译期多态（CRTP, SFINA
         using NYSEBook = OrderBook<NYSE>;
         void process_nyse(NYSEBook& book, const Order& o) { book.add(o); }
         ```
-    *   **Rust 泛型重写**: 如果逻辑不复杂，直接用 Rust 的 Generic + Trait 重写。Rust 的 Trait 系统比 C++ 模板更结构化，但表达能力略有不同（例如没有非类型模板参数的偏特化，直到 const generics 稳定）。
+    *   **Rust 泛型重写**: 如果逻辑不复杂，可用 Rust 泛型 + Trait 重写。Rust 与 C++ 模板的特化规则和可表达模式不同，应按实际实例集合验证，而不是逐语法翻译。
 
 ### 4.2 继承与虚函数 (Inheritance & Virtual Functions)
 *   **挑战**: Rust 没有继承。如果 C++ 代码严重依赖类层次结构（如 `BaseStrategy -> MomentumStrategy`），很难直接映射。
@@ -137,11 +143,13 @@ HFT 的 C++ 代码通常大量使用模板来实现编译期多态（CRTP, SFINA
     *   **Trait Object**: 将 C++ 的虚基类映射为 Rust 的 `dyn Trait`。`cxx` 支持调用 C++ 的虚函数，但需要小心生命周期。
 
 ### 4.3 异常安全 (Exception Safety)
-这是最容易导致 **Undefined Behavior (UB)** 的地方。
-*   **问题**: C++ 抛出异常跨越 FFI 边界进入 Rust，或者 Rust panic 跨越边界进入 C++，都会导致程序立即崩溃（abort）或堆栈损坏。
+这是最需要显式约定的边界之一。
+*   **问题**: 不要让 C++ 异常或 Rust panic 穿过一个不允许 unwind 的 ABI 边界；具体结果取决于 ABI、编译选项与桥接工具，可能终止进程或触发未定义行为，不能依赖“另一侧会自动接住”。
 *   **解决**:
-    *   **C++ -> Rust**: `cxx` 会自动捕获 C++ 异常并转换为 Rust `Result`。**不要**在 `extern "C"` 中直接抛出异常。
-    *   **Rust -> C++**: 在 `Cargo.toml` 中设置 `panic = "abort"`。这是 HFT 的标准做法。在低延迟系统中，Panic 意味着不可恢复的错误，直接 crash 比数据损坏更安全。
+    *   **C++ -> Rust**: 使用 `cxx` 时，把可能抛出的函数在 bridge 中声明为 `Result<T>`，CXX 才会捕获并转成 `Err`；未声明 `Result` 却抛出会走 `std::terminate`。原始 `extern "C"` 接口则应在 C++ wrapper 内捕获并转换成错误码。
+    *   **Rust -> C++**: CXX 的 `extern "Rust"` 函数发生 panic 会 abort。一般 FFI 若需要把 panic 转成错误，应在导出边界内部处理 `catch_unwind`（只捕获 unwind panic），不要让它穿越不匹配 ABI；全局 `panic = "abort"` 会影响整个进程的恢复方式，必须与监督进程和风控策略一起设计。
+
+如果系统明确选择全局 fail-stop，可以这样配置；这不是所有迁移项目的默认答案：
 
 ```toml
 [profile.release]
@@ -150,28 +158,33 @@ panic = "abort"
 
 ### 4.4 编译与链接复杂性
 *   **挑战**: 两个编译器（rustc, clang++）、两个构建系统（Cargo, CMake）、两个标准库（libc++, libstd）。符号冲突、ABI 不兼容、链接顺序错误是家常便饭。
-*   **解决**: 统一工具链。强制要求 C++ 项目使用 `clang` 编译，并确保其版本与 Rust 使用的 LLVM 版本一致。使用 `cxx` 提供的 `build.rs` 辅助脚本来自动处理链接参数。
+*   **解决**: 固定并记录 Rust toolchain、C++ 编译器、目标 triple、C++ 标准库、链接器和编译 flags，在 CI 中构建最小跨语言 smoke test。普通 C ABI/静态库互调并不要求 C++ 编译器与 rustc 使用相同 LLVM；只有共享 LLVM bitcode 的跨语言 LTO 才会引入更严格的插件/bitcode 兼容要求。
 
 ### 4.5 性能陷阱：跨语言内联 (Cross-Language LTO)
-默认情况下，C++ 编译器看不到 Rust 的函数体，Rust 也看不到 C++ 的。这意味着像 `get_price()` 这种极小的函数无法被内联，每次调用都有函数调用开销（约 2-5ns）。
+默认情况下，语言边界通常会阻止跨边界内联，但实际成本取决于 ABI、参数传递、所有权转换、缓存行为和调用频率，没有可信的固定纳秒数。
 
-**解决方案**: 开启 LTO。
-1.  **版本匹配 (Version Matching)**: 这是一个大坑。Rustc 确实绑定了一个特定版本的 LLVM。你必须找出你当前 Rustc 使用的 LLVM 版本，然后强制 C++ 使用**完全相同主版本**的 `clang`。
-    *   查看 Rust LLVM 版本: `rustc --version --verbose` (例如 `LLVM 16.0.4`)。
-    *   那么你编译 C++ 必须用 `clang-16`。如果用 `clang-14` 或 `clang-17`，LTO 链接时会直接报错或产生错误的机器码。
-2.  **Rust 端**: `lto = true`, `linker_plugin_lto = true`.
-3.  **C++ 端**: 使用 `clang++` 并开启 `-flto`.
+建议按以下顺序优化：
 
-### 4.3 内存对齐 (Alignment)
+1. **先做粗粒度接口**：把一批订单/行情一次交给另一侧处理，减少往返次数；
+2. **建立基准**：在目标硬件分别测空调用、代表性 payload 和端到端路径，并查看生成汇编/调用栈；
+3. **最后评估跨语言 LTO**：只有基准表明边界调用或无法内联确为瓶颈，才固定一套经过验证的 Clang/rustc/linker 组合尝试 `linker-plugin-lto`/ThinLTO；
+4. **CI 验证兼容性**：执行全量链接、行为测试、sanitizer 与性能回归。工具链不兼容通常应在构建期失败，不能依赖“版本号看起来接近”来证明产物正确。
+
+### 4.6 内存对齐 (Alignment)
 Rust 的 `#[repr(Rust)]` 内存布局是不确定的。
-**必须**使用 `#[repr(C)]` 标记所有跨语言共享的结构体，并确保双方对齐一致。
+按值或按字段共享布局的类型应使用双方约定的 ABI 表示（Rust 侧通常是 `#[repr(C)]`），并用两侧 `sizeof`、`alignof` 与字段 offset 的静态断言验证。若类型只通过不透明指针/句柄传递，则不需要向另一侧暴露内部布局。
 
 ```rust
-#[repr(C, align(64))] // 强制 Cache Line 对齐
-pub struct AtomicCounter {
-    pub value: std::sync::atomic::AtomicU64,
+#[repr(C)]
+pub struct OrderWire {
+    pub price_ticks: u64,
+    pub quantity: u32,
+    pub side: u8,
+    pub reserved: [u8; 3],
 }
 ```
+
+不要默认 Rust `AtomicU64` 与 C++ `std::atomic<uint64_t>` 具有相同布局或 ABI；若要共享原子内存，需要单独定义并验证双方共同遵守的表示、对齐和内存模型协议。
 
 ## 5. 进阶技巧与最佳实践 (Advanced Techniques)
 
@@ -196,7 +209,10 @@ void use_context(const ContextHandle& handle);
 ```
 
 **Rust 侧 (`lib.rs`)**:
-```rust
+
+下面的 Rust 声明必须与前一段 C++ 头文件共同构建，并依赖 `cxx` 生成代码；mdBook 因而不执行该多文件示例。
+
+```rust,ignore
 #[cxx::bridge]
 mod ffi {
     unsafe extern "C++" {
@@ -215,14 +231,14 @@ pub struct RustContext {
 }
 ```
 
-### 5.2 跨语言 LTO 配置详解
-为了消除 FFI 开销，必须让 Linker 能“看穿”边界。
+### 5.2 跨语言 LTO 的验证性配置
+跨语言 LTO 是可选的后期优化，不是 FFI 正确性或低延迟的前提。下面只展示一种可能的配置方向，不能直接复制到所有工具链。
 
-1.  **编译器版本一致**: 确保 `clang++` 和 `rustc` 使用相同的 LLVM 后端版本 (如 LLVM 16)。
+1.  **锁定已验证工具链**: 记录 `clang++`、`rustc -vV`、linker 与目标 triple；通过最小 bitcode 链接测试确认实际兼容性。
 2.  **Rust 配置 (`Cargo.toml`)**:
     ```toml
     [profile.release]
-    lto = true # 或 "thin"
+    lto = "thin"
     codegen-units = 1
     ```
 3.  **C++ 配置 (`CMakeLists.txt`)**:
@@ -233,11 +249,13 @@ pub struct RustContext {
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld -Wl,--plugin-opt=O3")
     ```
 
+Rust 与 C++ 的跨语言 bitcode 链接还可能需要额外的 `-Clinker-plugin-lto`、crate 类型和 linker 配置；应以当前 rustc/LLVM 文档及可复现的 CI 原型为准。若收益不稳定，保留粗粒度 FFI 往往更易维护。
+
 ### 5.3 调试混合栈 (Debugging Mixed Stacks)
 当程序崩溃时，你需要能看到跨语言的调用栈。
 *   **工具**: 使用 `lldb` (macOS) 或 `gdb` (Linux)。Rust 自带的 `rust-lldb` / `rust-gdb` 包装器对 Rust 符号支持更好。
 *   **技巧**: 编译时保留符号表。
-    *   Rust: `[profile.release] debug = true` (这不会影响运行时性能，只会增大二进制体积)。
+    *   Rust: `[profile.release] debug = true`（保留优化同时生成调试信息；仍需验证最终产物大小、符号拆分与部署方式）。
     *   C++: `-g` (Release with Debug Info).
 *   **ASan 集成**:
     在 Rust 中启用 ASan 需要 nightly toolchain：
@@ -272,9 +290,11 @@ class Momentum : public Strategy {
 
 **Rust 重构方案**:
 
+以下四段代码共同组成一个 **迁移结构骨架**。为突出“组合 + Trait + 静态分发”的关系，示例有意省略 `Order`、`Tick`、行情来源和策略计算等业务实现；这些片段不是四个互相独立的程序，因此 mdBook 不执行它们。
+
 1.  **提取公共状态 (Composition)**:
-    不要继承 `Context`，而是包含它。
-    ```rust
+    不要继承 `Context`，而是包含它。该片段依赖本节共同的业务类型骨架，不单独测试。
+    ```rust,ignore
     struct StrategyContext {
         // ... socket, logs, etc
     }
@@ -285,14 +305,16 @@ class Momentum : public Strategy {
     ```
 
 2.  **定义行为接口 (Trait)**:
-    ```rust
+    `Tick` 和 `StrategyContext` 来自共同骨架，该接口片段不单独测试。
+    ```rust,ignore
     trait Strategy {
         fn on_tick(&mut self, tick: &Tick, ctx: &mut StrategyContext);
     }
     ```
 
 3.  **具体实现 (Implementation)**:
-    ```rust
+    这里有意省略信号算法和订单构造细节，必须与共同骨架合并后才能编译。
+    ```rust,ignore
     struct MomentumStrategy {
         // 自己的状态
         window: Vec<f64>,
@@ -309,8 +331,8 @@ class Momentum : public Strategy {
     ```
 
 4.  **静态分发 (Static Dispatch)**:
-    在 HFT 中，我们极力避免 `Box<dyn Strategy>` (虚表调用)。我们使用泛型 `T: Strategy`。
-    ```rust
+    在 HFT 中，我们极力避免 `Box<dyn Strategy>` (虚表调用)。我们使用泛型 `T: Strategy`。该引擎片段还依赖共同骨架中的行情来源，不单独测试。
+    ```rust,ignore
     struct Engine<S: Strategy> {
         context: StrategyContext,
         strategy: S, // 编译期确定的具体类型，无虚函数开销
@@ -319,45 +341,45 @@ class Momentum : public Strategy {
     impl<S: Strategy> Engine<S> {
         fn run(&mut self) {
             while let Some(tick) = self.context.next_tick() {
-                // 这一行会被内联优化，完全没有函数调用开销
+                // 静态分发让优化器有机会内联；是否真的内联要检查产物。
                 self.strategy.on_tick(&tick, &mut self.context);
             }
         }
     }
     ```
 
-这种 **Trait + Generic** 的模式（即 Static Dispatch）是 Rust 性能超越 C++ 虚函数的关键。C++ 需要用 CRTP (Curiously Recurring Template Pattern) 这种极其晦涩的技巧才能达到的效果，在 Rust 里就是默认写法。
+这种 **Trait + Generic** 模式使用静态分发，能让优化器看见具体类型；它与 C++ 模板/CRTP 的目标相似。最终是否内联、代码体积是否膨胀，仍应通过产物和基准验证。
 
 ## 6. 常见面试题 (Q&A)
 
 ### Q1: 你们如何保证重构后的正确性？(Shadow Mode)
-**问题背景**: HFT 系统容错率为零。你不能简单地上线一个新模块，然后祈祷它不出错。
+**问题背景**: 交易系统不能靠一次上线后的观察来证明迁移正确，需要可重复比较和可回滚切换。
 **回答**:
-"我们绝对不会直接替换。我们采用**影子模式 (Shadow Mode)** 策略：
+"我们采用**影子模式 (Shadow Mode)** 并保留旧路径：
 1.  **并行运行**: 在生产环境中，C++ 旧模块和 Rust 新模块同时接收市场数据。
 2.  **只读不写**: Rust 模块执行所有计算逻辑，但**禁止发单**。它的输出（如定价、信号）被写入专门的日志或 RingBuffer。
 3.  **实时比对**: 有一个旁路脚本（或专门的 Verify 线程）实时消费 C++ 和 Rust 的输出。
-    *   **一致性**: 检查价格、数量是否完全一致（Bit-wise identical）。
-    *   **延迟**: 检查 Rust 的时间戳是否优于 C++。
-4.  **灰度切换**: 只有当连续运行一周且 99.9999% 的结果一致时，我们才会通过配置开关，将发单权限切换给 Rust。"
+    *   **一致性**: 离散字段可逐位比较；浮点或时序相关结果先定义业务容差与不变量，避免把非确定差异误判为错误。
+    *   **延迟**: 在同一输入、核绑定和时间戳口径下比较完整分位分布，而不是只看单次更快。
+4.  **验收与灰度**: 覆盖历史回放、故障注入、极端行情和恢复流程；一致性阈值、观察窗口与回滚条件由业务风险预先定义，不套用固定天数或百分比。"
 
 ### Q2: 跨语言调用的开销有多大？如何优化？
 **问题背景**: 很多人认为 FFI 很慢，不适合高频。
 **回答**:
-"如果不开启 LTO，每次 FFI 调用大约有 **3-5ns** 的开销（主要是寄存器保存、栈调整、无法内联）。这在每秒千万级调用下是可观的。
-我们有三个优化层次：
-1.  **Chunky Interface (粗粒度接口)**: 不要让 C++ 循环调 Rust。比如不要 `for i in 0..100 { rust_process(i) }`，而是传一个 `Vec` 给 Rust，让 Rust 内部循环 `rust_process_batch(vec)`。这能分摊 FFI 开销。
-2.  **Cross-Language LTO**: 我们确保 Rust 和 C++ 使用相同版本的 LLVM（如 LLVM 16），并开启 `linker_plugin_lto`。这允许编译器看穿 FFI 边界，实现跨语言内联，将开销降为 **0ns**。
-3.  **Shared Memory**: 对于极度敏感的数据，我们直接在 C++ 分配一块内存（如 `std::vector`），通过指针传给 Rust。双方直接读写这块内存，完全绕过函数调用。"
+"FFI 没有统一的纳秒答案。先分别测空边界、真实参数和端到端请求，并确认是否发生字符串转换、分配或引用计数。优化顺序通常是：
+1.  **Chunky Interface (粗粒度接口)**: 不要逐元素跨边界往返，而是借用 slice/批量结构，让另一侧内部循环；
+2.  **稳定表示与所有权**: 使用固定宽度字段，明确谁分配、谁销毁，避免热路径隐式转换；
+3.  **可选 LTO**: 只有 profile 表明调用边界确是瓶颈，才在锁定工具链后试验跨语言 LTO，并以汇编和回归基准确认收益；
+4.  **共享内存**: 适合进程或组件传递大块数据，但需要单独证明生命周期、同步、对齐和崩溃恢复，绝不是‘绕过函数调用就自动安全’。"
 
 ### Q3: 如果 C++ 端发生了 Segfault，Rust 能救吗？
 **问题背景**: Rust 标榜内存安全，但和 unsafe 的 C++ 混编时，这种保证还存在吗？
 **回答**:
-"**救不了**。Rust 的安全保证止步于 FFI 边界。如果 C++ 破坏了堆内存（Heap Corruption）或者访问了野指针，整个进程（包括 Rust 部分）都会崩溃。
+"**救不了**。Rust 的安全保证不能约束外部 C++ 实现。如果 C++ 破坏堆内存或访问野指针，可能立即触发进程级崩溃，也可能先静默破坏 Rust 依赖的内存不变量。
 为了缓解这个问题，我们采取防御性编程：
-1.  **Sanitizers**: 在开发和 CI 阶段，必须开启 `AddressSanitizer (ASan)` 运行混合代码。这能捕获 90% 的内存越界。
+1.  **Sanitizers**: 在兼容的测试构建中运行 ASan/UBSan 等工具，覆盖它们擅长检测的越界、释放后使用等错误；它们不能证明没有内存错误。
 2.  **隔离 (Isolation)**: 如果某个遗留 C++ 模块非常不稳定，我们会把它拆分成独立的进程，通过共享内存（SHM）或 IPC 通信。这样它崩了只会重启它自己，不会拖垮主策略进程。
-3.  **Crash 优于 Corruption**: 我们配置 Rust `panic = 'abort'`。在 HFT 中，带着错误的数据继续运行比直接死掉更可怕（可能导致巨额亏损）。所以一旦检测到异常，立即自杀是最佳策略。"
+3.  **定义失败策略**: 根据订单状态与高可用架构选择 fail-stop、撤单/熔断和进程拉起策略。`panic = 'abort'` 是一种部署选择，不替代外部风控与恢复设计。"
 
 ### Q4: 怎么处理 C++ 的 `std::shared_ptr` 和 Rust 的 `Arc`？
 **问题背景**: 两种语言都有引用计数，怎么互通？
@@ -367,3 +389,9 @@ class Momentum : public Strategy {
 *   **Rust 持有 C++**: Rust struct 中存放一个 `cxx::SharedPtr<CppClass>`。Rust 克隆时，调用 C++ 的拷贝构造函数增加引用计数。
 *   **C++ 持有 Rust**: C++ 存放一个 `Box<Arc<RustStruct>>` 的裸指针。这需要手动管理引用计数（调用 Rust 导出的 `clone` 和 `drop` 函数），非常容易出错。
 **最佳实践**: 尽量避免跨语言共享所有权。明确**单一所有权 (Single Ownership)**：要么是 C++ 拥有并在用完后通知 Rust，要么是 Rust 拥有并借用给 C++。如果必须共享，优先考虑使用对象池 (Object Pool) + ID 索引的方式，而不是传递指针。"
+
+### Q5: 面试追问——如何证明迁移没有偷偷增加拷贝？
+
+不要只回答“用了引用所以零拷贝”。应检查 bridge 生成代码与函数签名，分别记录分配次数、复制字节数和代表性 payload 的分位延迟；再用地址/生命周期测试确认借用没有被转换成临时 owned 对象。只有这些证据同时成立，才能把该条路径称为零拷贝。
+
+权威参考：[rustc linker-plugin LTO](https://doc.rust-lang.org/stable/rustc/linker-plugin-lto.html)、[CXX `Result<T>` 与异常语义](https://cxx.rs/binding/result.html) 和 [Rustonomicon: FFI 与 unwinding](https://doc.rust-lang.org/nomicon/ffi.html#ffi-and-unwinding)。

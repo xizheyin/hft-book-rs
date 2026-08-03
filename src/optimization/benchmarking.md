@@ -1,53 +1,59 @@
-# 基准测试 (Micro-benchmarking)
+# 基准测试 (Benchmarking)
 
-在 HFT 开发中，“直觉”往往是错误的。你认为更快的代码，在 CPU 分支预测失败或缓存未命中面前可能慢得离谱。因此，**一切优化必须以基准测试为依据**。
+基准测试不是为了得到一个好看的“每次 X ns”，而是验证：在明确输入、状态和硬件下，某项改动是否改善了目标指标，又有没有伤害尾延迟、吞吐或正确性。
 
-然而，编写正确的基准测试非常困难。编译器会优化掉“无用”的代码，操作系统会引入噪音，CPU 的动态频率调节也会干扰结果。
+## 1. 先选择测试层级
 
-## 理论背景：为何基准测试很难？
+| 层级 | 回答的问题 | 看不到什么 |
+| --- | --- | --- |
+| 微基准 | 一个函数/数据结构的局部成本 | 排队、网络、线程与恢复路径 |
+| 组件回放 | 解码→订单簿等一段流水线 | 完整场所网络与跨组件背压 |
+| 端到端压测 | 指定负载下的吞吐和延迟分布 | 难以单独归因某条指令 |
+| 生产影子/观测 | 真实消息组合和机器噪声 | 可控性较弱，不能随意制造故障 |
 
-1.  **编译器优化**：Rust (LLVM) 非常聪明。如果你计算了一个值但从未使用，它会直接删除这部分计算代码。
-2.  **冷启动 vs 热运行**：代码首次运行需要加载指令缓存 (i-cache) 和数据缓存 (d-cache)，并且分支预测器 (Branch Predictor) 尚未训练。
-3.  **环境噪音**：OS 中断、其他进程、电源管理 (Turbo Boost) 都会导致测量抖动。
+优化应从业务 SLO 出发，再用更小测试定位，而不是拿微基准替代 tick-to-trade。
 
-## Criterion.rs：标准的 Rust 基准测试库
+## 2. 写一份测试契约
 
-`criterion` 是 Rust 生态中最流行的统计驱动基准测试库。它能自动处理预热 (Warm-up)，并多次运行以消除噪音。
+运行前记录：
 
-### 依赖配置
+- 被测边界与结果是否包含 setup/cleanup；
+- 初始订单簿大小、消息类型、命中/未命中比例；
+- 平均、峰值、突发形态和是否开放环；
+- 编译器、features、链接方式与 release profile；
+- CPU 型号、拓扑、频率策略、内存、NUMA、内核；
+- 绑核/IRQ/后台负载；
+- 样本数、预热、统计方法和通过门槛。
 
-```toml
-[dev-dependencies]
-criterion = "0.5"
+缺少这些信息，两个“同名基准”可能测的是完全不同的问题。
 
-[[bench]]
-name = "order_book_bench"
-harness = false
-```
+## 3. Criterion 示例：不要让状态无限增长
 
-### 编写基准测试
+下面用项目锁定的 Criterion 版本。关键是用 `iter_batched` 把 setup 与被测操作分开，并让每次插入从相同规模开始。
 
-假设我们要测试一个订单簿的插入性能。
+这是一个放在 `benches/order_book.rs` 中的**工程骨架**：它依赖外部 `criterion` crate，以及项目自己的 `seeded_book`、`next_order_not_in_book` 和 `Book::add_order`，因此不作为单文件 doctest 编译。把 `criterion` 加入 `[dev-dependencies]` 并补上这些项目类型后，使用 `cargo bench --bench order_book` 单独验证。
 
-```rust
-// benches/order_book_bench.rs
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use hft_engine::order_book::OrderBook;
-use hft_engine::types::{Order, Side};
+```rust,ignore
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use std::hint::black_box;
 
 fn bench_order_insert(c: &mut Criterion) {
-    c.bench_function("order_book_insert", |b| {
-        // Setup: 创建 OrderBook
-        let mut book = OrderBook::new();
-        let mut id = 0;
-        
-        b.iter(|| {
-            id += 1;
-            // 使用 black_box 防止编译器优化掉整个循环
-            // 如果 OrderBook::add_order 返回值被忽略且无副作用，可能会被优化
-            let order = Order::new(id, Side::Buy, 100.0, 10);
-            black_box(book.add_order(black_box(order)));
-        })
+    c.bench_function("order_book_insert_at_10k", |b| {
+        b.iter_batched(
+            || {
+                let book = seeded_book(10_000);
+                let order = next_order_not_in_book();
+                (book, order)
+            },
+            |(mut book, order)| {
+                let result = book.add_order(black_box(order));
+                let _ = black_box(result);
+                // 把 book 作为 routine 输出交回 Criterion，避免在计时闭包内
+                // 析构整个 10k 订单簿。
+                book
+            },
+            BatchSize::LargeInput,
+        )
     });
 }
 
@@ -55,120 +61,135 @@ criterion_group!(benches, bench_order_insert);
 criterion_main!(benches);
 ```
 
-### 运行测试
+若在同一个 `Book` 上不停新增，测试会把“第 1 次插入”和“第 1,000,000 次插入”混在一起，还会测到扩容和不同工作集。它也可以是有效的增长测试，但名称和结果必须如此说明。
 
-```bash
-cargo bench
-```
+对对象池等系统，还应分别测试：
 
-Criterion 会生成详细的 HTML 报告（位于 `target/criterion/report/index.html`），展示平均耗时、离群值和分布图。
+- 容量内稳态；
+- 扩容（若允许）；
+- 满容量拒绝；
+- 删除/复用与 generation；
+- 不同缓存热度和键分布。
 
-## 避免编译器陷阱：`black_box`
+### 3.1 `black_box` 的边界
 
-`std::hint::black_box` 是基准测试中最重要的函数。它告诉编译器：“这个值被外部使用了，不要优化掉它”，或者“这个值的来源是不透明的，不要进行常量折叠”。
+`std::hint::black_box` 能抑制一些常量折叠和死代码消除，但它不是“保证执行精确机器指令”的屏障。仍要检查：
 
-**错误示例**：
-```rust
-b.iter(|| {
-    let x = 1 + 1; // 编译器会直接把这行替换为 let x = 2; 甚至直接删除
-})
-```
+- 输出是否真的被消费；
+- 编译器是否把循环外提或合并；
+- 测试是否主要在测计时器/black_box；
+- 汇编或硬件计数器是否符合预期。
 
-**正确示例**：
-```rust
-b.iter(|| {
-    // 强制执行加法
-    black_box(black_box(1) + black_box(1));
-})
-```
+## 4. Debug 结果有什么价值
 
-## 关注尾部延迟 (Tail Latency)
+Debug 构建与生产 release 的优化、溢出检查、内联和布局可能差异巨大，因此不能用 Debug 绝对耗时预测生产性能。
 
-在 HFT 中，平均延迟 (Mean) 毫无意义。如果你平均延迟 1µs，但每 100 笔交易有一笔延迟 1ms，你就会在最关键的市场波动时刻亏钱。
+但“Debug 结果完全无价值”也过于绝对。它可以帮助发现：
 
-我们需要关注 P99, P99.9, P99.99 延迟。
+- 测试本身卡死或数量级错误；
+- 某条路径意外执行百万次；
+- 不同算法在相同 Debug 配置下的粗略行为；
+- Debug 专属的开发体验问题。
 
-### 使用 `hdrhistogram`
+正式性能结论必须来自与部署足够接近的 release 产物，并保留符号用于分析。
 
-`criterion` 默认提供统计数据，但在生产环境或自定义测试工具中，我们需要记录每一次操作的耗时并生成直方图。
+## 5. 分布、分位数与样本数
 
-```toml
-[dependencies]
-hdrhistogram = "7.5"
-```
+平均值会掩盖长尾，但分位数也不是脱离上下文的真相。报告至少包括：
 
-```rust
-use hdrhistogram::Histogram;
-use std::time::Instant;
+- p50、p90/p99、所需更高分位和 max；
+- 样本数、窗口和置信/波动信息；
+- 单位、计时器、测量边界；
+- 输入负载与消息类型；
+- 超出直方图范围的样本数。
 
-fn measure_latency() {
-    let mut hist = Histogram::<u64>::new_with_bounds(1, 1000_000, 3).unwrap();
-    
-    for _ in 0..1_000_000 {
-        let start = Instant::now();
-        
-        // 执行操作
-        do_work();
-        
-        let elapsed = start.elapsed().as_nanos() as u64;
-        hist.record(elapsed).unwrap();
-    }
-    
-    println!("P50:   {} ns", hist.value_at_quantile(0.50));
-    println!("P99:   {} ns", hist.value_at_quantile(0.99));
-    println!("P99.9: {} ns", hist.value_at_quantile(0.999));
-    println!("Max:   {} ns", hist.max());
-}
-```
+不要把多个进程/线程的 p99 求平均；应合并原始样本或兼容 histogram buckets 后重算。极端分位需要足够多样本，且 max 会随观察时间变长而上升。
 
-## 基于指令计数的测试 (Instruction Counting)
+### 5.1 逐次 `Instant::now()` 可能测到计时器
 
-时间测量总是受 CPU 频率影响。`iai` (或更新的 `iai-callgrind`) 使用 Valgrind/Cachegrind 来模拟 CPU 执行，统计指令数、内存访问数和缓存未命中数。
+当被测函数很短，开始/结束两次读钟、循环和记录直方图可能占主要成本。可选择：
 
-这种测试极其稳定，不受机器负载影响，非常适合在 CI (Continuous Integration) 中运行。
+- 批量执行多次再除以次数（只能看平均批成本）；
+- 用框架校准/统计微基准；
+- 用硬件时间戳测真实包边界；
+- 单独测空操作基线，但不要草率逐样本相减；
+- 用采样 profiler/硬件计数器辅助归因。
 
-```toml
-[dev-dependencies]
-iai = "0.1"
-```
+直方图范围和有效数字要按预期与故障尾部配置。`record().unwrap()` 可能在最慢样本超范围时让压测崩溃；生产工具应单独计数并保存极端样本。
 
-```rust
-// benches/my_benchmark.rs
-use iai::black_box;
+## 6. Coordinated Omission
 
-fn bench_parsing() {
-    let data = b"8=FIX.4.4\x019=100...";
-    my_parser::parse(black_box(data));
-}
+闭环压测“完成一个才发下一个”。系统变慢时，生成器也自动少发，漏掉本该排队的请求。开放环压测按计划到达时间发送，才能检验固定目标负载和突发：
 
-iai::main!(bench_parsing);
-```
-
-运行结果会显示：
 ```text
-bench_parsing
-  Instructions:  1502
-  L1 Accesses:    305
-  L2 Accesses:      2
-  RAM Accesses:     0
-  Estimated Cycles: 1800
+planned arrival ────────► completion   包含生成器/队列等待
+actual ingress  ────────► completion   只看进入系统后的延迟
 ```
-如果某次提交导致 Instructions 从 1502 变成了 2000，你就知道性能退化了，即使在负载很高的 CI 机器上也能发现。
 
-## 硬件计数器 (Hardware Counters)
+两种边界都可以有意义，但不能混淆。若用直方图库做 coordinated-omission correction，要写明预期间隔和修正假设。
 
-在 Linux 上，我们可以使用 `perf` 工具来深入分析。
+生成器本身也要容量充足；否则测到的是压测端过载。
+
+## 7. 环境噪声与生产真实性
+
+可控实验会固定 CPU、减少后台任务、记录频率与温度，使 A/B 更容易解释。但过度“真空化”也会隐藏生产中的 IRQ、日志、遥测和共享资源影响。
+
+建议两组结果：
+
+1. **受控基线**：用于代码改动回归；
+2. **生产近似**：包含真实线程、网络、日志和突发。
+
+预热与冷启动也要分开。预热结果适合稳态，不能代表发布后第一次消息或恢复后的缓存冷状态。
+
+## 8. 指令与硬件计数器
+
+Callgrind/iai 类工具适合在 CI 观察指令级变化，但模拟 cache 不是目标 CPU，也不等于墙上时间。`perf stat` 可观察 cycles、instructions、branch/cache misses 等：
 
 ```bash
-# 统计缓存未命中和分支预测错误
-perf stat -e cache-misses,branch-misses,instructions,cycles ./target/release/my_hft_app
+perf stat -r 10 -e cycles,instructions,branches,branch-misses,cache-misses \
+  ./target/release/your_benchmark
 ```
 
-或者在 Rust 代码中使用 `perfcnt` crate 来针对特定代码块进行测量。
+解释时注意：
 
-## 总结
+- 事件可能被 multiplex，需看缩放比例；
+- 不同 CPU 对事件定义和精度不同；
+- 原始 miss 数应结合指令/访问数归一化；
+- 采集工具本身有开销；
+- 指令变少不保证端到端延迟变小。
 
-1.  **Criterion** 用于本地开发，测量真实时间（Wall time）。
-2.  **Iai/Cachegrind** 用于 CI，测量指令数和缓存行为，确保无性能回归。
-3.  **HdrHistogram** 用于生产环境监控和全链路压测，关注 P99+ 尾部延迟。
-4.  永远不要相信 Debug 模式下的性能测试结果。
+## 9. 性能实验流程
+
+1. 固定正确性测试与可复现输入；
+2. 写明假设，例如“HashMap 冲突导致 p99”；
+3. 先采基线分布和硬件事件；
+4. 一次只改主要变量；
+5. 多轮交错运行 A/B，避免温度和时间顺序偏差；
+6. 同时检查吞吐、尾延迟、CPU、内存和错误数；
+7. 未达到门槛就回滚，不挑最好的一次报告；
+8. 保存原始结果、环境和 commit/config ID。
+
+统计显著不等于业务有意义；要提前定义最小值得关注的改善和允许的回归。
+
+## 10. 面试追问与验证清单
+
+**为什么原来的插入基准可能误导？** 如果共享同一本书不断插入，数据规模、容量和缓存状态一直变化，测不到固定 10k 工作集的一次插入。
+
+**Debug 基准能不能看？** 可用于开发诊断，不能外推 release 生产延迟；正式结论必须测部署近似产物。
+
+**怎样避免 coordinated omission？** 按计划速率开放环发送，记录计划到达至完成的延迟，并确保生成器自身不过载。
+
+验证清单：
+
+- [ ] Setup、被测操作和 cleanup 边界明确；
+- [ ] 输入规模、分布、命中率和突发可复现；
+- [ ] release 产物与部署 features 一致；
+- [ ] 样本数、分位数、max 和超范围数齐全；
+- [ ] 计时器成本与生成器容量已验证；
+- [ ] 受控基线和生产近似场景都运行；
+- [ ] 正确性、错误数和资源消耗没有回归；
+- [ ] 未达到预设门槛时有明确回滚结论。
+
+---
+
+下一章：[性能分析 (Profiling)](profiling.md)

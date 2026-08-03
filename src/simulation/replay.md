@@ -1,104 +1,127 @@
 # 历史数据回放 (Data Replay)
 
-对于 HFT 而言，历史数据（Historical Data）就是金矿。高质量的 Tick 级数据（甚至 PCAP 级数据）是策略研发的基础。
+历史数据是策略研究、解析器回归测试和故障复现的重要输入。数据是否有价值，取决于来源、时间戳、丢包情况、字段语义和清洗过程，而不只是文件有多大。
 
 本章将讨论如何高效地存储、读取和回放海量的市场数据。
 
 ## 1. 数据格式选择
 
-在存储数百 TB 的行情数据时，CSV 绝对不是一个好选择。我们需要更紧凑、解析更快的二进制格式。
+存储高频、长周期的海量行情时，CSV 通常不是容量与回放吞吐优先场景的默认选择；但它并非“绝对不能用”。CSV 很适合小型测试夹具、人工排错、跨语言交换和展示官方样例。生产系统可以同时保留适合机器回放的主格式，以及便于检查的 CSV 导出。
 
 ### 1.1 常见格式对比
 
 | 格式 | 优点 | 缺点 | 适用场景 |
 | :--- | :--- | :--- | :--- |
-| **CSV** | 人类可读，通用性强 | 体积大，解析慢，精度丢失 | 少量数据的快速验证 |
-| **HDF5** | 支持层级结构，压缩率高，Pandas 友好 | 并发写入支持差，Rust 生态一般 | 每日收盘后的数据归档 |
-| **Parquet** | 列式存储，压缩率极高，查询快 | 写入开销大，不适合流式追加 | 大规模离线分析 (Spark/Presto) |
-| **Raw Binary** | **读写最快**，体积最小 | 缺乏元数据，跨平台兼容性差 | **HFT 回测与实盘记录** |
+| **CSV** | 人类可读、工具广泛、易制作小样本 | 通常较大且解析成本较高；类型、单位和 schema 需另行约定 | 测试夹具、排错导出、跨系统交换 |
+| **HDF5** | 适合层级化数组数据，支持元数据与压缩 | 并发与跨语言行为要按具体库验证，Rust 工具链选择较少 | 科学计算式归档、研究数据集 |
+| **Parquet** | 列式、支持压缩和列裁剪，适合分析查询 | 按时间逐行完整回放未必占优；追加、排序与小文件需设计 | 大规模离线聚合、特征研究 |
+| **版本化二进制记录** | 可为顺序读取和固定 schema 定制 | 要自行维护版本、端序、校验与工具 | 高吞吐采集、确定性事件回放 |
+| **PCAP/PCAPng** | 保留抓包点看到的报文边界与抓包元数据 | 体积和解析层次较多，业务字段查询不方便 | 网络解析回归、线上报文复现 |
 
-对于 HFT 回测，我们通常选择 **Raw Binary**（直接将 Rust 结构体 `这种` 到磁盘）或 **PCAP**（原始网络包）。
+CSV 本身不会必然“丢失精度”：若序列化规则保留足够数字、读取器使用正确的十进制定点或整数类型，值可以精确往返。常见风险是缺少类型/单位 schema、把价格默认解析成浮点数，或导出工具擅自格式化时间戳。
+
+同样，定制二进制也不保证一定最小或最快。Parquet 的压缩后体积可能更小；顺序回放速度还取决于存储、压缩、解码、访问模式和缓存。格式选择应以具体任务的端到端测试为依据。
+
+对于低延迟回放，常见选择是版本化的自定义二进制记录或 PCAP/PCAPng。不要直接把 Rust 结构体的内存原样写盘：padding、字节序、编译器布局和版本升级都会让文件不可移植。
 
 ### 1.2 自定义二进制格式设计
 
-```rust
-#[repr(C, packed)]
-struct TickHeader {
-    magic: u32,      // 魔数，用于校验
-    version: u16,    // 版本号
-    symbol_id: u16,  // 标的 ID
-    timestamp: u64,  // 纳秒级时间戳
-}
+一个可演进格式至少需要区分“文件元数据”和“单条记录”：
 
-#[repr(C, packed)]
-struct TickData {
-    price: i64,      // 价格 (定点数)
-    qty: u32,        // 数量
-    flags: u8,       // 买卖方向等标志位
-}
+```text
+FileHeader
+┌────────┬─────────┬──────────┬────────────┐
+│ magic  │ version │ endian   │ schema_id  │
+└────────┴─────────┴──────────┴────────────┘
+
+Record
+┌────────┬──────┬──────────┬─────────┬────────────┐
+│ length │ type │ sequence │ time_ns │ payload... │
+└────────┴──────┴──────────┴─────────┴────────────┘
 ```
 
-使用 `#[repr(C, packed)]` 可以确保内存布局紧凑且与 C 语言兼容，允许我们直接通过 `mmap` 读取文件。
+- `length` 让读取器能跳过未知记录，并检查截断。
+- `version/schema_id` 支持协议升级。
+- 明确规定整数是 little-endian 还是 big-endian。
+- 时间字段说明来源：交易所时间、NIC 硬件时间还是应用处理时间。
+- 重要数据可按块加入 checksum，发现静默损坏。
+
+`#[repr(C, packed)]` 并不等于安全的磁盘格式。packed 字段可能未对齐，对它创建普通 Rust 引用可能触发未定义行为；C layout 也没有自动解决字节序与版本问题。优先从 `&[u8]` 显式读取字段。
 
 ## 2. 高性能数据读取：Memory Mapping (mmap)
 
-当数据文件达到几十 GB 时，普通的文件 I/O (`read`) 会产生大量的系统调用和内存拷贝。
+当数据文件很大时，可以比较大块缓冲 `read`、异步/直接 I/O 和 `mmap`。小块频繁 `read` 确实会增加系统调用与复制，但经过合理缓冲的大块顺序读取也可能非常高效，不能只按 API 名称判断快慢。
 
 `mmap` 允许我们将文件直接映射到进程的虚拟内存空间。操作系统会负责按需加载（Page Fault）和页面缓存（Page Cache）。
 
 ### 2.1 Rust 中使用 memmap2
 
 ```rust
-use memmap2::MmapOptions;
-use std::fs::File;
-use std::slice;
+use std::convert::TryInto;
 
-struct MmapReader {
-    mmap: memmap2::Mmap,
-    cursor: usize,
+#[derive(Debug, PartialEq, Eq)]
+struct Tick {
+    price_ticks: i64,
+    qty: u32,
+    flags: u8,
 }
 
-impl MmapReader {
-    fn new(path: &str) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        Ok(Self { mmap, cursor: 0 })
-    }
+fn read_tick(bytes: &[u8]) -> Option<(Tick, &[u8])> {
+    const LEN: usize = 8 + 4 + 1;
+    let record = bytes.get(..LEN)?;
+    let price_ticks = i64::from_le_bytes(record.get(..8)?.try_into().ok()?);
+    let qty = u32::from_le_bytes(record.get(8..12)?.try_into().ok()?);
+    let flags = *record.get(12)?;
+    Some((Tick { price_ticks, qty, flags }, &bytes[LEN..]))
+}
 
-    fn next_tick(&mut self) -> Option<&TickData> {
-        if self.cursor + std::mem::size_of::<TickData>() > self.mmap.len() {
-            return None;
-        }
+fn main() {
+    let mut bytes = [0_u8; 13];
+    bytes[..8].copy_from_slice(&12_345_i64.to_le_bytes());
+    bytes[8..12].copy_from_slice(&100_u32.to_le_bytes());
+    bytes[12] = 1;
 
-        let tick = unsafe {
-            let ptr = self.mmap.as_ptr().add(self.cursor) as *const TickData;
-            &*ptr
-        };
-        
-        self.cursor += std::mem::size_of::<TickData>();
-        Some(tick)
-    }
+    let (tick, remaining) = read_tick(&bytes).unwrap();
+    assert_eq!(tick.price_ticks, 12_345);
+    assert_eq!(remaining, &[]);
+    assert!(read_tick(&bytes[..12]).is_none());
 }
 ```
 
-**性能优势**:
-1.  **零拷贝**: 数据直接从磁盘缓存映射到用户空间，无需内核到用户的拷贝。
-2.  **减少系统调用**: 无需频繁调用 `read`。
-3.  **操作系统优化**: OS 会利用空闲内存自动预读（Read-ahead）。
+实际建立映射需要外部 `memmap2` 依赖；下面只展示资源与安全边界，因此标记为不参与独立 doctest。把项目锁定的 `memmap2` 版本加入依赖后，使用临时文件运行 `cargo test mmap_reader`，至少验证正常读取、空文件、截断文件，以及映射期间文件被修改/截断时项目选择的处理策略：
+
+```rust,ignore
+use memmap2::MmapOptions;
+use std::fs::File;
+use std::io;
+
+fn open_mmap(path: &str) -> io::Result<memmap2::Mmap> {
+    let file = File::open(path)?;
+    // SAFETY: 映射期间不能通过其他路径截断或并发修改该文件。
+    // 生产代码还应固定文件所有权和生命周期。
+    unsafe { MmapOptions::new().map(&file) }
+}
+```
+
+**可能的优势与代价**:
+1.  **避免显式 `read` 拷贝**：页面缓存直接映射进进程地址空间；磁盘到内存仍然发生 I/O，首次访问仍可能 page fault。
+2.  **减少显式读取调用**：遍历映射区时无需为每一块调用 `read`，但 page fault 仍会进入内核。
+3.  **利用页面缓存与预读**：操作系统可能识别顺序访问并预读；效果依内核和访问模式而定，也可用平台 API 提示访问模式。
+4.  **延迟不完全可控**：缺页、回收和文件被并发截断都可能带来风险。需要稳定尾延迟时，大块预读到自管 buffer 可能更容易控制。
 
 ## 3. PCAP 回放 (Packet Capture Replay)
 
-最硬核的回测方式是直接回放抓包文件（PCAP）。这能还原最真实的网络环境，包括 TCP 握手、丢包重传、多播乱序等。
+PCAP/PCAPng 回放适合验证从链路层或网络层开始的解析路径。它能保留**抓包点实际记录到的**握手、重传、报文顺序和时间戳；若抓包本身丢包、snaplen 截断、只捕获单向流量，缺失信息不会被回放工具自动补回。把包按时间重新发送也不等于完整重建真实交易所、交换机拥塞和内核 TCP 状态。
 
 ### 3.1 为什么需要 PCAP 回放？
 
 - **验证解析器**: 确保你的解析逻辑能处理所有边缘情况。
 - **还原微观结构**: 交易所的消息往往是打包发送的（一个 UDP 包包含多个 Update）。PCAP 能还原这种打包结构。
-- **时序精确**: PCAP 包含硬件打的时间戳（Hardware Timestamping），精度可达纳秒级。
+- **保留线上分包与时序**: PCAP/PCAPng 会保存抓取时看到的报文边界和时间戳，但时间戳是否来自 NIC 硬件、精度是微秒还是纳秒，取决于抓包格式、设备与配置，必须读取元数据确认。
 
 ### 3.2 Rust 实现
 
-我们可以使用 `pcap` crate，或者手写解析器（推荐，为了性能）。
+通常先使用经过验证的 PCAP 解析库，并用畸形或截断输入测试错误路径。只有剖析证明库层是瓶颈，而且团队能承担格式兼容与安全审计成本时，才考虑定制解析器；“手写”本身不保证更快或更正确。
 
 ```rust
 // PCAP Global Header (24 bytes)
@@ -121,31 +144,50 @@ struct PacketHeader {
 }
 ```
 
-## 4. 甚至... FPGA 硬件回放？
+这些结构只用于展示字段，不应直接覆盖到文件字节上。经典 PCAP 的 magic 还决定文件端序和时间戳精度，解析器必须先识别 magic，再逐字段检查长度并转换；PCAPng 则是另一套分块格式。
 
-顶级 HFT 团队会使用 FPGA 卡（如 Solarflare 或 ExaNIC）进行硬件级回放。
-将 PCAP 文件加载到 FPGA 的大容量内存（或 NVMe SSD）中，然后让 FPGA 按照原始时间间隔将包发送到交易服务器的网卡上。
+## 4. 网卡或 FPGA 硬件回放
 
-这允许我们在不修改任何生产代码的情况下，对整个交易系统进行压力测试。
+部分团队会使用具备流量回放能力的专业网卡、FPGA 测试设备或网络测试仪。常见流程是把报文加载到设备可访问的内存或存储中，再按原始、固定或缩放后的间隔发送到被测服务器。
+
+如果测试入口与生产入口一致，这种方式可以少改应用代码并覆盖网卡到应用的更多路径。不过它仍不能自动复制真实交换机队列、对手方行为或全部故障条件；测试报告要写明设备时钟、速率控制、链路层重写和丢包统计。
 
 ## 5. 常见陷阱
 
 1.  **字节序 (Endianness)**:
-    x86 是小端序 (Little Endian)，而网络协议通常是大端序 (Big Endian)。直接 `transmute` 结构体时必须小心。
-    **解决**: 在文件头写入魔数（Magic Number）来检测字节序，或者强制使用 Little Endian 存储。
+    x86 通常使用小端序；许多网络层协议使用大端“网络字节序”，但具体行情 feed 或文件格式也可能规定小端。不要凭“网络协议”四个字猜端序，更不要 `transmute` 文件字节为结构体引用。
+    **解决**: 格式固定一种字节序，用 `from_le_bytes`/`from_be_bytes` 显式转换；magic 与 version 用于尽早拒绝错误文件。
 
 2.  **磁盘 IO 瓶颈**:
-    即使是 NVMe SSD，读取速度也有上限（约 3-5 GB/s）。如果回测引擎处理速度超过磁盘，CPU 就会空转。
-    **解决**: 使用压缩（如 Zstd）以 CPU 换 IO，或者构建多磁盘 RAID 0 阵列。
+    存储吞吐、page fault 和解压都可能成为瓶颈，具体上限取决于设备、队列深度、压缩率与访问模式。
+    **解决**: 先测量 I/O 与 CPU，再评估预读、分块压缩、并行解压或多设备条带化；RAID 0 会扩大单盘故障影响，研究数据仍需可恢复副本。
 
 3.  **时间旅行 (Look-ahead)**:
-    在使用 `mmap` 时，很容易不小心读取了 `cursor` 之后的数据。
-    **解决**: 封装严格的迭代器接口，禁止随机访问。
+    Look-ahead 与是否使用 `mmap` 无关，根因是策略能访问尚未在模拟时间发布的数据。
+    **解决**: 数据读取器可以预取，但只允许事件调度器按时间与确定 tie-break 规则向策略发布；策略接口不能暴露未来 cursor。
 
-## 6. 延伸阅读
+4.  **同时间戳顺序不稳定**:
+    两条记录时间相同，如果读取顺序受线程或 hash map 影响，每次回测可能产生不同结果。
+    **解决**: 为事件保存来源、channel、sequence 和单调递增的 ingest ordinal，并明确排序键。
 
-- [KDB+ / q](https://kx.com/) - 华尔街标准的时序数据库，了解其设计理念非常有益。
-- [Apache Arrow](https://arrow.apache.org/) - 现代列式内存格式标准，Rust 实现非常高效。
+## 6. 面试高频问答
+
+### Q1：`mmap` 为什么可能快？它真的是零拷贝吗？
+
+它把页面缓存映射到进程地址空间，避免每次 `read` 把内核缓冲复制到用户 buffer，也减少系统调用。但磁盘 I/O 和首次访问 page fault 仍存在，所以更准确的说法是“避免显式内核到用户拷贝”。
+
+### Q2：为什么不能直接把 `#[repr(C, packed)]` 结构体写盘再强转回来？
+
+packed 字段可能未对齐，普通引用会有 UB 风险；文件还会受字节序、版本、padding 与结构变更影响。稳定格式应明确字段宽度和 endian，并从 byte slice 做边界检查与转换。
+
+### Q3：如何保证回放可重复？
+
+固定输入、解析版本、随机种子和配置；事件用 `(timestamp, phase, source, sequence, ordinal)` 等完整键稳定排序；模拟时钟只由事件循环推进；最终输出和关键中间状态可做 hash 对比。
+
+## 7. 延伸阅读
+
+- [KDB+ / q](https://kx.com/) - 金融时序数据领域常见的一类数据库与查询语言；可用于比较其列式模型、时间查询和部署取舍。
+- [Apache Arrow](https://arrow.apache.org/) - 跨语言列式内存格式规范；Rust 中的具体实现、拷贝次数和性能仍应按所用 crate 与工作负载验证。
 
 ---
 下一章：我们将讨论如何模拟高精度的时钟与定时器 —— [高精度时钟模拟 (Clock Simulation)](clock.md)。

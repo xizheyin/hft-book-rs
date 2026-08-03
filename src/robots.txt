@@ -1,0 +1,5 @@
+# Crawlers must fetch HTML to observe each page's meta noindex directive.
+# Blocking these URLs here can leave an already-known URL indexed.
+# This file is effective only when deployed as /robots.txt at the origin root.
+User-agent: *
+Allow: /

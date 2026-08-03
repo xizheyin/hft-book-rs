@@ -10,7 +10,8 @@
 
 ```rust
 let x = 10;
-let add_x = |y| x + y;
+let add_x = |y: i32| x + y;
+assert_eq!(add_x(5), 15);
 ```
 
 编译器在背后悄悄生成了类似这样的代码：

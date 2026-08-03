@@ -19,23 +19,27 @@
 Rust 在生命周期检查中采用以函数为单位的分析（Intra-procedural Analysis）。这意味着编译器在检查某个函数时，必须仅依赖该函数签名与函数体内可见信息，而不能假设“调用方恰好安全”。正因为分析边界是局部的，函数签名就必须携带足够的生命周期元信息。
 
 #### 场景 A：函数体内可完全观测
-```rust
+
+下面是一个**故意写错的反例**：`compile_fail` 表示测试时预期编译器拒绝它，而不是书中代码失修。
+
+```rust,compile_fail
 fn main() {
-    let s = String::from("hello");
     let r;
     {
         let x = String::from("world");
-        // 编译器看得到 x 在这里结束，所以阻止 r 指向 x
-        // r = &x; // ❌ 编译错误
+        r = &x;
     }
-    // println!("{}", r);
+    // x 已经销毁，r 若仍可使用就会成为悬垂引用，因此这里必须编译失败。
+    println!("{}", r);
 }
 ```
 在该场景中，编译器可以直接观测到变量创建、销毁与引用使用点，因此无需额外标注即可完成安全性判断。
 
 #### 场景 B：跨函数边界的信息不充分
 
-```rust
+下面同样是预期失败的反例，用来观察“返回值缺少生命周期来源”这一错误。
+
+```rust,compile_fail
 // 编译器在编译这个函数时，根本不知道谁会调用它，传进来什么参数。
 // 也许 arg1 是全局静态变量（'static）？
 // 也许 arg2 是栈上一个马上要销毁的临时变量？
@@ -57,7 +61,9 @@ fn longest(x: &str, y: &str) -> &str {
 // 1. 输入 x 和 y 必须至少活得跟 'a 一样长。
 // 2. 返回值最多只能活得跟 'a 一样长。
 // 3. 'a 是 x 和 y 生命周期的“交集”（较短的那个）。
-fn longest<'a>(x: &'a str, y: &'a str) -> &'a str { ... }
+fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
+    if x.len() > y.len() { x } else { y }
+}
 ```
 
 **生命周期标注的本质，是将“输入与输出引用之间的有效期关系”显式编码到函数签名中。** 因而它是 API 语义的一部分，而不是实现细节。
@@ -65,11 +71,24 @@ fn longest<'a>(x: &'a str, y: &'a str) -> &'a str { ... }
 可以把 `'a` 理解为类型级契约标签。
 
 ```rust
+#[derive(Debug, PartialEq)]
+struct MarketMessage<'a> {
+    payload: &'a [u8],
+}
+
 // 这个函数的读法是：
 // "parse 函数接收一个 buffer，它的生命周期是 'a。
 //  它返回一个 MarketMessage，这个 Message 的生命周期也是 'a。"
 // 这意味着：只要 buffer 还活着，MarketMessage 就活着；buffer 一旦被销毁，MarketMessage 也必须销毁。
-fn parse<'a>(buffer: &'a [u8]) -> MarketMessage<'a> { ... }
+fn parse<'a>(buffer: &'a [u8]) -> MarketMessage<'a> {
+    MarketMessage { payload: buffer }
+}
+
+fn main() {
+    let packet = [1_u8, 2, 3];
+    let message = parse(&packet);
+    assert_eq!(message.payload, &[1, 2, 3]);
+}
 ```
 
 ### 为什么这套机制对系统软件是必要的？
@@ -115,7 +134,9 @@ fn main() {
 
 代码清单 13.2（不变性的必要性）：
 
-```rust
+下面代码是预期编译失败的反例：`&mut` 对其内部 `T` 不变，不能把局部字符串塞进承诺为 `'static` 的槽位。
+
+```rust,compile_fail
 fn overwrite<'a>(slot: &mut &'a str, v: &'a str) {
     *slot = v;
 }
@@ -161,6 +182,8 @@ fn main() {
 看一个最小例子：
 
 ```rust
+fn consume(_: i32) {}
+
 fn f() {
     let x = 1;
     let r = &x;
@@ -174,7 +197,9 @@ fn f() {
 在多参数函数里，签名上的 `'a`、`'b` 本质上就是“对外暴露的区域变量”。例如：
 
 ```rust
-fn choose<'a>(a: &'a str, b: &'a str) -> &'a str
+fn choose<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if a.len() >= b.len() { a } else { b }
+}
 ```
 
 这等价于向调用方声明：返回区域 `R_ret` 满足 `R_ret ⊆ R_a` 且 `R_ret ⊆ R_b`，因此其上界是两者交集。生命周期标注始终属于编译期约束，而非运行时元数据。
@@ -352,6 +377,10 @@ struct Context {
 这里真正需要表达的是：“对于**任意**可能的生命周期 `'a`，该回调都能接受 `&'a Context`”。
 
 ```rust
+struct Context {
+    data: Vec<u8>,
+}
+
 fn call_with_context<F>(callback: F)
 where
     // ✅ HRTB: "For any lifetime 'a..."
@@ -367,6 +396,11 @@ where
 在零拷贝消息总线、事件分发器和策略执行框架中，这类约束非常常见。
 
 ```rust
+#[derive(Debug)]
+struct MarketData {
+    price_ticks: i64,
+}
+
 trait MessageHandler {
     // 处理函数必须能接受任意生命周期的 msg 引用
     // 因为 msg 是在 on_message 栈上临时创建的
@@ -405,7 +439,9 @@ where
 
 **场景**：假设我们要手动实现一个切片迭代器。
 
-```rust
+第一段是**预期编译失败的反例**：生命周期参数 `'a` 没有出现在任何字段中，编译器无法建立约束。
+
+```rust,compile_fail
 // ❌ 错误示范：没有 PhantomData
 struct BadIter<'a, T> {
     ptr: *const T,
@@ -413,7 +449,11 @@ struct BadIter<'a, T> {
     // 我们定义了生命周期 'a，但是结构体字段里没有用到它！
     // 编译器会报错："parameter `'a` is never used"
 }
+```
 
+修复方式是通过 `PhantomData<&'a T>` 把底层借用关系编码进类型：
+
+```rust
 // ✅ 正确做法：告诉编译器我们“假装”拥有一个 &'a T
 struct Iter<'a, T> {
     ptr: *const T,
@@ -440,6 +480,12 @@ struct Iter<'a, T> {
 关键在于**构造函数签名**：`new` 接受 `&'a [T]`，因此 `'a` 会与输入切片生命周期绑定并传递到 `Self`。
 
 ```rust
+struct Iter<'a, T> {
+    ptr: *const T,
+    end: *const T,
+    _marker: std::marker::PhantomData<&'a T>,
+}
+
 impl<'a, T> Iter<'a, T> {
     // 关键：构造函数接受 &'a [T]
     fn new(slice: &'a [T]) -> Self {
@@ -463,7 +509,20 @@ impl<'a, T> Iter<'a, T> {
 
 这也是 HFT 基础设施中常见的技巧：利用 `PhantomData` 编码状态机，编译期限制非法状态迁移，而不引入额外运行时字段。
 
+为使类型状态本身能独立编译，下面用内存中的 `Socket` 替代真实网络连接；真实项目可把它换成 `TcpStream`，状态转换方式不变。
+
 ```rust
+#[derive(Default)]
+struct Socket {
+    sent: Vec<u8>,
+}
+
+impl Socket {
+    fn write(&mut self, data: &[u8]) {
+        self.sent.extend_from_slice(data);
+    }
+}
+
 // 定义一些空结构体作为“状态标签”
 struct Unconnected;
 struct Connected;
@@ -471,20 +530,20 @@ struct Connected;
 // 这个结构体可能只是一个简单的 socket 包装器
 // 注意：State 类型参数只出现在 PhantomData 中，它不占用任何内存！
 struct Session<State> {
-    socket: std::net::TcpStream,
+    socket: Socket,
     _state: std::marker::PhantomData<State>,
 }
 
 // 只有在 Unconnected 状态下，才有 connect 方法
 impl Session<Unconnected> {
-    fn new(socket: std::net::TcpStream) -> Self {
+    fn new(socket: Socket) -> Self {
         Self { socket, _state: std::marker::PhantomData }
     }
 
     fn connect(self) -> Session<Connected> {
-        // ... 执行 TCP 握手 ...
+        // 真实实现会在这里完成握手；本例只关注类型状态转换。
         // 转换类型：把 Unconnected 变成 Connected
-        // 这在运行时是零开销的（只是拷贝了 socket fd）
+        // PhantomData 不占空间，原有 Socket 直接移动到新状态中。
         Session {
             socket: self.socket,
             _state: std::marker::PhantomData
@@ -494,15 +553,18 @@ impl Session<Unconnected> {
 
 // 只有在 Connected 状态下，才有 send 方法
 impl Session<Connected> {
-    fn send(&mut self, data: &[u8]) { ... }
+    fn send(&mut self, data: &[u8]) {
+        self.socket.write(data);
+    }
 }
 
 fn main() {
-    let s = Session::<Unconnected>::new(stream);
+    let s = Session::<Unconnected>::new(Socket::default());
     // s.send(b"hello"); // ❌ 编译错误！Unconnected 状态没有 send 方法
 
-    let s = s.connect();
+    let mut s = s.connect();
     s.send(b"hello"); // ✅ 现在可以发送了
+    assert_eq!(s.socket.sent, b"hello");
 }
 ```
 
@@ -548,7 +610,9 @@ struct Invariant<'a, T> {
 
 常见问题是：为什么不能在同一结构体中同时保存拥有数据与指向该数据的引用？
 
-```rust
+下面是预期编译失败的结构草图：引用既缺少生命周期参数，也无法通过普通安全构造函数可靠地绑定到同一对象内可移动的 `String`。
+
+```rust,compile_fail
 struct SelfRef {
     data: String,
     pointer_to_data: &str, // ❌ 想要指向上面的 data

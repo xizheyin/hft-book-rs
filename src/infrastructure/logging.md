@@ -1,154 +1,197 @@
 # 高性能日志 (Logging)
 
-在 HFT 系统中，日志是唯一不能丢、但又最容易成为瓶颈的组件。一条简单的 `println!` 或 `log::info!` 可能会导致几十微秒的延迟，这在交易路径上是不可接受的。
+日志不是一种东西。订单审计事件、程序诊断日志和聚合指标的可靠性要求不同；只有先分类，才能回答“队列满了能不能丢”。
 
-本章将教你如何设计一个**纳秒级、零分配、异步**的日志系统。
+## 1. 三类记录，三种策略
 
-## 1. 理论背景：日志的开销
+| 类型 | 例子 | 丢失策略 | 典型用途 |
+| --- | --- | --- | --- |
+| 审计/业务事件 | 订单意图、风控结果、实际发送、ACK、Fill、限额变更、人工操作 | 不得静默丢；无法可靠记录时通常阻止新的扩险动作 | 重放、对账、合规调查 |
+| 诊断日志 | 连接重试、解析错误详情、调试上下文 | 可限速、采样或丢弃，但必须记录丢弃数量 | 排障 |
+| 指标 | 计数器、队列水位、延迟分布 | 聚合或采样；标记数据缺口 | 告警、趋势和容量 |
 
-### 1.1 为什么标准日志慢？
-1.  **I/O 阻塞**: `stdout` 或文件写入是系统调用 (Syscall)，涉及上下文切换。
-2.  **格式化开销**: `format!("Price: {:.2}", price)` 需要在运行时解析格式字符串，并将浮点数转为字符串。
-3.  **内存分配**: 拼接字符串通常涉及 `String` 的 `malloc`。
-4.  **锁**: `println!` 内部有锁，多线程并发时会竞争。
+“所有日志一条不能丢”和“队列满就全部丢”都不准确。策略应由事件类别、适用留存规则和故障模型决定。
 
-### 1.2 理想的 HFT 日志
-- **异步 (Async)**: 交易线程只负责把数据扔进队列，后台线程负责写盘。
-- **二进制 (Binary)**: 交易线程不进行字符串格式化，只记录原始数据 (struct)。格式化留给后台线程或离线工具。
-- **零分配 (Zero-Allocation)**: 消息对象在 Ring Buffer 中复用。
+> Kill/Cancel 通道通常要在审计存储异常时仍可用，因为它用于降低风险。可以停止 New，却不能因日志故障把减险能力一起锁死。
 
-## 2. 核心架构
-
-我们将构建一个基于 Ring Buffer 的异步日志系统。
+## 2. 异步日志并不免费
 
 ```mermaid
-graph LR
-    T[交易线程] -->|1. Push Event| RB[Ring Buffer]
-    RB -->|2. Pop Event| L[日志线程]
-    L -->|3. Format & Write| F[文件/IO]
+flowchart LR
+    H["热路径生产者"] --> Q["有界事件队列"]
+    Q --> W["日志消费者"]
+    W --> J["带校验的本地 Journal"]
+    J --> D["持久存储 / 复制"]
+    Q -. "水位、丢弃、最老事件 age" .-> M["监控"]
 ```
 
-### 2.1 日志事件定义
+异步化把格式化和 I/O 移出热路径，但生产者仍会承担：事件编码、拷贝、原子同步、缓存行争用和满队列处理。不能在没有硬件和负载口径时宣称“纳秒级”。
 
-为了避免分配，我们使用 `enum` 来承载不同类型的日志，或者使用 `union`。
+常见优化是：
+
+- 预分配有界队列，避免热路径隐式扩容；
+- 记录整数 ID、整数价格和原因码，后台再解析；
+- SPSC 用于单生产者，MPSC 用于多生产者；
+- 诊断文本使用静态模板 ID + 固定字段；
+- 批量写可以提高吞吐，但会增加首条事件的等待时间。
+
+### 2.1 固定事件不等于强行填满缓存行
 
 ```rust
-#[derive(Clone, Copy)]
-pub enum LogEvent {
-    OrderPlaced { id: u64, price: f64, size: u32 },
-    OrderFilled { id: u64, price: f64 },
-    Error { code: u16 },
-    // 预留填充，确保 Cache Line 对齐
-    _Padding([u8; 40]), 
+#[derive(Debug, Clone, Copy)]
+pub enum AuditEvent {
+    OrderIntent {
+        client_id: u64,
+        instrument_id: u32,
+        price_ticks: i64,
+        quantity: u64,
+    },
+    RiskReject { client_id: u64, reason_code: u16 },
+    Fill { execution_id: u64, client_id: u64, quantity: u64 },
 }
-
-// 确保 Event 大小固定且拷贝开销小
-static_assertions::const_assert!(std::mem::size_of::<LogEvent>() <= 64);
 ```
 
-### 2.2 极简 Logger 实现
+不要凭猜测加 `_Padding([u8; N])` 声称正好 64 字节；枚举布局、对齐和目标平台都会影响大小。用 `size_of`、队列槽位布局和缓存计数器验证，且价格不要为方便格式化而使用浮点账本值。
 
-利用我们之前写的 `MpscArrayQueue` 或 `SPSC` (如果是单线程策略)。
+## 3. 满队列策略必须写进 API
+
+下面用标准库有界通道给出一份可编译的语义示例。真实系统可替换成经过验证的 SPSC/MPSC，但必须保留“失败时归还事件所有权”的 API 契约。
 
 ```rust
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::fs::File;
-use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 
-pub struct AsyncLogger {
-    queue: MpscArrayQueue<LogEvent>, // 假设这是我们在前面章节实现的
-    running: AtomicBool,
+#[derive(Debug, Clone, Copy)]
+pub struct EncodedEvent {
+    pub sequence: u64,
+    pub event_type: u16,
 }
 
-impl AsyncLogger {
-    pub fn new(file_path: &str) -> (Self, thread::JoinHandle<()>) {
-        let queue = MpscArrayQueue::new(1024 * 1024); // 1M 容量
-        let logger = Self {
-            queue,
-            running: AtomicBool::new(true),
-        };
-        
-        let mut file = File::create(file_path).unwrap();
-        
-        // 启动后台线程
-        let handle = thread::spawn(move || {
-            // 将线程绑定到特定的 Core (例如 Core 3)
-            core_affinity::set_for_current(core_affinity::CoreId { id: 3 });
-            
-            while logger.running.load(Ordering::Relaxed) {
-                while let Some(event) = logger.queue.pop() {
-                    // 3. 延迟格式化 (Delayed Formatting)
-                    match event {
-                        LogEvent::OrderPlaced { id, price, size } => {
-                            writeln!(file, "PLACED,{},{:.2},{}", id, price, size).ok();
-                        }
-                        LogEvent::OrderFilled { id, price } => {
-                            writeln!(file, "FILLED,{},{:.2}", id, price).ok();
-                        }
-                        _ => {}
-                    }
-                }
-                // 空闲时自旋或 Yield
-                std::hint::spin_loop();
-            }
-        });
+pub struct EventSink {
+    sender: SyncSender<EncodedEvent>,
+    dropped_diagnostic: AtomicU64,
+}
 
-        (logger, handle)
-    }
-
-    // 热路径上的 API: 极快，无锁，无分配
-    pub fn log(&self, event: LogEvent) {
-        if let Err(_) = self.queue.push(event) {
-            // 队列满了！策略：
-            // 1. 丢弃 (Drop) - 保证低延迟
-            // 2. 阻塞 (Block) - 保证数据完整
-            // HFT 通常选 1，并记录一个 "Dropped" 计数器
-            eprintln!("Log queue full!"); 
+impl EventSink {
+    fn try_push(&self, event: EncodedEvent) -> Result<(), EncodedEvent> {
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(event) | TrySendError::Disconnected(event)) => Err(event),
         }
     }
 }
-```
 
-## 3. 进阶优化
+#[derive(Debug, Clone, Copy)]
+pub enum EventClass { Audit, Diagnostic }
 
-### 3.1 时间戳 (Timestamping)
-不要在热路径调用 `SystemTime::now()`，它是系统调用，慢。
-**优化**: 使用 CPU 的 TSC (Time Stamp Counter) 寄存器。
+pub enum EmitResult {
+    Enqueued,
+    DiagnosticDropped,
+    /// 把未入队事件交还调用者，供备用 journal 或安全停发流程使用。
+    AuditUnavailable(EncodedEvent),
+}
 
-```rust
-pub fn rdtsc() -> u64 {
-    unsafe { std::arch::x86_64::_rdtsc() }
+pub fn emit(
+    sink: &EventSink,
+    class: EventClass,
+    event: EncodedEvent,
+) -> EmitResult {
+    let event = match sink.try_push(event) {
+        Ok(()) => return EmitResult::Enqueued,
+        Err(event) => event, // try_push 失败时必须归还所有权
+    };
+
+    match class {
+        EventClass::Diagnostic => {
+            sink.dropped_diagnostic.fetch_add(1, Ordering::Relaxed);
+            EmitResult::DiagnosticDropped
+        }
+        EventClass::Audit => EmitResult::AuditUnavailable(event),
+    }
 }
 ```
-在日志线程中，再将 TSC 转换为真实时间（通过定期校准）。
 
-### 3.2 结构化二进制日志 (SBE - Simple Binary Encoding)
-与其在后台线程 `writeln!` 文本，不如直接把 `LogEvent` 的内存 `memcpy` 到内存映射文件 (mmap) 中。
-这能达到磁盘 IO 的物理极限。
-离线时，再写一个解析器把二进制转为 CSV/JSON。
+调用者收到 `AuditUnavailable` 后应执行预先批准的安全策略，例如：
 
-### 3.3 避免 False Sharing
-日志队列的 `head` 和 `tail` 同样需要 Padding。
-交易线程只写 `tail`，日志线程只读 `tail`。
+1. 将系统标记为 degraded；
+2. 阻止新的普通订单，保留 Cancel/kill；
+3. 告警并尝试备用 journal；
+4. 保存“从哪个序号开始无法证明完整”的缺口；
+5. 恢复后对账，未通过门禁前不自动恢复交易。
 
-## 4. 常见陷阱 (Pitfalls)
+不要在队列满分支调用 `eprintln!`：它可能锁住 stderr、阻塞并形成递归日志风暴。满队列计数器应预先存在，告警由独立健康线程读取。
 
-1.  **队列溢出**:
-    当磁盘 I/O 抖动（例如 SSD GC）时，日志线程会变慢，导致队列瞬间填满。
-    **解决**: 
-    - 增大队列容量 (例如 1GB)。
-    - 使用 `O_DIRECT` 绕过 Page Cache。
-    - 关键日志阻塞，非关键日志丢弃。
+### 3.1 阻塞、丢弃还是停发？
 
-2.  **字符串处理**:
-    如果必须记录动态字符串（如错误信息），不要用 `String`。
-    **解决**: 使用定长数组 `[u8; 64]` 或索引到静态字符串表 `&'static str`。
+| 行为 | 优点 | 风险 |
+| --- | --- | --- |
+| 阻塞生产者 | 审计事件不被主动丢弃 | 热路径停顿，可能错过行情 |
+| 丢弃事件 | 保住生产者延迟 | 审计链不完整，不能用于关键业务事件 |
+| 停止新单并排空 | 不继续制造不可审计副作用 | 可用性下降，需保留减险路径 |
+| 切换备用 sink | 提高韧性 | 双写、顺序、去重和故障切换更复杂 |
 
-## 5. 延伸阅读
+无限增大队列只会延后持续过载。除了 depth，还要监控最老事件 age 和消费者落后序号。
 
-- [Nanolog](https://github.com/PlatformLab/NanoLog) - C++ 极速日志库，宣称比 `printf` 快 100 倍。
-- [SftLog](https://github.com/SftLogic/sft_log) - Rust 实现的无锁日志。
+## 4. 二进制日志要显式编码
+
+不能把 Rust enum 的原始内存直接 `memcpy` 到文件并称为稳定格式，因为它可能包含 padding，布局也没有跨版本、跨平台保证。一个可恢复 journal 至少要定义：
+
+```text
+magic | schema_version | record_type | payload_len | sequence
+event_time | receive_time | payload | checksum
+```
+
+还要说明：
+
+- 字节序和整数缩放；
+- schema 演进与未知字段；
+- 部分写入和文件尾损坏如何截断；
+- sequence/Client ID/execution ID 如何去重；
+- `write`、page cache、`fsync`、设备缓存与复制 ACK 分别代表什么持久性；
+- 密钥、个人信息和策略参数怎样脱敏与授权。
+
+`mmap` 不等于已经持久化，`O_DIRECT` 也不是默认更快：它有对齐限制，会绕过 page cache 的一些帮助，并增加实现复杂度。两者都要在目标文件系统和设备故障模型下测试。
+
+## 5. 时间戳
+
+- 事件时间：交易所提供的外部时间；
+- 接收/发送硬件时间：测量 wire 边界；
+- 单调时间：本机持续时间和超时；
+- 墙上时间：人类报表和跨系统关联。
+
+`SystemTime::now()` 是否走系统调用取决于平台，不能简单说“一定慢”。TSC 读取成本可能较低，但必须验证跨核稳定性、频率语义、序列化要求和校准误差；裸 `_rdtsc()` 还是架构相关 `unsafe`。优先使用项目的统一时钟抽象，并记录时间质量。
+
+## 6. 停机与崩溃恢复
+
+正常停机需要：停止接收普通新事件、排空队列、写入终止序号、flush/按策略同步、等待消费者退出。不能只把 `running=false` 后立即丢掉队列尾部。
+
+崩溃恢复要测试：
+
+- 记录写到一半断电；
+- checksum 错误和尾部截断；
+- 同一批记录重放两次；
+- 磁盘满、只读、I/O 卡顿和文件轮转；
+- 主日志和备用日志不同步；
+- 恢复后的订单/成交与独立 drop copy 对账。
+
+## 7. 面试追问与验证清单
+
+**日志队列满了怎么办？** 先问事件类别。诊断日志可采样并增加 dropped counter；关键审计事件不得静默丢，通常触发停止新单、保留撤单、切备用和对账。
+
+**异步日志为何仍会影响 p99？** 队列 push 会写共享缓存行，满队列会背压，消费者还可能与热线程争 CPU、内存带宽或 I/O。
+
+**二进制日志是否直接 dump struct？** 不应。要显式 schema、长度、版本、字节序和 checksum，保证跨版本解析和崩溃恢复。
+
+验证清单：
+
+- [ ] 每种事件有 owner、可靠性和留存等级；
+- [ ] 队列高水位、满队列和最老 age 有指标；
+- [ ] 诊断丢弃本身可观测；
+- [ ] 审计不可用会阻止新单但保留减险；
+- [ ] 峰值、持续过载、磁盘卡顿和崩溃恢复已演练；
+- [ ] 解析器能读取旧 schema，损坏记录不会越界；
+- [ ] 端到端 p50/p99 与开启/关闭日志的 A/B 结果已记录。
 
 ---
+
 下一章：[配置热加载 (Configuration)](config.md)

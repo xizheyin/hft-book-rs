@@ -15,9 +15,9 @@
 
 一个有用的近似模型是：
 
-\[
-Throughput \approx \frac{BatchSize}{FixedCost + VariableCost \times BatchSize}
-\]
+<div class="formula" role="math" aria-label="batch throughput approximation">
+Throughput ≈ BatchSize / (FixedCost + VariableCost × BatchSize)
+</div>
 
 它说明了批处理的价值。若一次系统调用、一次原子同步或一次队列提交存在不可忽略的固定成本，那么把多个元素合并处理，往往比逐条处理更接近硬件上限。
 

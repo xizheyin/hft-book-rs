@@ -143,9 +143,9 @@ unsafe fn count_greater_avx2(prices: &[f64], threshold: f64) -> usize {
 
 ## 3. 性能分析 (Performance Analysis)
 
-Unsafe 优化是否成立，必须通过可复现实验来验证。建议使用固定数据分布与固定 CPU 频率策略，分别评估三类实现：纯 Safe 基线、局部 `get_unchecked`、手写 SIMD。评估时不要只看平均值，应同时记录 P99 和硬件事件计数（如分支失误、L1/L2 miss）。
+Unsafe 优化是否成立，必须通过可复现实验来验证。建议使用固定数据分布与固定 CPU 频率策略，分别评估三类实现：纯 Safe 基线、局部 `get_unchecked`、手写 SIMD。评估时不要只看平均值，应同时记录 P99 和硬件事件计数（如分支失误、L1/L2 miss）。下面代码依赖 `criterion` 开发依赖、Cargo benchmark harness，并复用本章前面的函数；它应放入 `benches/` 运行，因此 mdBook 不把它当作独立标准库示例执行。
 
-```rust
+```rust,ignore
 use criterion::{criterion_group, criterion_main, Criterion, black_box};
 
 fn bench_count(c: &mut Criterion) {

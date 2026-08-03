@@ -1,137 +1,188 @@
 # 持仓管理 (Position Management)
 
-持仓管理模块负责实时跟踪策略的持仓数量、平均成本以及盈亏（PnL）。它是连接执行层（Execution）和风控层（Risk）的桥梁。
+持仓是成交事实的本地投影。最重要的不变量是：
 
-在高频交易中，持仓更新必须极快，以便风控模块能立即使用最新的持仓数据进行检查。
+> **已确认持仓只由去重后的成交（Fill）改变。** New、ACK、Cancel 请求和 Cancel ACK 都不直接改变已确认持仓。
 
-## 1. 核心数据结构
+未成交订单会产生风险，但应记录为 reservation/open-order exposure，而不是伪装成已经持有的仓位。两者的关系见[预交易风控](pre_trade_risk.md)。
 
-我们需要跟踪每个 Instrument（合约/股票）的持仓状态。
+## 1. 先定义口径
+
+| 状态 | 来源 | 用途 |
+| --- | --- | --- |
+| Confirmed position | 唯一成交回报 | 持仓账本和成交后风险 |
+| Open buy/sell quantity | 订单状态机 | 预交易最坏边界 |
+| Strategy view | 上述状态的只读投影 | 策略决策，可能稍旧 |
+| External position | Drop copy、经纪商或清算来源 | 独立对账 |
+
+成本方法也不是技术团队随意选择的“最快算法”。平均成本、FIFO、逐笔 lot 等口径取决于产品、会计、税务和报表要求；实时策略估值与正式账本可以采用不同口径，但必须明确转换和核对。
+
+## 2. 平均成本教学实现
+
+下面代码用于解释多空、减仓和反手。它使用 `f64`，没有费用、币种和合约乘数，因此**不能直接作为正式资金账本**。生产系统通常使用十进制定点/足够宽整数，并定义每一步舍入规则。
 
 ```rust
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Position {
-    pub symbol_id: u16,
-    pub quantity: i32,      // 净持仓：正数为多，负数为空
-    pub avg_price: f64,     // 持仓均价
-    pub realized_pnl: f64,  // 已实现盈亏
-    pub total_volume: u64,  // 总成交量
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AverageCostPosition {
+    pub quantity: i64,             // 正数为多，负数为空
+    pub average_price_ticks: f64,  // 教学简化
+    pub realized_pnl_ticks: f64,   // 尚未乘合约乘数、汇率，未扣费用
+    pub total_volume: u64,
 }
-```
 
-### 1.1 成本计算方法
-通常有两种计算持仓成本的方法：
-1.  **加权平均价 (Weighted Average Price)**: 最常用。
-2.  **FIFO (First-In, First-Out)**: 需要维护一个队列，内存开销大，HFT 中较少使用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionError {
+    ZeroFill,
+    InvalidPrice,
+    QuantityOverflow,
+    VolumeOverflow,
+    NumericOverflow,
+}
 
-我们采用**加权平均价**。
+impl AverageCostPosition {
+    /// signed_qty: 买入为正，卖出为负。
+    pub fn on_fill(
+        &mut self,
+        signed_qty: i64,
+        fill_price_ticks: f64,
+    ) -> Result<(), PositionError> {
+        if signed_qty == 0 {
+            return Err(PositionError::ZeroFill);
+        }
+        if !fill_price_ticks.is_finite() || fill_price_ticks <= 0.0 {
+            return Err(PositionError::InvalidPrice);
+        }
 
-## 2. 持仓更新逻辑
-
-当收到成交回报 (Execution Report - Fill) 时，我们需要更新持仓。
-
-```rust
-impl Position {
-    pub fn on_fill(&mut self, fill_qty: i32, fill_price: f64) {
         let old_qty = self.quantity;
-        let new_qty = old_qty + fill_qty;
+        let new_qty = old_qty
+            .checked_add(signed_qty)
+            .ok_or(PositionError::QuantityOverflow)?;
+        let fill_abs = signed_qty.unsigned_abs();
+        let old_abs = old_qty.unsigned_abs();
+        let next_volume = self.total_volume
+            .checked_add(fill_abs)
+            .ok_or(PositionError::VolumeOverflow)?;
+        let mut next_average = self.average_price_ticks;
+        let mut next_realized = self.realized_pnl_ticks;
 
         if old_qty == 0 {
-            // 开仓
-            self.avg_price = fill_price;
-        } else if (old_qty > 0 && fill_qty > 0) || (old_qty < 0 && fill_qty < 0) {
-            // 加仓 (同方向)
-            // avg_price = (old_value + new_value) / new_qty
-            let old_val = old_qty as f64 * self.avg_price;
-            let new_val = fill_qty as f64 * fill_price;
-            self.avg_price = (old_val + new_val) / new_qty as f64;
+            next_average = fill_price_ticks;
+        } else if old_qty.signum() == signed_qty.signum() {
+            let old_cost = self.average_price_ticks * old_abs as f64;
+            let added_cost = fill_price_ticks * fill_abs as f64;
+            next_average = (old_cost + added_cost) / new_qty.unsigned_abs() as f64;
         } else {
-            // 减仓/平仓 (反方向)
-            // 均价不变，计算已实现盈亏
-            // PnL = (Exit Price - Entry Price) * Qty * Multiplier
-            // 这里假设 Multiplier = 1
-            
-            let closed_qty = if new_qty.abs() < old_qty.abs() {
-                // 部分平仓
-                fill_qty.abs()
+            let closed = old_abs.min(fill_abs);
+            let pnl_per_unit = if old_qty > 0 {
+                fill_price_ticks - self.average_price_ticks
             } else {
-                // 全部平仓或反手
-                old_qty.abs()
+                self.average_price_ticks - fill_price_ticks
             };
+            next_realized += pnl_per_unit * closed as f64;
 
-            let pnl = if old_qty > 0 {
-                (fill_price - self.avg_price) * closed_qty as f64
-            } else {
-                (self.avg_price - fill_price) * closed_qty as f64
-            };
-            
-            self.realized_pnl += pnl;
-
-            // 如果反手了 (例如持多 10，卖出 20 -> 持空 10)
-            if (old_qty > 0 && new_qty < 0) || (old_qty < 0 && new_qty > 0) {
-                self.avg_price = fill_price;
+            if new_qty == 0 {
+                next_average = 0.0;
+            } else if old_qty.signum() != new_qty.signum() {
+                // 反手后，超出平仓部分以本次成交价建立新成本。
+                next_average = fill_price_ticks;
             }
+            // 仅减仓且未反手时，剩余仓位平均成本不变。
         }
 
+        if !next_average.is_finite() || !next_realized.is_finite() {
+            return Err(PositionError::NumericOverflow);
+        }
         self.quantity = new_qty;
-        self.total_volume += fill_qty.abs() as u64;
+        self.average_price_ticks = next_average;
+        self.realized_pnl_ticks = next_realized;
+        self.total_volume = next_volume;
+        Ok(())
     }
 }
 ```
 
-> **注意**: 浮点数运算在某些极端情况下可能会累积误差。对于期货/数字货币，建议使用定点数（如 `i64` 表示微元）。
+算例：原来多 10，均价 100；卖 15，成交价 103。先平掉 10，产生 `30` 个“价格 tick × 数量”的已实现结果；剩余空 5，新的平均入场价是 103。费用与乘数要在约定层处理。
 
-## 3. 并发更新与无锁设计
+### 2.1 先去重，再调用 `on_fill`
 
-在 HFT 系统中，可能有多个线程会读取持仓（风控线程、策略线程、监控线程），而网络线程负责写入持仓。
+同一成交回报可能因重连或重放到达多次。更新流程应是：
 
-### 3.1 读多写少场景
+1. 验证订单、账户、合约和 execution ID；
+2. 按协议会话语义判断该 execution ID 是否已应用；
+3. 只在第一次应用时更新订单累计成交、持仓、费用和风险；
+4. 将“已应用”与状态事件放在同一可恢复顺序中；
+5. 重启后恢复去重状态，再接收重放。
 
-持仓更新频率取决于成交频率，通常远低于行情更新频率。
-我们可以使用 `SeqLock`（在[订单簿管理](order_book.md)中介绍过）来保护 `Position` 结构体。
+不要用 `(价格, 数量, 时间)` 去重，两笔合法成交可能具有完全相同的这些字段。
 
-### 3.2 原子化持仓 (Atomic Position)
+## 3. Reservation 不是 Shadow Position
 
-如果只需要跟踪 `quantity`（用于风控），可以直接使用 `AtomicI64`。我们将 `quantity` 和 `symbol_id` 打包在一个 `u64` 中（如果 symbol id 够小）。或者仅使用 `AtomicI32` 存储 quantity。
+“发出买单后立即把持仓加上，Reject 时再减回”会混淆事实与可能性。更清晰的状态是：
 
-```rust
-use std::sync::atomic::{AtomicI64, Ordering};
+```text
+confirmed_position = 只由 Fill 更新
+open_buy_qty        = 仍可能成交的买单剩余量
+open_sell_qty       = 仍可能成交的卖单剩余量
 
-pub struct AtomicPositionManager {
-    // 简单场景：只维护数量
-    quantities: Vec<AtomicI64>, 
-}
-
-impl AtomicPositionManager {
-    pub fn new(num_symbols: usize) -> Self {
-        let mut quantities = Vec::with_capacity(num_symbols);
-        for _ in 0..num_symbols {
-            quantities.push(AtomicI64::new(0));
-        }
-        Self { quantities }
-    }
-
-    #[inline(always)]
-    pub fn update(&self, symbol_id: usize, delta: i64) {
-        self.quantities[symbol_id].fetch_add(delta, Ordering::SeqCst);
-    }
-
-    #[inline(always)]
-    pub fn get_qty(&self, symbol_id: usize) -> i64 {
-        self.quantities[symbol_id].load(Ordering::SeqCst)
-    }
-}
+worst_long  = confirmed_position + open_buy_qty
+worst_short = confirmed_position - open_sell_qty
 ```
 
-### 3.3 影子持仓 (Shadow Position)
+事件转换：
 
-由于成交回报 (Fill) 总是有延迟的，策略在发出订单后，实际上已经承担了潜在的风险。
-因此，我们通常维护两个持仓：
-1.  **已确认持仓 (Confirmed Position)**: 基于 Fill 更新。
-2.  **潜在持仓 (Pending/Shadow Position)**: 发单时立即更新，收到 Fill 或 Reject 时修正。
+- New 风控通过：增加对应 open quantity；
+- ACK：通常不改变三者；
+- Buy Fill 4：`open_buy_qty -= 4`，`confirmed_position += 4`；
+- Cancel 请求：不释放；
+- Cancel ACK：释放权威确认的 leaves quantity；
+- Reject：释放该订单尚未成交的预占。
 
-风控检查通常基于 `Pending Position`，以防止“超发”。
+每次释放都必须关联具体订单及其剩余预占，避免重复回报导致下溢或释放别人的额度。
 
-## 4. 总结
+## 4. 并发所有权
 
-持仓管理是 HFT 系统的账本。虽然逻辑看似简单（加加减减），但在高并发环境下保证数据的一致性和实时性是一项挑战。通过区分“风控用持仓”（原子化、极简）和“策略用持仓”（详细、包含 PnL），我们可以同时满足低延迟和功能完备的需求。
+推荐让订单状态、成交去重、已确认持仓和预占由同一账户/分片所有者按序更新。这样一条 Fill 能原子地完成“订单 leaves 减少 → position 增加 → reservation 转换”。
+
+如果其他线程只需要数量，可发布 `AtomicI64` 的派生读视图；但它不提供与平均成本、PnL 和订单预占一致的复合快照。需要完整快照时使用标准锁、不可变 `Arc<Snapshot>` 或经过验证的发布机制，不要对普通 `Position` 套用手写 `UnsafeCell` SeqLock。
+
+内存序不能凭习惯统一用 Relaxed 或 SeqCst。先确定谁发布、谁读取以及需要同时可见的字段，再证明同步关系并用并发测试验证。
+
+## 5. PnL 不是一个无上下文数字
+
+至少区分：
+
+- realized PnL：已平部分，依赖成本方法；
+- unrealized PnL：当前仓位相对某个 mark price 的估值；
+- fees/rebates：交易费、清算费、返佣等；
+- FX 与 contract multiplier；
+- gross 与 net、交易日和结算价口径。
+
+行情丢失时 mark 可能陈旧，因此 PnL 告警要携带价格来源和新鲜度。不能用陈旧 PnL 作为唯一自动动作依据。
+
+## 6. 对账与恢复
+
+内部实时持仓不是最终外部事实。系统要用独立 drop copy、经纪商/清算记录核对：
+
+- 每个 execution ID 是否一致；
+- 累计成交量和 leaves quantity 是否守恒；
+- 账户、合约、币种和交易日映射是否一致；
+- 手工交易、改单和 bust/correct 事件是否纳入；
+- 本地与外部持仓差异是否为 0。
+
+发现差异时先阻止扩大相关风险，保存差异证据，再按权威来源产生可审计的修复事件；不要静默覆盖本地数字。
+
+## 7. 面试追问、易错点与验证
+
+**ACK 为什么不改变持仓？** ACK 表示订单通常已被接受，尚不代表成交；只有 Fill 是持仓变化事实。
+
+**Cancel 发出后风险能否释放？** 不能。确认前原单可能成交，必须等 Cancel ACK/Expire 或用 Fill 转换对应数量。
+
+**AtomicI64 是否足够？** 只够发布单个数量视图；成本、PnL、open orders 和去重需要一致的复合状态。
+
+易错点包括：精确平仓后忘记把平均成本清零、反手仍沿用旧成本、重复 Fill 更新两次、忽略费用/乘数、把 reservation 当持仓，以及用浮点结果做正式资金账本。
+
+验证至少覆盖：开仓、同向加仓、部分减仓、精确平仓、反手、多空对称、溢出、重复/乱序 Fill、Cancel/Fill 竞态，以及与逐笔朴素参考实现的性质对比。
+
+---
+
+上一章：[预交易风控实战](pre_trade_risk.md) ｜ 下一章：[策略框架设计](strategy.md)

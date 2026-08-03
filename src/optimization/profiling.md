@@ -1,127 +1,152 @@
 # 性能分析 (Profiling)
 
-基准测试告诉我们“代码有多快”，而性能分析（Profiling）告诉我们“代码为什么慢”。
+基准测试告诉你“目标指标发生了什么”，profiling 帮你形成“为什么”的证据。CPU 热点、排队、调度、锁、缺页和网络等待需要不同工具；一张火焰图不能回答全部问题。
 
-在 HFT 中，我们通常面临两种性能问题：
-1.  **CPU 瓶颈**：热点函数消耗了大量 CPU 周期。
-2.  **延迟瓶颈**：虽然 CPU 占用率不高，但关键路径因为缓存未命中或锁争用而被阻塞。
+## 1. 先定义症状和关键路径
 
-## 准备工作：保留调试符号
+| 症状 | 优先观察 |
+| --- | --- |
+| CPU 使用率高、吞吐不足 | On-CPU samples、instructions/cycles、算法复杂度 |
+| p99 高但 CPU 不高 | 队列 age、off-CPU、调度、IRQ、page fault、I/O |
+| 单核满、其他核空 | 分片倾斜、串行 owner、锁和队列 |
+| 周期性尖峰 | 定时任务、日志 flush、频率/温度、内存回收 |
+| 只在峰值恶化 | 排队、锁竞争、NIC/软中断、背压 |
 
-为了让 Profiler 能将机器码映射回 Rust 源代码，我们需要在 `release` 构建中保留调试符号。这会增加二进制文件的大小，但不会影响运行时性能。
+先写清延迟起点/终点、负载、时间窗口和变差版本，再选工具。否则容易优化一个宽热点，却没有改善用户关心的路径。
+
+## 2. Release 符号与栈展开
 
 ```toml
-# Cargo.toml
 [profile.release]
-debug = true  # 保留调试信息
-strip = false # 不要剥离符号表
+debug = 1
+strip = false
 ```
 
-## Linux Perf 与火焰图 (FlameGraphs)
+调试信息通常不改变优化级别，主要增加文件体积；是否影响最终二进制布局、部署包和启动行为仍应由目标构建验证。生产剥离符号时，可把同一 build ID 的符号文件安全保存在符号服务器。
 
-`perf` 是 Linux 内核自带的性能分析工具，功能极其强大。
+栈不完整可能来自 frame pointer 省略、内联、unwind 信息或采样权限。解决方式取决于平台：启用 frame pointers、使用 DWARF unwind，或保存可符号化的构建。不同设置可能改变性能，所以对比前保持配置一致。
 
-### 1. 采集数据
+## 3. On-CPU 采样与火焰图
+
+一个 Linux 示例：
 
 ```bash
-# 以 99Hz 的频率采样所有 CPU，持续 30 秒
-# -g: 记录调用栈 (Call graph)
-# -p <PID>: 监控特定进程
-sudo perf record -F 99 -g -p $(pgrep hft_app) -- sleep 30
+perf record -F 199 -g -p <PID> -- sleep 30
+perf report
 ```
 
-### 2. 生成火焰图
+采样频率不是越高越好：过低可能漏掉短突发，过高会增加开销和数据量。记录开始/结束时间、丢失样本、调用栈模式和工具版本。
 
-火焰图 (FlameGraph) 是可视化调用栈最直观的方式。
+火焰图含义：
+
+- X 轴宽度约表示被采样到的 On-CPU 时间占比，不是时间顺序；
+- Y 轴是调用栈；
+- 宽函数可能是必要工作、busy poll 或非关键线程；
+- 颜色通常没有“红色就是慢”的通用含义；
+- 采样是统计近似，会受 unwind 和频率偏差影响。
+
+若要分析单次 300µs 尾事件，应先用 trace ID 定位时间窗，再做阶段打点、调度/IRQ trace 或低开销持续 profiling。全程平均火焰图可能把稀有尖峰淹没。
+
+## 4. Off-CPU 与调度
+
+热线程不在 CPU 上时，普通 CPU 火焰图看不到原因。需要观察：
+
+- voluntary/involuntary context switches；
+- run-queue delay 和线程迁核；
+- futex、锁等待、sleep 和 I/O；
+- IRQ/softirq 抢占；
+- page fault 和内存回收。
+
+可使用 `perf sched`、eBPF/bpftrace 或平台追踪工具。采集生产数据前评估权限、开销和敏感信息。
+
+“CPU 不满”不代表没有性能问题；线程可能大部分时间在排队或等待另一个所有者。
+
+## 5. 硬件事件要归一化解释
 
 ```bash
-# 需要先安装 flamegraph 工具
-# cargo install flamegraph
-
-# 直接运行并生成火焰图
-cargo flamegraph --root --bin hft_app
+perf stat -e cycles,instructions,branches,branch-misses,cache-misses \
+  -p <PID> -- sleep 30
 ```
 
-在火焰图中：
-- **X 轴**：表示采样次数（即 CPU 占用时间）。越宽的函数占用 CPU 越多。
-- **Y 轴**：表示调用栈深度。
-- **平顶 (Plateaus)**：如果在顶层有很宽的“平顶”，说明该函数本身（而非它调用的子函数）消耗了大量 CPU。
+注意：
 
-## 深入硬件事件 (Hardware Events)
+- `cache-misses` 的具体定义依 CPU/事件而异；
+- 多事件可能 multiplex，需要查看运行时间和缩放；
+- 用 MPKI（每千指令 miss）等比例辅助比较，不只看原始数；
+- NUMA 远端访问、内存带宽和 false sharing 需要专门事件/工具；
+- 虚拟机、容器和权限会限制可用计数器。
 
-仅仅看 CPU 周期是不够的。有时代码慢是因为缓存未命中。
+某函数 LLC miss 多只是线索，不能直接推出“换 Arena 就会更快”。还可能是流式访问、工作集过大或其他核造成失效；需要最小实验和 A/B 验证。
 
-```bash
-# 分析 L1 数据缓存未命中
-perf record -e L1-dcache-load-misses -g ...
+## 6. 因果 profiling 的边界
 
-# 分析分支预测失败
-perf record -e branch-misses -g ...
+Coz 一类 causal profiler 用“虚拟加速”估计某段代码变快对吞吐/延迟进度点的影响。它提醒我们：最宽热点不一定在关键路径。
 
-# 分析最后以级缓存 (LLC) 未命中
-perf record -e LLC-load-misses -g ...
-```
+使用前要：
 
-如果发现 `order_book::match_order` 函数有大量的 `LLC-load-misses`，说明你的订单簿内存布局不友好（可能是指针跳转太多），需要考虑改用数组或 Arena 分配器。
+- 选择真正代表业务完成的 progress point；
+- 确保负载稳定且持续时间足够；
+- 区分吞吐目标和尾延迟目标；
+- 了解工具对语言、平台和优化构建的支持；
+- 用真实修改复验估计结果。
 
-## 因果分析 (Causal Profiling): Coz
+工具输出是实验假设，不是“优化 15% 必然提升 12%”的承诺。
 
-传统的 Profiler 有一个误区：优化占用 CPU 最多的函数，不一定能提升系统整体吞吐量或降低端到端延迟。因为那个热点可能并不在关键路径上。
+## 7. 分配与内存分析
 
-`coz` 是一个“因果分析器”。它的工作原理很有趣：它不加速特定的代码，而是通过**虚拟减速**其他代码，来模拟“如果这行代码加速 20% 会发生什么”。
+分配 profiler 可发现短命对象、隐式 `Vec` 扩容和峰值驻留内存。但 Valgrind、DHAT、heap profiler 会显著改变时序，不应拿它们的墙上延迟当生产结果。
 
-### 安装与使用
+需要区分：
 
-```bash
-cargo install coz
-```
+- 分配次数与分配字节；
+- 活跃内存与累计流量；
+- page fault、RSS 和 allocator arena；
+- NUMA 分配位置；
+- 对象生命周期和回收线程。
 
-在代码中插入“进度点”：
+`memcpy`、`malloc`、`Mutex` 或 syscall 出现在 profile 中不自动是 bug。`memcpy` 可能比手写循环高效，锁可能在冷路径，系统调用可能被 vDSO/批处理优化。先确认它们是否处于目标慢样本的关键路径。
 
-```rust
-// 告诉 Coz：这里是一次交易处理的结束
-coz::progress!("transaction_processed");
-```
+## 8. 采样、追踪与测量效应
 
-运行：
+| 方法 | 优点 | 风险 |
+| --- | --- | --- |
+| 统计采样 | 开销相对可控，适合持续观察 | 稀有短事件可能漏采 |
+| 每阶段打点 | 能关联单条慢 trace | 热路径写入和时钟开销 |
+| 函数 instrumentation | 细粒度 | 扰动通常更大 |
+| eBPF/内核 trace | 看调度、网络和 syscall | 权限、内核版本、数据量 |
 
-```bash
-coz run --- ./target/release/hft_app
-```
+记录 profiler 开启/关闭的 A/B 延迟和吞吐，检查 lost samples。对订单 ID、账户和策略细节做脱敏/访问控制。
 
-Coz 会输出：
-> "Optimizing function `process_order` by 15% will increase throughput by 12%."
+## 9. 从证据到改动
 
-这比看火焰图猜测更有指导意义。
+1. 用可复现负载确认问题；
+2. 关联端到端慢样本与阶段、线程、CPU；
+3. 形成一个可证伪假设；
+4. 保存 profile、配置、build ID 和基线；
+5. 一次改变主要变量；
+6. 重新跑正确性、p50/p99、吞吐和资源指标；
+7. 未改善目标或引入回归就回滚；
+8. 在生产近似流量复验。
 
-## 堆内存分析 (Heap Profiling)
+例如看到大量 `pthread_mutex_lock`，先确认等待者、持有时间和调用路径；可能的修复是缩小临界区、改变状态所有者，也可能只是把低频配置读取移出热点。不要直接替换成复杂无锁结构。
 
-如果你的程序总是发生 Minor Page Faults，或者内存碎片化严重，可以使用 `dhat` 或 `bytehound`。
+## 10. 面试追问与验证清单
 
-### DHAT (Dynamic Heap Analysis Tool)
+**火焰图最宽的函数就是第一优化目标吗？** 不一定。它可能不在关键路径，或是不可避免的 busy poll；应关联业务 progress/慢 trace。
 
-DHAT 是 Valgrind 的一部分，它可以精确地告诉你每一行代码分配了多少内存，以及这些内存的生命周期。
+**CPU 不高但 p99 很差，查什么？** 排队、off-CPU、调度、IRQ、缺页、锁和 I/O，并用同一事件的阶段时间定位。
 
-```bash
-# 需要安装 valgrind
-valgrind --tool=dhat ./target/release/hft_app
-```
+**保留 debug symbols 会不会让 Release 变成 Debug？** 不会改变优化级别，但会增大产物；要保持构建配置一致并验证布局/部署影响。
 
-它会指出“短命”的分配（Short-lived allocations），这通常是优化的低垂果实——应该把它们改为栈分配或对象池复用。
+验证清单：
 
-## 常见性能杀手
+- [ ] 症状、负载、时间窗和关键路径已定义；
+- [ ] build ID、符号和栈完整度可验证；
+- [ ] On-CPU、off-CPU 与硬件事件按症状选择；
+- [ ] 采样丢失、multiplex 和 profiler 开销有记录；
+- [ ] 结论来自慢样本关联，而非仅凭宽度猜测；
+- [ ] 改动有 A/B、正确性回归和回滚条件。
 
-在 Profiling Rust HFT 程序时，常见的瓶颈包括：
+---
 
-1.  **`memcpy` / `memmove`**：通常由 `Clone` 或不必要的 `match` 移动引起。
-2.  **`malloc` / `free`**：通常由 `Vec::push` 扩容或 `String` 拼接引起。
-3.  **`pthread_mutex_lock`**：锁竞争。
-4.  **`syscall`**：频繁的 `read`/`write` 或 `gettimeofday`（如果不是 vDSO）。
-
-## 总结
-
-- 先用 **FlameGraph** 找 CPU 热点。
-- 用 **Perf Events** 找缓存和分支预测问题。
-- 用 **Coz** 找真正的吞吐量瓶颈。
-- 用 **DHAT** 优化内存分配。
-- **永远不要猜测**。
+下一章：[CPU 亲和性与隔离](cpu_affinity.md)

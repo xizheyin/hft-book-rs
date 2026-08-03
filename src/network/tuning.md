@@ -1,175 +1,311 @@
-# TCP/UDP 调优 (TCP/UDP Tuning)
+# Linux 网络调优：从网卡计数器到应用队列
 
-在深入 Kernel Bypass 之前，我们首先要榨干标准内核协议栈的性能。很多时候，仅仅修改几行 `sysctl` 配置或 Socket 选项，就能带来显著的延迟降低。
+网络调优不是收集一份“神奇 sysctl 清单”。同一个参数可能降低空闲时延，也可能在 microburst 时制造丢包；可能改善吞吐，又让 P99.99 更差。
 
-## 1. 理论基础：TCP 的延迟杀手
+正确流程是：**画清路径 → 找到排队/丢包层 → 一次改变一个参数 → 用相同流量复测 → 保留回滚值**。
 
-TCP 协议设计之初是为了在不可靠的低速网络上提供可靠传输，而不是为了微秒级低延迟。因此，默认配置中包含了很多“延迟杀手”。
+本章讨论主机、NIC 和内核层。单连接读写与 `TCP_NODELAY` 见 [TCP 协议优化](tcp_optimization.md)。
 
-### 1.1 Nagle 算法 (Nagle's Algorithm)
-- **目的**：减少小包数量，提高网络利用率。
-- **机制**：如果发送的数据小于 MSS (Maximum Segment Size)，且之前发送的数据未被 ACK，则缓存该数据，直到凑满 MSS 或收到 ACK。
-- **HFT 影响**：极度致命。如果你发送一个 50 字节的订单，Nagle 可能会让你等待 40ms（典型的 Delayed ACK 超时）才发出去。
-- **解决**：必须禁用！设置 `TCP_NODELAY`。
+## 1. 一张图看懂可能慢在哪里
 
-### 1.2 延迟确认 (Delayed ACK)
-- **目的**：减少 ACK 包的数量，减轻网络负载。
-- **机制**：收到数据后不立即回复 ACK，而是等待几十毫秒，看是否有数据要发回（Piggybacking），或者等第二个数据包到达。
-- **HFT 影响**：增加 RTT (Round Trip Time)。
-- **解决**：在 Linux 上设置 `TCP_QUICKACK`（注意：每次 recv 后可能需要重新设置）。
-
-### 1.3 慢启动 (Slow Start)
-- **机制**：连接建立初期，拥塞窗口 (CWND) 很小，随着 ACK 逐渐增大。
-- **HFT 影响**：对于长连接（如 FIX 会话），这不是大问题。但对于新建连接，前几个包可能被阻塞。
-- **解决**：增大初始拥塞窗口 (`initcwnd`)。
-
-## 2. 核心实现：Socket 选项调优
-
-在 Rust 中，我们通常使用 `socket2` crate 来进行底层配置，或者直接在 `TcpStream` 上设置。
-
-```rust
-use std::net::TcpStream;
-use std::os::unix::io::AsRawFd;
-
-fn tune_socket(stream: &TcpStream) -> std::io::Result<()> {
-    // 1. 禁用 Nagle 算法 (最重要!)
-    stream.set_nodelay(true)?;
-
-    // 2. 设置非阻塞模式
-    stream.set_nonblocking(true)?;
-
-    // 3. 增大缓冲区 (避免填满导致阻塞/丢包)
-    // 注意：过大的缓冲区可能导致 Buffer Bloat (延迟增加)
-    // 对于 HFT，通常设置适中即可，如 256KB - 1MB
-    let buf_size = 1024 * 1024; 
-    // stream.set_recv_buffer_size(buf_size)?;
-    // stream.set_send_buffer_size(buf_size)?;
-    
-    // 4. 设置 QoS / TOS (Type of Service)
-    // 告诉路由器：这个包优先级最高 (Low Delay)
-    // 对应 IP 头部的 DSCP 字段
-    // 需要 libc
-    let fd = stream.as_raw_fd();
-    unsafe {
-        let iptos_lowdelay: i32 = 0x10;
-        let res = libc::setsockopt(
-            fd,
-            libc::IPPROTO_IP,
-            libc::IP_TOS,
-            &iptos_lowdelay as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&iptos_lowdelay) as u32,
-        );
-        if res < 0 {
-            // handle error
-        }
-        
-        // 5. 启用 TCP_BUSY_POLL (Linux 3.11+)
-        // 让内核在 recv 调用中忙轮询，而不是挂起等待中断
-        // 这可以显著降低延迟 (Latency) 和 抖动 (Jitter)
-        let busy_poll_us: i32 = 50; // 轮询 50us
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_BUSY_POLL,
-            &busy_poll_us as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&busy_poll_us) as u32,
-        );
-    }
-
-    Ok(())
-}
+```mermaid
+flowchart LR
+    A[Wire] --> B[NIC Rx FIFO]
+    B --> C[DMA Descriptor Ring]
+    C --> D[NAPI / SoftIRQ]
+    D --> E[内核 backlog 与协议栈]
+    E --> F[Socket Receive Queue]
+    F --> G[应用解析队列]
+    G --> H[策略]
 ```
 
-## 3. 操作系统级调优 (Sysctl)
+每一层都有不同证据：
 
-除了代码，还需要修改 `/etc/sysctl.conf`。
+| 层 | 典型现象 | 首先查看 |
+| :--- | :--- | :--- |
+| 交换机/链路 | CRC、pause、端口 drop | 交换机遥测、`ethtool -S` |
+| NIC/Rx ring | `rx_missed`、`no_buffer` 类计数增长 | 驱动统计、ring size |
+| NAPI/内核 | softnet drop、softirq 饱和 | `/proc/net/softnet_stat`、`/proc/softirqs` |
+| Socket | UDP `RcvbufErrors`、TCP zero window | `nstat`、`ss -u/-t -m` |
+| 应用 | 协议序列号 gap、队列变深 | 应用指标与回放日志 |
 
-### 3.1 缓冲区与队列
+计数器名字由 NIC 驱动决定，不能只 grep 一个固定字段就下结论。先保存 `ethtool -i eth0` 的驱动/固件信息，再阅读该驱动的统计含义。
+
+## 2. 先建立可重复的基线
+
+### 2.1 记录环境
 
 ```bash
-# 增大读写缓冲区上限
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.rmem_default = 16777216
-net.core.wmem_default = 16777216
-
-# 增大 backlog 队列 (防止 SYN Flood 攻击或瞬时高并发丢包)
-net.core.netdev_max_backlog = 50000
-net.ipv4.tcp_max_syn_backlog = 30000
+uname -a
+ethtool -i eth0
+ethtool -k eth0
+ethtool -c eth0
+ethtool -g eth0
+ethtool -l eth0
+lscpu -e=CPU,CORE,SOCKET,NODE,ONLINE
+cat /proc/interrupts
 ```
 
-### 3.2 TCP 行为
+还应记录 BIOS、电源策略、网卡固件、CPU/IRQ 绑定、NUMA、内核命令行和全部修改过的 sysctl。没有基线就无法知道下一次重启或固件升级改变了什么。
+
+### 2.2 使用真实负载形状
+
+平均包率相同，不代表负载相同：
+
+```text
+平均 100k packets/s
+
+平滑：每 10µs 来 1 个包
+突发：每 1ms 瞬间来 100 个包
+```
+
+HFT 更容易被 microburst 击中。测试工具应重现包大小、burst、单流/多流、组播数量和 CPU 消费速度，并报告完整延迟分位数与丢包。
+
+## 3. NIC 队列、中断合并与 Offload
+
+### 3.1 Descriptor ring
+
+Rx ring 是 NIC 与驱动共享的 descriptor 队列。ring 太小可能吸收不了 microburst；太大能减少丢包，却让故障时更多旧包排队，并不能修复消费速度长期不足。
 
 ```bash
-# 禁用慢启动重启 (Slow Start Restart)
-# 如果连接空闲一段时间，TCP 默认会重置 CWND，导致再次发送数据时变慢
-net.ipv4.tcp_slow_start_after_idle = 0
-
-# 启用 BBR 拥塞控制算法 (Linux 4.9+)
-# BBR 基于带宽和延迟探测，比传统的 CUBIC 更适合高吞吐低延迟网络
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-
-# 快速回收 TIME_WAIT 连接 (仅在特定场景下开启，NAT 环境慎用)
-net.ipv4.tcp_tw_reuse = 1
+# 只读查看当前值与硬件上限
+ethtool -g eth0
 ```
 
-## 4. UDP 调优 (Market Data)
+修改 ring 后要同时比较：NIC drop、应用 gap、延迟和内存/NUMA 位置。若持续输入速率超过处理能力，增大 ring 只会推迟失败。
 
-对于行情数据，我们通常使用 UDP (Multicast)。
+### 3.2 Interrupt coalescing
 
-### 4.1 接收缓冲区
+网卡可以等待若干包或若干微秒再发中断：
 
-UDP 没有流量控制。如果你的程序处理慢了，或者内核缓冲区满了，包就会被**直接丢弃**。
-这是 HFT 中最常见的丢包原因。
-
-**必须**将 UDP 接收缓冲区设置得足够大，以应对微突发 (Micro-bursts)。
-
-```rust
-use std::net::UdpSocket;
-
-fn tune_udp(socket: &UdpSocket) {
-    // 建议至少 8MB，甚至 32MB
-    let buf_size = 32 * 1024 * 1024;
-    // socket.set_recv_buffer_size(buf_size).expect("Failed to set recv buffer");
-    
-    // 实际上，setsockopt 设置的值会被内核加倍 (用于元数据)
-    // 并且受限于 net.core.rmem_max
-}
-```
-
-### 4.2 绑定特定网卡与 CPU
-
-多播流量通常巨大。如果不绑定 CPU，软中断 (SoftIRQ) 可能会在不同核心间跳动，导致缓存失效和乱序。
-
-- 使用 `taskset` 或 `numactl` 绑定进程。
-- 配置网卡多队列 (RSS, Receive Side Scaling)，将流量哈希到特定队列，并绑定中断到特定 CPU。
-
-## 5. 性能验证工具
-
-### 5.1 `sockperf`
-
-Google 开发的网络基准测试工具，专注于延迟。
+- 合并更多：中断少、吞吐高，但首包多等一会儿。
+- 合并更少：空闲时延可能下降，但高包率下 CPU/softirq 压力可能恶化长尾。
 
 ```bash
-# Server
-sockperf server
-
-# Client (测试 Ping-Pong 延迟)
-sockperf ping-pong -i 192.168.1.10 -t 10 --tcp
+# 查看，不修改
+ethtool -c eth0
 ```
 
-### 5.2 `netstat` / `ss` / `ethtool`
+不要直接假定 `rx-usecs 0` 最快。禁用 adaptive 模式后，从小值逐步扫描，并在高峰 burst 下确认没有中断风暴。
 
-监控丢包和错误：
+### 3.3 GRO/LRO、TSO/GSO 与 checksum offload
 
 ```bash
-# 查看 UDP 丢包 (RcvbufErrors)
-cat /proc/net/snmp | grep Udp
-
-# 查看网卡级丢包 (Ring buffer overflow)
-ethtool -S eth0 | grep drop
+ethtool -k eth0
 ```
 
-如果 `RcvbufErrors` 增加，说明你的应用程序处理太慢（或者调度不及时），导致 Socket 缓冲区溢出。
-如果 `rx_missed_errors` (网卡级) 增加，说明 PCIe 带宽不足或 CPU 根本来不及把包从网卡取走 -> 需要 Kernel Bypass (DPDK)。
+| 功能 | 作用 | 延迟测试重点 |
+| :--- | :--- | :--- |
+| GRO/LRO | 接收侧合并多个包 | 合并等待、包边界/时间戳可见性 |
+| TSO/GSO | 发送侧把大块数据后分段 | 小消息是否排队、CPU 与包率 |
+| Checksum offload | NIC 计算/验证校验和 | CPU 收益与抓包显示差异 |
+
+抓包中看到“bad checksum”不一定是线上坏包：发送包可能在 tcpdump 抓取时还没由 NIC 填入校验和。用接收端抓包、NIC 错误计数和 offload 状态交叉验证。
+
+## 4. RSS、IRQ 与 CPU/NUMA 对齐
+
+### 4.1 RSS 在做什么
+
+RSS（Receive Side Scaling）对报文头做 hash，把不同 flow 分配到不同 NIC Rx queue。它提高并行处理能力，但不会自动保证应用线程、IRQ 和内存位于正确位置。
+
+目标是让一条热流的路径尽量局部：
+
+```mermaid
+flowchart LR
+    A[Rx Queue 3] --> B[IRQ on CPU 6]
+    B --> C[SoftIRQ on CPU 6]
+    C --> D[App thread on CPU 6/nearby core]
+    D --> E[Memory on NIC NUMA node]
+```
+
+实际选择取决于应用：IRQ 和应用放同核可减少 cache 迁移，却可能互相抢占；放相邻专用核可隔离工作，却增加跨核交接。两种都要测。
+
+### 4.2 找到网卡的 NUMA 节点和 IRQ
+
+```bash
+cat /sys/class/net/eth0/device/numa_node
+grep -i eth0 /proc/interrupts
+cat /proc/irq/123/smp_affinity_list
+```
+
+配置前确认：
+
+- CPU 是物理核还是 SMT sibling。
+- NIC 所在 NUMA node。
+- `irqbalance` 是否会覆盖手工 affinity。
+- 进程、内存、大页和 DMA 是否跨 NUMA。
+
+`RPS/RFS` 是内核软件收包 steering，`XPS` 是发送侧选择队列。硬件 RSS 已满足时，额外软件 steering 可能增加跨核交接；虚拟机或队列受限环境中又可能有帮助。
+
+## 5. 内核 backlog 与 Socket 缓冲区
+
+### 5.1 先理解参数控制哪一层
+
+| 参数 | 控制对象 | 常见误解 |
+| :--- | :--- | :--- |
+| `net.core.netdev_max_backlog` | 内核来不及处理时的输入 backlog 上限 | 不是 TCP listen backlog |
+| `net.core.rmem_max` | socket 接收缓冲区可请求上限 | 不等于每个 socket 都自动用满 |
+| `net.core.wmem_max` | socket 发送缓冲区可请求上限 | 越大不一定越低延迟 |
+| `net.ipv4.tcp_max_syn_backlog` | 未完成握手的 SYN 队列 | 与 UDP 行情丢包无关 |
+| `somaxconn` | listen backlog 的上限之一 | 不影响已建立连接的收包队列 |
+
+只读检查：
+
+```bash
+sysctl net.core.netdev_max_backlog
+sysctl net.core.rmem_max net.core.wmem_max
+sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+```
+
+Linux 报告的 socket buffer 数值可能包含内核 bookkeeping，`setsockopt` 结果也受 autotuning、最小值和上限影响。程序启动后应通过 `getsockopt` 或 `ss -m` 读取实际值，而不是只相信配置文件。
+
+### 5.2 UDP 为什么需要 burst 余量
+
+UDP 没有 TCP 流量控制。socket receive queue 满后，新数据报会被丢弃。估算下限时可从 burst 开始：
+
+```text
+所需 payload 空间 ≈ 峰值数据率 × 应用最长不可调度时间
+```
+
+还要为内核元数据、多个组播流同时 burst 和安全余量留空间。buffer 再大也不能解决应用长期处理不过来的问题。
+
+检查：
+
+```bash
+nstat -az UdpRcvbufErrors UdpInErrors
+ss -u -a -m
+```
+
+### 5.3 TCP 缓冲区关注排队而非丢 UDP 包
+
+TCP 接收压力会通过窗口反馈给发送方；发送队列过深意味着旧业务消息在等待。观察 `ss -tinm` 中的 RTT、重传、拥塞窗口与内存队列，并结合应用 pending queue。不要把 TCP 和 UDP 的 buffer 策略混为一谈。
+
+## 6. 拥塞控制与 TIME_WAIT：不要用一句 sysctl 解决
+
+### 6.1 CUBIC、BBR 与专线
+
+BBR 通过估算瓶颈带宽和 RTT 建模，常用于高吞吐广域网；CUBIC 是许多 Linux 环境的默认选择。哪一个适合订单连接取决于 RTT、丢包、交换机队列、内核版本和对端。
+
+在低 RTT、低带宽用量的专线订单会话中，应用可能根本没有把拥塞窗口填满，此时更换算法不会神奇降低每条消息延迟。它还会改变与其他流的公平性和 queue 行为，必须与网络团队及对端共同验证。
+
+```bash
+sysctl net.ipv4.tcp_available_congestion_control
+sysctl net.ipv4.tcp_congestion_control
+```
+
+### 6.2 Slow start after idle
+
+`tcp_slow_start_after_idle=0` 有时用于避免长连接空闲后收缩拥塞窗口，但会让连接在网络条件变化后仍以旧速率突发。订单会话消息量小，收益可能有限。先从抓包或 `ss -ti` 证明 cwnd 确实是瓶颈。
+
+### 6.3 TIME_WAIT
+
+TIME_WAIT 保护旧重复报文不会污染新连接，并保证最后 ACK 有机会重传。大量 TIME_WAIT 应先检查为什么频繁创建短连接。
+
+`tcp_tw_reuse` 的行为随 Linux 版本、时间戳和 loopback 条件变化，不应描述为“快速回收 TIME_WAIT”。交易会话通常更应建立持久连接、做好重连节流和端口容量规划。
+
+## 7. 多播专项检查
+
+多播能否收到，不只是调用 `IP_ADD_MEMBERSHIP`：
+
+- 指定正确本地接口，避免 IGMP report 从管理口发出。
+- 验证 VLAN、IGMP snooping、querier 与组播路由。
+- 检查 source-specific multicast 时是否使用正确 source/group。
+- 一个 flow 应落到哪个 Rx queue，需要查看 NIC hash/filter 能力。
+- A/B feed 的序列号仲裁必须在应用层验证，不能只看包数。
+
+```bash
+ip maddr show dev eth0
+ip route get 239.1.2.3
+ethtool -n eth0 rx-flow-hash udp4
+```
+
+`tcpdump` 能看到包而应用仍然 gap，可能是抓包 tap 点在丢包层之前，也可能是应用解析/序列逻辑错误。对比 NIC、内核、socket 和应用四层计数器。
+
+## 8. MTU、时间戳与 Busy Poll
+
+### 8.1 MTU
+
+Jumbo frame 可提高大吞吐效率，但必须整条路径一致。HFT 小包不一定受益。验证时使用带 DF 的探测、交换机配置和真实协议包；不要只确认本机 `ip link` 显示 9000。
+
+### 8.2 时间戳
+
+- 软件时间戳靠近内核收包点，仍包含之前的 NIC/驱动延迟。
+- 硬件时间戳由 NIC 在更靠近线缆的位置记录，更适合单向延迟和审计。
+- 不同时间域（PHC、`CLOCK_REALTIME`、TSC）比较前必须同步和校准。
+
+错误时钟会让“优化后延迟降低”成为测量幻觉。
+
+### 8.3 Busy Poll
+
+`SO_BUSY_POLL`、NAPI busy polling 或用户态 busy loop 都在用 CPU 换唤醒延迟。要把 poll 预算、线程/IRQ affinity、功耗和同机服务公平性作为一个整体测试。若程序消费速度本来不足，忙轮询不会增加业务处理能力。
+
+## 9. 一次可审计的调优实验
+
+每项改动写一张实验卡：
+
+```text
+假设：Rx 中断合并造成空闲时 P99 多 4µs
+唯一改动：rx-usecs 从 8 调到 2
+固定条件：流量文件、包率、CPU/IRQ、频率、二进制、温度区间
+成功门槛：P99/P99.9 改善，0 丢包，CPU 不超过预算
+失败回滚：恢复 rx-usecs=8 与 adaptive-rx 原值
+证据：原始直方图、ethtool 统计、softirq、版本信息
+```
+
+推荐顺序：
+
+1. 保存原值和环境快照。
+2. 预热后运行多轮基线。
+3. 只改一个变量。
+4. A/B 交错运行，避免时间和温度偏差。
+5. 比较完整分布、CPU 和各层 drop。
+6. 达不到门槛就回滚，不保留“也许有用”的参数。
+
+## 10. 故障定位案例：行情 gap 增长
+
+不要直接把 buffer 调成 32MB。按层排查：
+
+```mermaid
+flowchart TD
+    A[应用检测到序列号 gap] --> B{交换机端口也丢?}
+    B -->|是| C[链路/拥塞/交换机队列]
+    B -->|否| D{NIC drop 增长?}
+    D -->|是| E[Rx ring/PCIe/IRQ/驱动]
+    D -->|否| F{softnet 或 UDP RcvbufErrors?}
+    F -->|softnet| G[NAPI预算/CPU/内核backlog]
+    F -->|socket| H[接收缓冲/应用未及时读取]
+    F -->|都没有| I[解析、A/B仲裁、序列号逻辑]
+```
+
+真实系统可能多层同时丢包，所以计数器要看**同一时间窗口的增量**，不能只看自开机以来的绝对值。
+
+## 11. 面试高频问答
+
+### Q1：你会如何降低 Linux UDP 行情接收延迟？
+
+先用硬件/应用时间戳建立基线并重现 burst；确认 NIC queue、IRQ、应用线程和 NUMA 对齐；评估中断合并、GRO 与 busy poll；给 Rx ring、内核 backlog 和 socket buffer 足够的 burst 余量；最后同时验证 P99.99、CPU 与 NIC/softnet/socket/application 四层丢包。
+
+### Q2：为什么 buffer 越大不一定越好？
+
+大 buffer 能吸收短 burst，却也允许旧数据排更久，掩盖消费速度不足。应按峰值数据率和最长调度间隙估算，再用队列深度与消息 age 设上限。
+
+### Q3：看到 `rx_missed_errors` 是否应该立刻上 DPDK？
+
+不应该。先确认该驱动字段语义，再检查 ring、IRQ affinity、CPU 饱和、PCIe/NUMA、固件和 burst。DPDK 是架构选择，会引入驱动接管、内存和运维复杂度，不是单个计数器的自动答案。
+
+### Q4：BBR 是否一定比 CUBIC 低延迟？
+
+不一定。BBR 主要是另一种拥塞模型，在高带宽长 RTT 环境常有价值；低负载订单会话可能并不受拥塞窗口限制。必须按目标内核、路径和对端用真实流量比较队列、重传和尾延迟。
+
+## 12. 最终检查清单
+
+- [ ] 已保存内核、驱动、固件、NIC、CPU/IRQ/NUMA 与 sysctl 基线。
+- [ ] 测试包含真实包大小和 microburst，不只看平均 packet rate。
+- [ ] NIC、softnet、socket 和应用序列号四层计数能关联同一时间窗口。
+- [ ] RSS queue、IRQ、应用线程和内存位置经过拓扑设计与实测。
+- [ ] ring、coalescing、offload 和 buffer 每次只改一项，并有回滚值。
+- [ ] TCP 拥塞控制和 TIME_WAIT 参数没有脱离实际瓶颈盲调。
+- [ ] 多播接口、VLAN、IGMP、A/B feed 与恢复流程均已验证。
+- [ ] 结论同时包含 P50 到 P99.99、CPU、队列深度和丢包，而非单个平均值。
+
+网络调优的专业性，不体现在你背了多少参数，而体现在你能把一个微秒或一个丢包定位到具体队列，并用可复现实验证明改动值得上线。

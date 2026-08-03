@@ -20,9 +20,9 @@
 
 一个常见的近似思路是把分配成本拆成两部分：
 
-\[
+<div class="formula" role="math" aria-label="allocation cost model">
 AllocationCost = FastPath + Contention + Reclamation
-\]
+</div>
 
 当对象规模较小且分配频繁时，真正的问题通常不是“单次 `malloc` 慢”，而是：
 

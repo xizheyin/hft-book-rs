@@ -1,160 +1,179 @@
 # 策略框架设计 (Strategy Framework Design)
 
-交易策略是 HFT 系统的“大脑”。一个优秀的策略框架应该让 Quant 能够专注于 Alpha 逻辑，而不用关心底层的网络通信、订单路由或风控细节。
+策略框架把可信市场状态转换为订单**意图**。它不应绕过预交易风控、直接篡改持仓，或把本地发送结果当作成交事实。
 
 ## 1. 设计目标
 
-1.  **极低延迟 (Ultra-Low Latency)**: 从收到 Market Data 到发出 Order 的路径必须是纳秒级的。
-2.  **安全性 (Safety)**: 必须防止策略发送非法订单（Fat Finger），这通常通过预交易风控（Pre-Trade Risk）实现。
-3.  **确定性 (Determinism)**: 相同的输入必须产生相同的输出，这对回测和调试至关重要。
-4.  **易用性 (Ergonomics)**: 提供清晰、类型安全的 API。
+1. **可测量的延迟**：在给定负载下满足 tick-to-intent / tick-to-trade 的 p50、p99 预算，而不是笼统要求“纳秒级”；
+2. **安全边界**：所有意图经过权限、风控、限流和最终网关；
+3. **可重放性**：相同初始状态、输入顺序、配置、时钟和随机种子应产生可比较结果；
+4. **明确所有权**：订单状态、持仓和风险分别有权威所有者；
+5. **易验证**：策略逻辑可在没有真实 socket 的环境中回放和故障注入。
 
-## 2. 核心架构：基于 Trait 的回调系统
+浮点运算、并发调度、外部时间和硬件差异都可能影响逐位确定性，因此面试中最好说明“业务输出确定”还是“bit-for-bit 确定”。
 
-我们使用 Rust 的 `trait` 来定义策略接口。为了实现零成本抽象，我们优先使用静态分发（泛型）。
-
-```rust
-pub trait Strategy {
-    // 市场数据回调
-    fn on_tick(&mut self, tick: &Tick);
-    fn on_order_book_update(&mut self, book: &OrderBook);
-    
-    // 订单状态回调
-    fn on_order_ack(&mut self, order_id: OrderId);
-    fn on_order_fill(&mut self, fill: &Fill);
-    fn on_order_reject(&mut self, reason: RejectReason);
-}
-```
-
-### 2.1 静态分发 vs 动态分发
-
-在 HFT 中，我们通常为每个策略编译一个独立的二进制文件，或者使用 Enum Dispatch，而不是 `Box<dyn Strategy>`。
+## 2. 基于事件与意图的接口
 
 ```rust
-// 推荐：静态分发
-struct Engine<S: Strategy> {
-    strategy: S,
-    risk_manager: RiskManager,
-    order_router: OrderRouter,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstrumentId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientOrderId(pub u64);
+
+#[derive(Debug, Clone, Copy)]
+pub struct MonoTime(pub u64);
+
+pub struct BookView {
+    pub sequence: u64,
+    pub is_live: bool,
 }
 
-impl<S: Strategy> Engine<S> {
-    #[inline(always)]
-    fn on_market_data(&mut self, data: MarketData) {
-        // 1. 更新内部状态
-        // 2. 调用策略
-        self.strategy.on_tick(&data.tick);
-    }
+pub enum OrderEvent { Ack, Reject, Fill { quantity: u64 }, CancelAck }
+pub struct NewOrderIntent { pub price_ticks: i64, pub quantity: u64 }
+pub struct LocalReject;
+pub struct OpenExposure { pub buy_qty: u64, pub sell_qty: u64 }
+
+pub trait Strategy<C: StrategyContext> {
+    fn on_book(&mut self, book: &BookView, ctx: &mut C);
+    fn on_timer(&mut self, now: MonoTime, ctx: &mut C);
+    fn on_order_event(&mut self, event: &OrderEvent, ctx: &mut C);
 }
-```
 
-这种方式允许编译器将 `on_tick` 完全内联到 Engine 的循环中，消除函数调用开销。
-
-## 3. 上下文与指令发送
-
-策略不应该直接持有网络 socket。相反，它应该通过一个 `Context` 对象与外界交互。这有助于单元测试和回测。
-
-```rust
 pub trait StrategyContext {
-    fn send_order(&mut self, order: NewOrder) -> Result<OrderId, RejectReason>;
-    fn cancel_order(&mut self, order_id: OrderId);
-    fn get_position(&self, symbol: Symbol) -> i64;
-}
-
-// 策略实现示例
-struct MyMarketMaker {
-    context: Box<dyn StrategyContext>, // 在这里使用动态分发是可以接受的，因为 send_order 不是热路径
-    // 或者使用泛型 Context
-}
-
-impl Strategy for MyMarketMaker {
-    fn on_tick(&mut self, tick: &Tick) {
-        if tick.price > 100.0 {
-            self.context.send_order(NewOrder::new(Side::Buy, 100.0, 10));
-        }
-    }
+    /// 成功只表示本地意图已被接受并分配 Client ID，不表示场所 ACK/Fill。
+    fn submit(&mut self, intent: NewOrderIntent) -> Result<ClientOrderId, LocalReject>;
+    fn cancel(&mut self, id: ClientOrderId) -> Result<(), LocalReject>;
+    fn confirmed_position(&self, instrument: InstrumentId) -> i64;
+    fn open_order_exposure(&self, instrument: InstrumentId) -> OpenExposure;
 }
 ```
 
-## 4. 避免内存分配
+`BookView` 应携带行情序号、市场状态和 `is_live`；仅有一个非空价格不代表数据可信。`StrategyContext` 提供的是持仓/订单权威状态的只读投影，真正更新由订单回报和成交处理器完成。
 
-在策略的热路径（Hot Path）中，绝对不能分配堆内存。
+## 3. 静态分发与动态分发
 
-### 4.1 预分配对象池
-对于 `NewOrder` 对象，不要每次都 `new`。使用对象池或者在栈上分配。
+泛型或 enum dispatch 可能让编译器内联小回调；选定具体 Context 后，`Box<dyn Strategy<LiveContext>>` 则支持运行时组合和较稳定的编译边界。动态调用并非必然慢到不可用，静态分发也不保证一定内联，还可能增大代码体积和指令缓存压力。
 
-### 4.2 避免 String
-使用 `FixedString<N>` 或者 `u64` 类型的 ID。
+选择方法：
 
-```rust
-// 错误
-struct Tick {
-    symbol: String, // 堆分配！
-}
+| 需求 | 可考虑 |
+| --- | --- |
+| 单一固定策略、极短回调 | 泛型/enum dispatch |
+| 插件化、运行时切换 | trait object 或进程隔离 |
+| 多策略共享网关 | 明确队列、额度和故障隔离 |
 
-// 正确
-struct Tick {
-    symbol_id: u64, // 映射到 Symbol Map
-    // 或者
-    symbol: [u8; 8],
-}
-```
+`submit` 很可能就在 tick-to-trade 关键路径上，不能因为调用频率比行情低就未经测量地断言动态分发“无影响”。用目标二进制和端到端负载比较。
 
-## 5. 状态管理与恢复
+## 4. 热路径分配的真实边界
 
-策略通常是有状态的（Stateful）。例如，它需要记住当前的持仓、未完成订单（Open Orders）以及一些计算指标（如移动平均线）。
+堆分配可能造成分配器竞争、缺页或尾延迟，因此常见做法是整数 `InstrumentId`、栈上小意图、预分配有界队列和缓冲复用。但“任何分配绝对禁止”过于绝对：控制面、启动期和冷拒绝路径可以选择更简单的实现。
 
-如果进程崩溃重启，如何恢复状态？
+关键问题是：
 
-1.  **持久化 (Persistence)**: 定期将状态序列化到共享内存或磁盘（太慢）。
-2.  **事件溯源 (Event Sourcing)**: 推荐。重启时，重放当天的所有 `Fill` 和 `Ack` 消息，重建内存状态。
+- 分配是否位于已定义的关键路径；
+- 峰值时对象池满了怎么办；
+- 是否会隐式扩容；
+- 复用槽位如何防止旧 ID 指向新对象；
+- 优化后 p99 是否真的改善。
 
-## 6. 实战：一个简单的做市策略
+对象池耗尽时不能默默覆盖活跃订单；应拒绝新意图或安全降级，并保留 Cancel/kill 通道。
 
-让我们实现一个最简单的做市策略：在最佳买卖价上各挂一个单子（Quoting）。
+## 5. 报价示例：先写状态机，再写价格公式
+
+下面只演示单侧订单生命周期，不代表可盈利策略。价格用整数 tick；真实报价还要处理库存、费用、市场状态、自成交和场所规则。
 
 ```rust
-struct SimpleMarketMaker<C: StrategyContext> {
-    ctx: C,
-    spread: f64,
-    qty: u32,
-    bid_order_id: Option<OrderId>,
-    ask_order_id: Option<OrderId>,
+# #[derive(Debug, Clone, Copy)]
+# struct ClientOrderId(u64);
+# struct NewOrderIntent;
+# impl NewOrderIntent { fn buy(_price_ticks: i64, _quantity: u64) -> Self { Self } }
+# struct LocalReject;
+# trait StrategyContext {
+#     fn submit(&mut self, intent: NewOrderIntent) -> Result<ClientOrderId, LocalReject>;
+#     fn cancel(&mut self, id: ClientOrderId) -> Result<(), LocalReject>;
+# }
+#[derive(Debug, Clone, Copy)]
+enum QuoteState {
+    Idle,
+    PendingNew { id: ClientOrderId, price_ticks: i64 },
+    Working { id: ClientOrderId, price_ticks: i64 },
+    PendingCancel { id: ClientOrderId },
 }
 
-impl<C: StrategyContext> Strategy for SimpleMarketMaker<C> {
-    fn on_order_book_update(&mut self, book: &OrderBook) {
-        let best_bid = book.best_bid();
-        let best_ask = book.best_ask();
-        
-        let target_bid = best_bid - self.spread;
-        let target_ask = best_ask + self.spread;
-
-        // 逻辑简化：如果价格变动超过阈值，撤单重发
-        if let Some(oid) = self.bid_order_id {
-            if (self.current_bid_price(oid) - target_bid).abs() > 0.01 {
-                self.ctx.cancel_order(oid);
-                self.bid_order_id = None; // 等待 CancelAck 再发新单？这就涉及复杂的状态机了
+fn on_target(
+    state: &mut QuoteState,
+    target_price_ticks: i64,
+    ctx: &mut impl StrategyContext,
+) {
+    match *state {
+        QuoteState::Idle => {
+            if let Ok(id) = ctx.submit(NewOrderIntent::buy(target_price_ticks, 10)) {
+                *state = QuoteState::PendingNew { id, price_ticks: target_price_ticks };
             }
-        } else {
-             self.bid_order_id = Some(self.ctx.send_order(NewOrder::buy(target_bid, self.qty)).unwrap());
         }
-        
-        // Ask 侧同理...
+        QuoteState::Working { id, price_ticks } if price_ticks != target_price_ticks => {
+            if ctx.cancel(id).is_ok() {
+                // 不把 id 清空：Cancel ACK 前旧单仍可能成交。
+                *state = QuoteState::PendingCancel { id };
+            }
+        }
+        QuoteState::PendingNew { .. } | QuoteState::PendingCancel { .. } => {
+            // 等权威事件；是否允许重叠替代单取决于额外风险预算和场所语义。
+        }
+        QuoteState::Working { .. } => {}
     }
 }
 ```
 
-## 7. 常见陷阱
+事件处理还必须覆盖：
 
-1.  **回调地狱 (Callback Hell)**:
-    异步编程（Future/Async）虽然在 Web 开发中很流行，但在 HFT 策略逻辑中，**状态机 (State Machine)** 模式通常比 Async/Await 更可控、更高效。不要在策略中使用 `async fn`。
+- New ACK：`PendingNew → Working`；
+- Reject：释放本地意图/风险，回到可决策状态；
+- Partial Fill：更新目标完成量，但订单可能仍 Working/PendingCancel；
+- Full Fill：进入终态，不再等待普通 Cancel ACK；
+- Cancel ACK：只释放确认的 leaves；
+- 连接断开：不能确定的订单进入 Unknown，并保留最坏风险。
 
-2.  **重复发送 (Double Sending)**:
-    如果没有正确处理 `Pending` 状态，策略可能会在收到 Ack 之前连续发送多个订单。必须维护订单的生命周期状态。
+绝不能在发出 Cancel 后立即把 `order_id = None`，否则下一个 tick 可能再发一张单，而旧单仍在场内。
 
-3.  **时间源问题**:
-    不要在策略中调用 `SystemTime::now()`。这会产生系统调用开销。应该由 Engine 传入当前的 Exchange Time 或由专门的 TSC 时钟线程提供的本地时间。
+## 6. 状态恢复：事件溯源不是只重放 ACK/Fill
+
+要重现策略决策，可能需要：
+
+- 原始或规范化行情及其序号；
+- 市场状态、定时器和本地可见时间；
+- 配置版本、模型版本和随机种子；
+- 订单意图、风控结果、实际发送消息；
+- ACK、Reject、Fill、Cancel ACK 和 bust/correct；
+- 初始持仓、人工动作和 kill 状态。
+
+重启时只重放本地事件仍不能证明场内订单状态；还要用会话重放、查询和独立 drop copy 对账。在恢复门禁通过前策略不应自动恢复普通新单。
+
+## 7. Async 与时间源
+
+`async fn` 适合大量等待型连接，但在单线程确定性事件循环里，显式状态机通常更容易控制分配、唤醒和事件顺序。这不是“策略中禁止 async”的语言规则；选择要看 I/O 模型、延迟目标和实测。
+
+策略最好由引擎注入时间，主要原因是语义和可重放性：
+
+- 交易所事件时间用于描述外部事件；
+- 单调本地时间用于超时和持续时间；
+- 墙上时间用于报表，不应直接驱动关键超时。
+
+`SystemTime::now()` 是否发生系统调用取决于平台实现；不能把禁用理由简化为“它一定很慢”。跨核 TSC 也必须验证稳定性与同步，不能凭线程缓存时间保证正确。
+
+## 8. 面试追问、易错点与验证
+
+**为什么策略不能直接持有 socket？** 隔离协议、风控和会话状态，使回放与单元测试可复用，并保证所有订单经过统一发送门。
+
+**相同行情一定产生相同订单吗？** 只有初始状态、配置、时钟、随机性、订单回报顺序等也相同时才可讨论；还要定义数值确定性级别。
+
+**静态分发一定更快吗？** 不一定。它可能内联，也可能造成代码膨胀；应看编译产物和端到端分布。
+
+易错点包括：把 `submit Ok` 当 ACK、把 ACK 当 Fill、Cancel 即清空 ID、策略维护另一份权威持仓、在 stale 行情上报价、使用浮点价格比较 tick，以及用固定纳秒要求替代延迟预算。
+
+验证应包含确定性双跑、行情重复/缺口、ACK/Fill 乱序、Cancel/Fill 竞态、对象池耗尽、限流、时钟跳变和 crash recovery。策略输出还需经过风险/合规审查；报价必须有真实交易意图。
 
 ---
-下一章：我们将探讨如何从市场数据中提取有价值的信号 —— [信号生成 (Signal Generation)](signals.md)。
+
+下一章：[信号生成 (Signal Generation)](signals.md)

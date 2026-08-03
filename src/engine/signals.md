@@ -1,151 +1,190 @@
 # 信号生成 (Signal Generation)
 
-在量化交易中，信号（Signal）是策略决策的输入。它将海量的、嘈杂的市场数据（Market Data）提炼为具有预测能力的指标。
+信号把市场数据转换成可供策略使用的特征或分数。中间价、订单簿不平衡、波动率和移动平均都可以是信号输入，但“被称为 signal”不代表它已经具有稳定预测能力。
 
-HFT 的信号生成有两个显著特点：
-1.  **极低延迟**: 必须在纳秒级完成计算。
-2.  **增量更新 (Incremental Updates)**: 不能每次都重算整个历史窗口，必须利用上一次的计算结果。
+延迟和更新方式取决于策略时间尺度与预算。增量计算常能减少工作量，但小窗口、低频控制路径或需要纠正漂移时，全量重算也可能更简单可靠。
 
-## 1. 信号流水线 (Signal Pipeline)
+## 1. 信号流水线
 
 ```mermaid
-graph LR
-    A[Market Data] --> B[Derived Data]
-    B --> C[Alpha Factors]
-    C --> D[Combined Signal]
-    D --> E[Execution]
+flowchart LR
+    A["带序号的可信行情"] --> B["清洗与派生数据"]
+    B --> C["单因子"]
+    C --> D["归一化 / 组合"]
+    D --> E["策略意图"]
+    E --> F["风控与执行"]
 ```
 
-*   **Derived Data**: 中间价 (Mid Price), 订单簿不平衡 (Imbalance), 加权均价 (VWAP)。
-*   **Alpha Factors**: 动量 (Momentum), 均值回归 (Mean Reversion), 波动率 (Volatility)。
-*   **Combined Signal**: 多因子加权打分。
+每个输出最好携带：输入行情序号、计算时间、配置/模型版本、是否 warm-up 完成和数据是否 live。这样策略不会把“默认值 0”误当成真实信号。
 
-## 2. 增量计算 (Incremental Calculation)
+## 2. EMA：O(1) 状态不等于永远适用
 
-### 2.1 指数移动平均 (EMA)
-EMA 是最适合 HFT 的指标，因为它不需要维护历史窗口，只需要上一个值。
-
-$$ EMA_t = \alpha \times Price_t + (1 - \alpha) \times EMA_{t-1} $$
+<div class="formula" role="math" aria-label="EMA 下标 t 等于 alpha 乘 x 下标 t，加上一减 alpha 乘 EMA 下标 t 减一">
+EMA<sub>t</sub> = αx<sub>t</sub> + (1 − α)EMA<sub>t−1</sub>
+</div>
 
 ```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalError { InvalidAlpha, NonFiniteInput }
+
 pub struct Ema {
     alpha: f64,
-    // 预计算 (1 - alpha) 以减少一次减法指令
     one_minus_alpha: f64,
-    value: f64,
-    initialized: bool,
+    value: Option<f64>,
 }
 
 impl Ema {
-    pub fn new(alpha: f64) -> Self {
-        Self {
-            alpha,
-            one_minus_alpha: 1.0 - alpha,
-            value: 0.0,
-            initialized: false,
+    pub fn new(alpha: f64) -> Result<Self, SignalError> {
+        if !alpha.is_finite() || !(0.0 < alpha && alpha <= 1.0) {
+            return Err(SignalError::InvalidAlpha);
         }
+        Ok(Self { alpha, one_minus_alpha: 1.0 - alpha, value: None })
     }
 
-    #[inline(always)]
-    pub fn update(&mut self, price: f64) -> f64 {
-        if !self.initialized {
-            self.value = price;
-            self.initialized = true;
-        } else {
-            // FMA (Fused Multiply-Add) 指令优化
-            // value = alpha * price + (1-alpha) * value
-            self.value = price.mul_add(self.alpha, self.value * self.one_minus_alpha);
+    pub fn update(&mut self, x: f64) -> Result<f64, SignalError> {
+        if !x.is_finite() {
+            return Err(SignalError::NonFiniteInput);
         }
-        self.value
+        let next = match self.value {
+            None => x,
+            Some(old) => x.mul_add(self.alpha, old * self.one_minus_alpha),
+        };
+        if !next.is_finite() {
+            return Err(SignalError::NonFiniteInput);
+        }
+        self.value = Some(next);
+        Ok(next)
     }
 }
 ```
 
-### 2.2 滑动窗口 (Sliding Window)
-对于简单移动平均 (SMA) 或最大/最小值，我们需要维护一个窗口。
-**Ring Buffer** 是最佳选择。
+初始化方式会影响前几个输出。也可以用历史均值 warm-up；无论哪种，都应在研究和生产中保持一致，并记录何时从 warming 进入 live。
+
+“预计算一次减法”是否有可测收益取决于编译器和关键路径，不应凭源码行数断言。
+
+## 3. 滑动窗口：先处理未填满和零容量
 
 ```rust
 pub struct SlidingWindowSum {
-    window: Vec<f64>, // 或使用 const generics [f64; N]
+    values: Vec<f64>,
     head: usize,
+    len: usize,
     sum: f64,
-    capacity: usize,
 }
 
 impl SlidingWindowSum {
-    pub fn update(&mut self, new_val: f64) -> f64 {
-        let old_val = self.window[self.head];
-        self.window[self.head] = new_val;
-        
-        // 增量更新 Sum: Sum_new = Sum_old - x_out + x_in
-        self.sum = self.sum - old_val + new_val;
-        
-        self.head = (self.head + 1) % self.capacity;
-        self.sum
+    pub fn new(capacity: usize) -> Option<Self> {
+        (capacity > 0).then(|| Self {
+            values: vec![0.0; capacity],
+            head: 0,
+            len: 0,
+            sum: 0.0,
+        })
     }
-}
-```
-**注意**: 浮点数累加 `sum` 可能会产生精度漂移 (Catastrophic Cancellation)。建议每隔 N 次 update 重新全量求和一次 (Re-normalization)。
 
-## 3. 复杂信号优化：线性回归 (Linear Regression)
-
-假设我们需要计算价格关于时间的斜率（Slope）。
-$$ y = kx + b $$
-使用最小二乘法，可以在 $O(1)$ 时间内更新斜率。我们需要维护四个累加和：
-*   $\sum x$, $\sum y$, $\sum x^2$, $\sum xy$
-
-当新数据点进入、旧数据点移出时，更新这 4 个 Sum 即可直接算出 $k$ 和 $b$。
-
-## 4. SIMD 加速
-
-如果需要同时计算 4 个不同周期的 EMA，或者为 4 个不同的 Symbol 计算同一个指标，可以使用 SIMD (Single Instruction Multiple Data)。
-
-```rust
-#![feature(portable_simd)]
-use std::simd::{f64x4, Simd};
-
-pub struct SimdEma4 {
-    alphas: f64x4,
-    one_minus_alphas: f64x4,
-    values: f64x4,
-}
-
-impl SimdEma4 {
-    pub fn new(alphas: [f64; 4]) -> Self {
-        let alphas = f64x4::from_array(alphas);
-        let one = f64x4::splat(1.0);
-        Self {
-            alphas,
-            one_minus_alphas: one - alphas,
-            values: f64x4::splat(0.0),
+    pub fn push(&mut self, x: f64) -> Option<f64> {
+        if !x.is_finite() {
+            return None;
         }
+        let outgoing = if self.len < self.values.len() {
+            0.0
+        } else {
+            self.values[self.head]
+        };
+        let next_sum = self.sum - outgoing + x;
+        if !next_sum.is_finite() {
+            return None;
+        }
+        self.len = (self.len + 1).min(self.values.len());
+        self.values[self.head] = x;
+        self.sum = next_sum;
+        self.head = (self.head + 1) % self.values.len();
+        Some(self.sum)
     }
 
-    #[inline(always)]
-    pub fn update(&mut self, prices: f64x4) -> f64x4 {
-        // 并行计算 4 个 EMA
-        // value = price * alpha + value * (1 - alpha)
-        self.values = prices * self.alphas + self.values * self.one_minus_alphas;
-        self.values
+    pub fn mean(&self) -> Option<f64> {
+        (self.len > 0).then(|| self.sum / self.len as f64)
     }
 }
 ```
 
-## 5. 信号合成与归一化 (Composition & Normalization)
+浮点增减会随时间积累舍入误差。可以按固定次数或误差监控周期重新求和，并在测试中与高精度/朴素参考实现比较。若信号用于价格合法性或资金账本，应使用明确的定点口径；研究特征使用浮点也要处理 NaN、Infinity 和平台差异。
 
-原始信号（如价格差）的量纲各异，通常需要归一化为 Z-Score：
-$$ Z = \frac{x - \mu}{\sigma} $$
+Ring buffer 是常见选择，不是所有窗口的“最佳结构”。滑动最大/最小通常需要单调队列；时间窗口还要处理不规则时间戳和过期多个元素。
 
-其中 $\mu$ 和 $\sigma$ 也可以使用增量算法（Welford's Online Algorithm）实时更新。
+## 4. 滑动线性回归的隐藏细节
 
-最终的交易信号通常是多个因子的加权和：
+最小二乘可维护 `Σx、Σy、Σx²、Σxy` 来减少每次更新工作，但要先说明：
+
+- `x` 是绝对时间、相对索引还是事件序号；
+- 窗口滑动时旧点移出和索引重编号怎样处理；
+- 大时间戳会导致数值消减，通常应中心化；
+- 分母接近 0 时不能输出无穷斜率；
+- 乱序/重复数据怎样处理。
+
+“维护四个和便严格 O(1)”只在定义好的固定窗口算法和数值口径下成立。用朴素 O(N) 版本作为 oracle 做随机对比更可靠。
+
+## 5. SIMD 不是默认优化
+
+SIMD 适合相同操作作用于多个独立因子/标的，前提是数据布局、批大小和关键路径允许。它可能带来：
+
+- 为凑齐向量而等待，增加单事件延迟；
+- 不同标的分支/缺失值导致 lane 利用率低；
+- 对齐、跨平台和浮点结果差异；
+- nightly `portable_simd` 或架构 intrinsic 的工具链维护成本。
+
+先让编译器自动向量化并查看产物，再比较标量、批处理和 SIMD 的端到端 p50/p99。不要为了展示指令集引入没有收益的 `unsafe`。
+
+## 6. 归一化与组合
+
+Z-score：
+
+<div class="formula" role="math" aria-label="z 等于 x 减均值 mu，再除以标准差 sigma">
+z = (x − μ) / σ
+</div>
+
+当样本不足或 `σ` 接近 0 时，输出无定义；应进入 warming/invalid，而不是除以 0。Welford 算法适合在线累计均值和方差，但“从开盘到现在”的统计与“最近 N 个样本”的滚动统计不是同一个东西。
+
 ```rust
-#[inline(always)]
-fn combine_signals(factors: &[f64], weights: &[f64]) -> f64 {
-    // 自动向量化友好
-    factors.iter().zip(weights).map(|(f, w)| f * w).sum()
+fn weighted_sum(factors: &[f64], weights: &[f64]) -> Option<f64> {
+    if factors.is_empty()
+        || factors.len() != weights.len()
+        || factors.iter().chain(weights).any(|x| !x.is_finite())
+    {
+        return None;
+    }
+    let result: f64 = factors.iter().zip(weights).map(|(f, w)| f * w).sum();
+    result.is_finite().then_some(result)
 }
 ```
 
-通过预计算权重和因子布局（SoA），这个操作可以在极少的 CPU 周期内完成。
+静默 `zip` 不等长切断会漏掉因子，所以先检查长度。组合前还要处理量纲、相关性、异常值、模型版本和缺失因子策略。
+
+## 7. 研究结果怎样进入生产
+
+至少验证：
+
+- 没有 future leakage：只使用当时已经可见的数据；
+- 训练、回放和生产使用相同事件顺序、warm-up 与缺失值规则；
+- 加入费用、延迟、成交模型和容量约束后仍理解结果变化；
+- 在多个时间段/市场状态做样本外检验，并报告不确定性；
+- 信号失效、行情 stale 或模型文件损坏时能 fail closed/安全降级；
+- 监控输入分布、输出饱和、NaN、漂移和决策覆盖率。
+
+统计相关不等于因果，更不保证未来收益。部署信号还要遵守数据许可、交易规则和公司模型治理。
+
+## 8. 面试追问与易错点
+
+**增量算法为什么仍要全量重算？** 用于控制浮点漂移、恢复状态和验证实现；全量版本也是很好的测试 oracle。
+
+**为什么不让 invalid signal 返回 0？** 0 可能是有意义的中性值，会掩盖数据缺失；显式 `Option/Result` 或状态位更安全。
+
+**SIMD 一定降低 tick-to-trade 吗？** 不一定。批处理等待和数据搬运可能抵消计算收益，必须测端到端分布。
+
+易错点包括：alpha 越界、窗口容量为 0、未 warm-up 就交易、NaN 传播、Z-score 除零、绝对时间导致回归数值不稳、`zip` 静默截断，以及把订单簿不平衡度描述成必然价格方向。
+
+验证应使用边界单测、随机序列对比朴素实现、确定性重放、数据缺口/乱序、长时间漂移和目标硬件基准；上线后持续做输入与输出分布监控。
+
+---
+
+下一章：[执行算法 (Execution Algos)](execution.md)
