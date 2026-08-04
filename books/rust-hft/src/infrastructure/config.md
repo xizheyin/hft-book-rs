@@ -193,4 +193,4 @@ if let Err(message) = invalid.validate() {
 - [notify Crate](https://github.com/notify-rs/notify) - 比轮询更高效的文件系统监控。
 
 ---
-**基础设施篇完结**。接下来我们将进入 **[网络篇 (Network)](../network/README.md)**，探讨如何处理 TCP/UDP 数据流。
+**基础设施篇完结**。接下来我们将进入 **[网络篇 (Network)](../network/index.html)**，探讨如何处理 TCP/UDP 数据流。

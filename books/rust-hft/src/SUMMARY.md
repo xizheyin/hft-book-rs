@@ -1,6 +1,7 @@
 # Summary
 
-[前言：这本书解决什么问题](introduction/README.md)
+- [首页：Rust 与 HFT 基础宝典](README.md)
+- [前言：这本书解决什么问题](introduction/README.md)
 - [如何使用本书：从零基础到面试表达](introduction/how_to_use.md)
 - [为什么选择 Rust 构建低延迟系统](introduction/why_rust.md)
 - [低延迟系统 Rust 生态概览](introduction/ecosystem.md)

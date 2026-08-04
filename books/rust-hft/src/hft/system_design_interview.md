@@ -191,7 +191,7 @@ enum FeedState {
 - 断线重连、会话恢复和订单查询；
 - 产出审计事件。
 
-详细状态机见[HFT 总览](README.md)与[订单类型与撮合优先级](orders_matching.md)。
+详细状态机见[HFT 总览](index.html)与[订单类型与撮合优先级](orders_matching.md)。
 
 ## 7. 核心数据模型与不变量
 

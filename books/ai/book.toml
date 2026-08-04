@@ -1,0 +1,17 @@
+[book]
+authors = ["AI 学习团队"]
+language = "zh-CN"
+src = "src"
+title = "DeepSeek AI Agent Infra 面试宝典"
+description = "从 LLM 与 Agent Harness 到沙箱云平台、可靠性和个性化面试实战的中文宝典"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+site-url = "/hft-book-rs/ai/"
+mathjax-support = true
+additional-css = ["theme/custom.css"]
+additional-js = ["mermaid.min.js", "mermaid-init.js", "theme/custom.js"]
+git-repository-url = "https://github.com/xizheyin/hft-book-rs"
+edit-url-template = "https://github.com/xizheyin/hft-book-rs/edit/main/books/ai/{path}"

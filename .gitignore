@@ -2,4 +2,7 @@
 !.github/
 
 book/
+site/
+books/rust-hft/book/
+books/ai/book/
 temp/

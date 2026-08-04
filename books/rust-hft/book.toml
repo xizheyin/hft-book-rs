@@ -1,0 +1,16 @@
+[book]
+authors = ["Rust · HFT 学习团队"]
+language = "zh-CN"
+src = "src"
+title = "Rust 与 HFT 基础宝典"
+description = "面向零基础求职者的 Rust、HFT、低延迟工程与系统设计面试宝典"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+site-url = "/hft-book-rs/rust-hft/"
+additional-css = ["theme/custom.css"]
+additional-js = ["mermaid.min.js", "mermaid-init.js", "theme/custom.js"]
+git-repository-url = "https://github.com/xizheyin/hft-book-rs"
+edit-url-template = "https://github.com/xizheyin/hft-book-rs/edit/main/books/rust-hft/{path}"

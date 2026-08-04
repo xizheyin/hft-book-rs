@@ -1,6 +1,17 @@
 # 内容贡献规范
 
-这本书面向第一次接触项目细节的读者。新增或修改章节时，不要默认读者已经懂金融、Rust、Linux 或低延迟术语。
+这套书面向第一次接触项目细节的读者。新增或修改章节时，不要默认读者已经懂金融、Rust、Linux、低延迟或 AI 术语。
+
+## 两本书放在哪里
+
+仓库使用同一套 mdBook 工具链，但内容分成两本可以独立阅读的书：
+
+- `books/rust-hft/`：Rust 与 HFT；章节放入 `books/rust-hft/src/`，目录维护在 `books/rust-hft/src/SUMMARY.md`。
+- `books/ai/`：AI；章节放入 `books/ai/src/`，目录维护在 `books/ai/src/SUMMARY.md`。
+- `shared/theme/`：两本书共用的样式、交互和 `noindex` 页面头。
+- `portal/`：部署后的总入口，只负责把读者带到两本子书。
+
+不要把一本书的 Markdown 文件复制到另一本书。跨书引用应链接部署后的 HTML 页面，例如 AI 首页引用 Rust 生命周期章节时使用 `../rust-hft/rust_advanced/lifetimes.html`。
 
 ## 一章的推荐结构
 
@@ -60,17 +71,26 @@
 
 ```bash
 python3 scripts/check_book.py
-mdbook test
-mdbook build
+mdbook test books/rust-hft
+mdbook test books/ai
+
+BOOK_SITE_ROOT="$(pwd)/site"
+mkdir -p "$BOOK_SITE_ROOT"
+cp -R portal/. "$BOOK_SITE_ROOT/"
+mdbook build books/rust-hft -d "$BOOK_SITE_ROOT/rust-hft"
+mdbook build books/ai -d "$BOOK_SITE_ROOT/ai"
+python3 scripts/create_legacy_redirects.py "$BOOK_SITE_ROOT"
+python3 scripts/check_site.py "$BOOK_SITE_ROOT"
+
 git diff --check
 ```
 
 还要人工确认：
 
-- 新章节已加入 `src/SUMMARY.md`；
+- 新章节已加入对应子书的 `src/SUMMARY.md`；
 - 每章只有一个一级标题；
-- 内部链接和折叠块完整；
+- 书内链接、跨书链接和折叠块完整；
 - 深色/浅色、桌面/移动端无明显布局问题；
-- 构建出的每个 HTML 页面都保留 `<meta name="robots" content="noindex, ...">`。
+- 总入口和两本书构建出的每个 HTML 页面都保留 `<meta name="robots" content="noindex, ...">`。
 
 `noindex` 不是权限控制。若内容必须保密，应使用认证或私有托管。

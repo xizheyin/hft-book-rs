@@ -571,4 +571,4 @@ BBO：`99.98 × 120 / 100.02 × 80`。
 
 ---
 
-上一章：[HFT 系统设计面试](system_design_interview.md) ｜ 回到：[HFT 总览与交易生命周期](README.md)
+上一章：[HFT 系统设计面试](system_design_interview.md) ｜ 回到：[HFT 总览与交易生命周期](index.html)
