@@ -60,7 +60,32 @@
 - [编译优化、基准与诊断工具](cpp/optimization_tooling.md)
 - [C++ HFT 贯穿项目](cpp/hft_capstone.md)
 
-# 第五部分：吞吐量、并发与基础设施
+# 第五部分：算法笔试与面试编码
+
+- [部分导论：从思路到 C++20](algorithms/README.md)
+- [从题目到算法：一套固定解题流程](algorithms/problem_solving.md)
+- [复杂度、正确性与测试](algorithms/complexity_correctness.md)
+- [C++20 算法解题工具箱](algorithms/cpp_toolbox.md)
+- [在线笔试输入输出与提交模式](algorithms/online_judge_io.md)
+- [数组、字符串与线性模式](algorithms/arrays_strings.md)
+- [字符串解析、KMP 与 Trie](algorithms/string_algorithms.md)
+- [哈希、排序、区间与二分](algorithms/hashing_binary_search.md)
+- [排序、分区与选择](algorithms/sorting_selection.md)
+- [栈、队列、双端队列与堆](algorithms/stack_queue_heap.md)
+- [链表、递归与树](algorithms/linked_list_tree.md)
+- [图、并查集、最短路与回溯](algorithms/graph_search.md)
+- [贪心与动态规划](algorithms/greedy_dp.md)
+- [动态规划核心模式](algorithms/dp_patterns.md)
+- [位运算与数值算法](algorithms/bit_math.md)
+- [流式与工程算法](algorithms/streaming_systems.md)
+- [进阶数据结构与图算法（按岗位选学）](algorithms/advanced_structures.md)
+- [基础设施与量化岗位场景综合题](algorithms/company_scenarios.md)
+- [限时模拟笔试与面试](algorithms/mock_exams.md)
+- [追加盲测卷：完整输入输出与陌生组合](algorithms/mock_exams_extra.md)
+- [算法模式覆盖矩阵](algorithms/coverage_matrix.md)
+- [8 周、28 天与 14 天训练计划](algorithms/study_plan.md)
+
+# 第六部分：吞吐量、并发与基础设施
 
 - [部分导论](infrastructure/README.md)
 - [原子操作详解](infrastructure/atomics.md)
@@ -74,7 +99,7 @@
 - [配置管理与热加载](infrastructure/config.md)
 - [指标监控与遥测](infrastructure/metrics.md)
 
-# 第六部分：网络与高性能 I/O
+# 第七部分：网络与高性能 I/O
 
 - [部分导论](network/README.md)
 - [网络协议栈基础](network/basics.md)
@@ -88,7 +113,7 @@
   - [Solarflare OpenOnload](network/openonload.md)
 - [Linux 网络调优](network/tuning.md)
 
-# 第七部分：行情、协议与订单接入
+# 第八部分：行情、协议与订单接入
 
 - [电子市场协议概览](connectivity/protocols.md)
   - [FIX 协议解析](connectivity/fix.md)
@@ -98,7 +123,7 @@
   - [增量更新、快照与恢复](connectivity/incremental_updates.md)
 - [订单路由系统](connectivity/order_routing.md)
 
-# 第八部分：交易引擎、风控与策略
+# 第九部分：交易引擎、风控与策略
 
 - [订单簿管理](engine/order_book.md)
 - [风控系统](engine/risk.md)
@@ -108,7 +133,7 @@
   - [信号生成](engine/signals.md)
   - [执行算法](engine/execution.md)
 
-# 第九部分：性能工程、测试与仿真
+# 第十部分：性能工程、测试与仿真
 
 - [基准测试](optimization/benchmarking.md)
 - [性能分析](optimization/profiling.md)

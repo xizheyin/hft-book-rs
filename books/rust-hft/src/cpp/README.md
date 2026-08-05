@@ -44,7 +44,9 @@ flowchart LR
 5. **[智能指针](smart_pointers.md)**：用类型表达独占、共享和弱观察关系。
 6. **[STL 成本模型](stl_cost_model.md)**：会使用 `vector`、`array`、`string`、映射和算法，同时知道分配、扩容与缓存局部性。
 
-接下来再读[模板与多态](templates_polymorphism.md)、[内存布局](memory_layout.md)、[错误与未定义行为](errors_ub.md)、[原子内存模型](atomics_memory_model.md)、[无锁结构](lock_free.md)、[分配器与零拷贝](allocators_zero_copy.md)以及[优化工具](optimization_tooling.md)。最后用 [C++ HFT 贯穿项目](hft_capstone.md)把行情、订单簿、信号、风控和网关串起来。这种顺序不是为了拖慢进度，而是因为高阶内容都建立在“对象何时存在、谁负责释放、访问是否仍然有效”之上。
+完成 STL 后，若目标包含笔试或现场编码，可以立即进入[算法笔试与面试编码专题](../algorithms/)。算法专题会把题意翻译、暴力基线、不变量、伪代码、复杂度、C++20 和测试串成同一条解题链；不必等到学完无锁编程才开始。
+
+系统开发主线接下来再读[模板与多态](templates_polymorphism.md)、[内存布局](memory_layout.md)、[错误与未定义行为](errors_ub.md)、[原子内存模型](atomics_memory_model.md)、[无锁结构](lock_free.md)、[分配器与零拷贝](allocators_zero_copy.md)以及[优化工具](optimization_tooling.md)。最后用 [C++ HFT 贯穿项目](hft_capstone.md)把行情、订单簿、信号、风控和网关串起来。这种顺序不是为了拖慢进度，而是因为高阶内容都建立在“对象何时存在、谁负责释放、访问是否仍然有效”之上。
 
 如果你正准备求职，可以直接使用[六周面试学习路线](interview_roadmap.md)安排每天的阅读、编码和自测。
 

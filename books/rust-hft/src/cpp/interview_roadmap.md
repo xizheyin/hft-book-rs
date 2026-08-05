@@ -28,6 +28,8 @@ c++ -std=c++20 -fsanitize=address,undefined -g hello.cpp -o hello_san
 
 此时不用先学会复杂 CMake。先能完成“编辑 → 编译 → 运行 → 看懂第一条错误信息”的闭环。
 
+如果面试包含限时算法笔试或现场编码，还要并行使用[算法笔试与面试编码专题](../algorithms/)。本章六周主线解决 C++ 与低延迟系统能力，算法专题解决数组、哈希、堆、树图、动态规划以及“伪代码怎样变成正确 C++”；两者不能互相替代。完整算法安排见[8 周、28 天与 14 天训练计划](../algorithms/study_plan.md)。
+
 ## 3. 六周主线
 
 每天建议 60–90 分钟。如果时间更少，延长周数，不要跳过练习。
@@ -70,6 +72,8 @@ c++ -std=c++20 -fsanitize=address,undefined -g hello.cpp -o hello_san
 - 用 `sizeof`、`alignof` 观察字段顺序带来的布局变化。
 
 **周末产出**：给订单簿选择容器，并主动说明未知条件和验证方案。
+
+若要参加算法轮，本周起至少完成算法专题中的[固定解题流程](../algorithms/problem_solving.md)、[复杂度与正确性](../algorithms/complexity_correctness.md)和[数组与字符串](../algorithms/arrays_strings.md)，每题必须从空白文件写出并测试。
 
 ### 第 4 周：理解并发正确性
 
