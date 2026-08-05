@@ -42,6 +42,7 @@
 # 第四部分：现代 C++ 与低延迟开发
 
 - [部分导论：从零认识现代 C++](cpp/README.md)
+- [C++ 基础复习：重新找回手感](cpp/basics_refresher.md)
 - [C++ 量化与 HFT 面试学习路线](cpp/interview_roadmap.md)
 - [C++ 最小语法与数据建模](cpp/minimal_syntax.md)
 - [编译、链接与内存地图](cpp/compilation_memory.md)

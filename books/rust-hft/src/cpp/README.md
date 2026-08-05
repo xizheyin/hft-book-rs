@@ -27,15 +27,22 @@ flowchart LR
 
 ## 学习路线
 
-建议按下面的顺序阅读。后面的章节会使用前面已经解释过的词，但不会默认你了解本书其他部分的项目细节。
+不用让“零基础读者”和“学过但忘了的读者”走完全相同的起点：
 
-1. **[最小语法与数据建模](minimal_syntax.md)**：先学会读变量、函数、判断、循环、`struct` 和 `class`，不要求任何 C 语言基础。
-2. **[编译、链接与内存直觉](compilation_memory.md)**：知道代码如何变成程序，区分自动存储期、动态存储期和静态存储期。
-3. **[指针、引用与 `const`](pointers_references.md)**：知道“对象”和“对象的地址”不是一回事，能表达可空与不可空的借用。
-4. **[RAII 与生命周期](raii_lifetime.md)**：让资源跟着对象自动释放，理解构造和析构。
-5. **[复制与移动](copy_move.md)**：看懂对象为什么有时被复制、有时转移资源，以及 `std::move` 到底做了什么。
-6. **[智能指针](smart_pointers.md)**：用类型表达独占、共享和弱观察关系。
-7. **[STL 成本模型](stl_cost_model.md)**：会使用 `vector`、`array`、`string`、映射和算法，同时知道分配、扩容与缓存局部性。
+| 你的状态 | 先从哪里开始 |
+|---|---|
+| 完全没学过 C/C++ | 先读[最小语法与数据建模](minimal_syntax.md)，再用[基础复习](basics_refresher.md)亲手练一遍 |
+| 以前写过，但很久没写 | 直接进入[基础复习：重新找回手感](basics_refresher.md)，不会的地方再回查最小语法 |
+| 基础还在，正在准备面试 | 先用基础复习中的 30～90 分钟诊断查漏，再进入[六周面试路线](interview_roadmap.md) |
+
+基础恢复后，再沿共同主线阅读。后面的章节会使用前面已经解释过的词，但不会默认你了解本书其他部分的项目细节。
+
+1. **[编译、链接与内存直觉](compilation_memory.md)**：知道代码如何变成程序，区分自动存储期、动态存储期和静态存储期。
+2. **[指针、引用与 `const`](pointers_references.md)**：知道“对象”和“对象的地址”不是一回事，能表达可空与不可空的借用。
+3. **[RAII 与生命周期](raii_lifetime.md)**：让资源跟着对象自动释放，理解构造和析构。
+4. **[复制与移动](copy_move.md)**：看懂对象为什么有时被复制、有时转移资源，以及 `std::move` 到底做了什么。
+5. **[智能指针](smart_pointers.md)**：用类型表达独占、共享和弱观察关系。
+6. **[STL 成本模型](stl_cost_model.md)**：会使用 `vector`、`array`、`string`、映射和算法，同时知道分配、扩容与缓存局部性。
 
 接下来再读[模板与多态](templates_polymorphism.md)、[内存布局](memory_layout.md)、[错误与未定义行为](errors_ub.md)、[原子内存模型](atomics_memory_model.md)、[无锁结构](lock_free.md)、[分配器与零拷贝](allocators_zero_copy.md)以及[优化工具](optimization_tooling.md)。最后用 [C++ HFT 贯穿项目](hft_capstone.md)把行情、订单簿、信号、风控和网关串起来。这种顺序不是为了拖慢进度，而是因为高阶内容都建立在“对象何时存在、谁负责释放、访问是否仍然有效”之上。
 

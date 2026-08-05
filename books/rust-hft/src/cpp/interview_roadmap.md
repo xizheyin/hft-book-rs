@@ -34,7 +34,7 @@ c++ -std=c++20 -fsanitize=address,undefined -g hello.cpp -o hello_san
 
 ### 第 1 周：知道代码怎样变成程序
 
-阅读：[最小语法与数据建模](minimal_syntax.md)、[编译与内存](compilation_memory.md)、[指针与引用](pointers_references.md)。
+阅读：[基础复习：重新找回手感](basics_refresher.md)、[编译与内存](compilation_memory.md)、[指针与引用](pointers_references.md)。如果基础复习中的语法已经完全陌生，先把[最小语法与数据建模](minimal_syntax.md)当作详细教材补读。
 
 你要完成：
 
