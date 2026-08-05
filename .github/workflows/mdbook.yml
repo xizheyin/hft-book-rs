@@ -40,6 +40,9 @@ jobs:
           mdbook test books/rust-hft
           mdbook test books/ai
 
+      - name: Compile standalone C++20 examples
+        run: python3 scripts/check_cpp_examples.py --compiler g++
+
       - name: Assemble portal and both books
         run: |
           test -f portal/index.html

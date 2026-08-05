@@ -129,7 +129,8 @@ HFT 的 C++ 代码通常大量使用模板来实现编译期多态（CRTP, SFINA
 *   **挑战**: 绑定工具通常不能把任意模板定义原样暴露为 Rust 泛型。像 `OrderBook<NYSE>` 这样的具体实例，通常需要在 C++ 侧先实例化并包装成普通函数或不透明类型。
 *   **解决**:
     *   **手动特化 (Manual Monomorphization)**: 在 C++ 侧写辅助函数，实例化特定类型的模板，导出为普通函数。
-        ```cpp
+        下面只展示包装形状，`OrderBook`、`NYSE` 与 `Order` 由原项目提供，因此不是独立程序。
+        ```cpp,ignore
         // C++ Side
         using NYSEBook = OrderBook<NYSE>;
         void process_nyse(NYSEBook& book, const Order& o) { book.add(o); }
@@ -191,8 +192,8 @@ pub struct OrderWire {
 ### 5.1 不透明句柄模式 (Opaque Handle Pattern)
 当 C++ 和 Rust 需要共享一个对象（如 `std::shared_ptr<Context>`），但又不想暴露其内部布局时，使用此模式。
 
-**C++ 侧 (`context_wrapper.h`)**:
-```cpp
+**C++ 侧 (`context_wrapper.h`)**：这是多文件 FFI 头文件，依赖项目中的 `legacy_context.h`，不能单独编译。
+```cpp,ignore
 #pragma once
 #include <memory>
 #include "legacy_context.h"
@@ -273,8 +274,8 @@ C++ 的继承通常承载了两件事：
 在 Rust 中，这两者是分离的。
 
 #### 案例：策略继承体系
-**C++ 代码**:
-```cpp
+**C++ 代码**：下面是结构骨架，省略了 `Context`、`Order`、`Tick` 和策略计算实现。
+```cpp,ignore
 class Strategy {
 protected:
     Context ctx;

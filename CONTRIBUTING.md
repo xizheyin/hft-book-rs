@@ -6,7 +6,7 @@
 
 仓库使用同一套 mdBook 工具链，但内容分成两本可以独立阅读的书：
 
-- `books/rust-hft/`：Rust 与 HFT；章节放入 `books/rust-hft/src/`，目录维护在 `books/rust-hft/src/SUMMARY.md`。
+- `books/rust-hft/`：Rust、C++ 与 HFT；章节放入 `books/rust-hft/src/`，目录维护在 `books/rust-hft/src/SUMMARY.md`。
 - `books/ai/`：AI；章节放入 `books/ai/src/`，目录维护在 `books/ai/src/SUMMARY.md`。
 - `shared/theme/`：两本书共用的样式、交互和 `noindex` 页面头。
 - `portal/`：部署后的总入口，只负责把读者带到两本子书。
@@ -52,6 +52,8 @@
 - 并发示例说明生产者/消费者数量、所有权、满/空语义和内存顺序。
 - 标准库且声称完整的示例使用 `rust` 围栏，必须通过 `mdbook test`。
 - 依赖外部 crate、操作系统、硬件或多文件工程的示例使用 `rust,ignore`，并在正文说明依赖和单独验证方式。
+- 单文件、只依赖标准库的完整 C++20 程序使用 `cpp` 围栏，必须包含 `main` 并通过 `scripts/check_cpp_examples.py`。
+- C++ 教学片段、多文件工程、平台专属代码和故意展示错误的代码使用 `cpp,ignore`，正文必须说明为什么不能独立编译。
 - 真正的伪代码要明确写出省略的类型或步骤，不能伪装成可直接运行的程序。
 
 ## 展现形式
@@ -71,6 +73,7 @@
 
 ```bash
 python3 scripts/check_book.py
+python3 scripts/check_cpp_examples.py
 mdbook test books/rust-hft
 mdbook test books/ai
 

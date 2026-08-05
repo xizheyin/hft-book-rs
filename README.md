@@ -1,15 +1,15 @@
-# AI、Rust、HFT基础宝典
+# AI、Rust、C++、HFT基础宝典
 
 这是一个面向零基础求职者的中文知识库。仓库中包含两本独立的 `mdBook`，但共用同一套主题、质量检查和 GitHub Pages 部署流程：
 
-- **《Rust 与 HFT 基础宝典》**：市场微观结构、订单撮合、Rust 成本模型、网络、风控、性能验证和系统设计面试。
+- **《Rust、C++ 与 HFT 基础宝典》**：市场微观结构、订单撮合、Rust/C++ 成本模型、网络、风控、性能验证和系统设计面试。
 - **《DeepSeek AI Agent Infra 面试宝典》**：从 AI/LLM 地基、DeepSeek 架构与 Agent Harness，一直覆盖沙箱、虚拟化、存储、网络、调度、可靠性和个性化面试实战。
 
 ## 仓库结构
 
 ```text
 books/
-├── rust-hft/          # Rust/HFT 独立 mdBook
+├── rust-hft/          # Rust/C++/HFT 独立 mdBook（沿用既有部署路径）
 │   ├── book.toml
 │   └── src/
 └── ai/                # AI 独立 mdBook
@@ -24,7 +24,7 @@ site/                   # 本地统一构建产物（不提交）
 部署后的路径是：
 
 - `/hft-book-rs/`：两本书的总入口；
-- `/hft-book-rs/rust-hft/`：Rust/HFT 书；
+- `/hft-book-rs/rust-hft/`：Rust/C++/HFT 书；
 - `/hft-book-rs/ai/`：AI 书。
 
 ## 阅读与贡献原则
@@ -37,13 +37,14 @@ site/                   # 本地统一构建产物（不提交）
 
 ## 本地检查
 
-需要 `mdbook` 与 `mdbook-mermaid`：
+需要 `mdbook`、`mdbook-mermaid`，以及支持 C++20 的 GCC 或 Clang：
 
 ```bash
 cargo install --locked --version 0.5.2 mdbook
 cargo install --locked --version 0.17.0 mdbook-mermaid
 
 python3 scripts/check_book.py
+python3 scripts/check_cpp_examples.py
 mdbook test books/rust-hft
 mdbook test books/ai
 ```
@@ -69,6 +70,6 @@ GitHub Actions 会执行同样的双书检查和构建，然后把整个 `site/`
 
 ## 内容入口
 
-- Rust/HFT 目录：[`books/rust-hft/src/SUMMARY.md`](books/rust-hft/src/SUMMARY.md)
+- Rust/C++/HFT 目录：[`books/rust-hft/src/SUMMARY.md`](books/rust-hft/src/SUMMARY.md)
 - AI 目录：[`books/ai/src/SUMMARY.md`](books/ai/src/SUMMARY.md)
 - 贡献规范：[`CONTRIBUTING.md`](CONTRIBUTING.md)

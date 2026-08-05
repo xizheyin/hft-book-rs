@@ -1,6 +1,6 @@
 # Summary
 
-- [首页：Rust 与 HFT 基础宝典](README.md)
+- [首页：Rust、C++ 与 HFT 基础宝典](README.md)
 - [前言：这本书解决什么问题](introduction/README.md)
 - [如何使用本书：从零基础到面试表达](introduction/how_to_use.md)
 - [为什么选择 Rust 构建低延迟系统](introduction/why_rust.md)
@@ -39,7 +39,27 @@
 - [宏编程实战](rust_advanced/macros.md)
 - [闭包与函数指针](rust_advanced/closures.md)
 
-# 第四部分：吞吐量、并发与基础设施
+# 第四部分：现代 C++ 与低延迟开发
+
+- [部分导论：从零认识现代 C++](cpp/README.md)
+- [C++ 量化与 HFT 面试学习路线](cpp/interview_roadmap.md)
+- [C++ 最小语法与数据建模](cpp/minimal_syntax.md)
+- [编译、链接与内存地图](cpp/compilation_memory.md)
+- [指针、引用与 const](cpp/pointers_references.md)
+- [对象生命周期与 RAII](cpp/raii_lifetime.md)
+- [拷贝、移动与 Rule of Zero/Five](cpp/copy_move.md)
+- [智能指针与所有权](cpp/smart_pointers.md)
+- [STL 容器与成本模型](cpp/stl_cost_model.md)
+- [模板、Concepts 与多态](cpp/templates_polymorphism.md)
+- [内存布局、缓存与 False Sharing](cpp/memory_layout.md)
+- [错误、异常与未定义行为](cpp/errors_ub.md)
+- [原子操作与 C++ 内存模型](cpp/atomics_memory_model.md)
+- [无锁结构与 SPSC 队列](cpp/lock_free.md)
+- [分配器、对象池与零拷贝](cpp/allocators_zero_copy.md)
+- [编译优化、基准与诊断工具](cpp/optimization_tooling.md)
+- [C++ HFT 贯穿项目](cpp/hft_capstone.md)
+
+# 第五部分：吞吐量、并发与基础设施
 
 - [部分导论](infrastructure/README.md)
 - [原子操作详解](infrastructure/atomics.md)
@@ -53,7 +73,7 @@
 - [配置管理与热加载](infrastructure/config.md)
 - [指标监控与遥测](infrastructure/metrics.md)
 
-# 第五部分：网络与高性能 I/O
+# 第六部分：网络与高性能 I/O
 
 - [部分导论](network/README.md)
 - [网络协议栈基础](network/basics.md)
@@ -67,7 +87,7 @@
   - [Solarflare OpenOnload](network/openonload.md)
 - [Linux 网络调优](network/tuning.md)
 
-# 第六部分：行情、协议与订单接入
+# 第七部分：行情、协议与订单接入
 
 - [电子市场协议概览](connectivity/protocols.md)
   - [FIX 协议解析](connectivity/fix.md)
@@ -77,7 +97,7 @@
   - [增量更新、快照与恢复](connectivity/incremental_updates.md)
 - [订单路由系统](connectivity/order_routing.md)
 
-# 第七部分：交易引擎、风控与策略
+# 第八部分：交易引擎、风控与策略
 
 - [订单簿管理](engine/order_book.md)
 - [风控系统](engine/risk.md)
@@ -87,7 +107,7 @@
   - [信号生成](engine/signals.md)
   - [执行算法](engine/execution.md)
 
-# 第八部分：性能工程、测试与仿真
+# 第九部分：性能工程、测试与仿真
 
 - [基准测试](optimization/benchmarking.md)
 - [性能分析](optimization/profiling.md)
