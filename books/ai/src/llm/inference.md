@@ -4,6 +4,14 @@
 
 > 本章目标：讲清 Prefill、Decode、KV Cache、TTFT、TPOT、Continuous Batching 和 PagedAttention，并能用数字估算缓存、延迟与吞吐，设计过载时的有界行为。
 
+## 学习优先级
+
+| 优先级 | 先掌握什么 | 面试要求 |
+|---|---|---|
+| P0 | Prefill/Decode、KV Cache、TTFT/TPOT、连续批处理、Token/KV 准入 | 能画请求链路并定位高延迟/OOM |
+| P1 | PagedAttention、量化、Prefix Cache、Chunked Prefill、模型并行 | 能解释优化针对哪本账及其副作用 |
+| 暂不展开 | 某款 GPU 的手写 Kernel、特定引擎私有调度实现 | 除非面试官明确进入实现细节 |
+
 ## 1. 一次请求经历哪些阶段
 
 ```mermaid
@@ -81,7 +89,9 @@ KV bytes ≈ 层数 × KV头数 × 每头维度 × 2(K和V)
 
 这不是某个 DeepSeek 模型的真实配置。GQA/MQA、[MLA](deepseek_architecture.md)、缓存量化和层配置都可大幅改变结果。面试计算的价值是展示影响项，而不是背一个通用“每 Token 内存”。
 
-## 4. MLA、GQA 与缓存优化解决什么
+## 4. 结构、量化与数值精度怎样进入推理账单
+
+### 4.1 MLA、GQA 与缓存结构优化
 
 - MQA 让许多 Query 头共享一组 K/V 头；
 - GQA 让一组 Query 头共享较少的 K/V 头；
@@ -91,6 +101,66 @@ KV bytes ≈ 层数 × KV头数 × 每头维度 × 2(K和V)
 这些方法共同降低缓存或读取压力，但模型结构和权重必须匹配。不能把一个普通 MHA 权重在服务配置中简单声明成 MLA。
 
 Prefix Caching 还能复用多个请求共同的系统提示或文档前缀。缓存键必须包含模型、Tokenizer、Chat Template 和影响结果的配置；权限敏感前缀还要隔离租户，避免跨租户信息泄露。
+
+### 4.2 权重、激活和 KV 量化不是同一件事
+
+量化把数值映射到更少的 bit。名字通常写成 `W位数A位数`：W8A8 表示权重与激活都以 8 bit 为主要量化目标；W4A16 表示权重更低位、激活通常走 16 bit 路径。
+
+| 量化对象 | 首先减少什么 | 主要风险 |
+|---|---|---|
+| 权重 | 模型驻留容量与权重读取字节 | 反量化开销、模型质量、Kernel 支持 |
+| 激活 | 算子中间传输及潜在低精度计算 | 离群值、累积误差、校准失配 |
+| KV Cache | 长上下文请求的缓存容量与读取字节 | 注意力质量、动态范围、专用 Kernel |
+
+一个 16GB 的纯权重张量若从 16 bit 压到 4 bit，只看位数的理想存储是：
+
+```text
+16GB × 4/16 = 4GB
+```
+
+真实服务还需要 Scale/Zero-point 等元数据、未量化层、工作区与对齐空间，所以进程显存不会严格从 16GB 变成 4GB。更重要的是，KV Cache 和临时激活没有因权重量化自动缩小。
+
+### 4.3 为什么模型变小不保证同比例加速
+
+若 Decode 主要在搬权重，减少权重字节有机会改善 TPOT；若瓶颈在 KV、网络、采样、排队或客户端背压，收益会小得多。硬件若没有高效的 4-bit Kernel，还可能先解包到高精度再算，额外工作抵消带宽收益。
+
+因此量化上线至少要配对比较：
+
+- 任务质量与安全回归；
+- 模型加载时间和峰值显存；
+- 不同 Prompt/输出长度下的 TTFT、TPOT；
+- 不同 Batch 的聚合吞吐；
+- 每请求成本和失败率。
+
+量化公式、FP16/BF16/FP8 与 Kernel 的基础见 [GPU、显存与数值精度](gpu_numerics.md)。
+
+### 4.4 Prefill、Decode 与算力/带宽的联系
+
+Prefill 能在已知输入的多个位置上做较大的矩阵乘，Batch 足够时常更容易提高数据复用和计算单元利用率。Decode 每轮每请求只前进一个 Token，却要读取权重与历史 KV，常更容易受 HBM 带宽影响。
+
+这是诊断假设，不是定律：
+
+| 变化 | 可能让瓶颈改变的原因 |
+|---|---|
+| Batch 变大 | 权重复用提高，但单轮变长、KV 读取增加 |
+| Prompt 变长 | Prefill 算量与 Attention I/O 增加 |
+| KV 变长 | Decode 每轮历史读取增加 |
+| Tensor/Expert Parallel 增大 | 单卡计算减少，通信比例上升 |
+| 量化或融合 Kernel | 数据字节和算子路径改变 |
+
+面试中应说“我会用 Kernel 时间线、HBM 带宽、算术吞吐和通信等待验证”，而不是只凭 GPU 利用率猜测。
+
+### 4.5 数值精度也是服务正确性
+
+低精度和并行归约可能让接近的 Logit 交换次序。对普通文本，这可能只改变措辞；对工具参数、停止 Token 或结构化输出，单个 Token 的变化可能改变外部动作。
+
+可靠上线应：
+
+1. 锁定浮点基线、模型和 Tokenizer；
+2. 在相同请求上做配对回归，不只看平均困惑度；
+3. 分层检查代码、数字、长上下文、工具 JSON 和安全任务；
+4. 记录精度、量化配置、Kernel 与引擎版本；
+5. 为非法结构和高风险动作保留确定性校验。
 
 ## 5. 三个核心延迟指标
 
@@ -264,6 +334,18 @@ Continuous Batching（连续批处理，也称迭代级调度）每轮重新组�
 - PagedAttention 用块表管理非连续 KV，降低碎片但要求正确回收。
 - 吞吐提高不保证单请求更快；调度必须同时看延迟、公平和成本。
 - 队列、输出和缓存都要有上界；取消与重试必须贯穿整条链路。
+- 权重、激活和 KV 量化减少的是不同资源账；模型文件缩小不代表 TPOT 同比例下降。
+- Prefill/Decode 的算力或带宽判断必须结合 Batch、长度、并行和 Kernel 实测。
+- 数值精度变化可能改变 Token 与工具动作，必须做配对质量和安全回归。
+
+## 15. 章末自测
+
+1. 为什么 Prefill 与 Decode 常表现成两种不同负载？
+2. 用公式估算 24 层、8 个 KV 头、头维 128、BF16 时每 Token KV 字节数。
+3. 16-bit 权重降到 4-bit 后，为什么进程显存不一定变成四分之一？
+4. 权重量化、激活量化与 KV 量化分别先影响哪本账？
+5. 吞吐上升、TPOT 变差是否矛盾？请给一个带 Batch 的解释。
+6. 量化后工具调用成功率下降，但平均文本指标不变，你会怎样定位？
 
 ## 一手资料
 
@@ -272,3 +354,6 @@ Continuous Batching（连续批处理，也称迭代级调度）每轮重新组�
 - [Sarathi-Serve：Chunked Prefill 与吞吐—延迟权衡，OSDI 2024](https://www.usenix.org/conference/osdi24/presentation/agrawal)
 - [FlashAttention：注意力 I/O 优化](https://arxiv.org/abs/2205.14135)
 - [DeepSeek-V2：MLA 与 KV Cache](https://arxiv.org/abs/2405.04434)
+- [SmoothQuant：权重—激活量化原始论文](https://arxiv.org/abs/2211.10438)
+- [GPTQ：大模型训练后权重量化原始论文](https://arxiv.org/abs/2210.17323)
+- [FP8 Formats for Deep Learning：低精度格式原始论文](https://arxiv.org/abs/2209.05433)

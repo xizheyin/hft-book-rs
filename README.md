@@ -3,7 +3,7 @@
 这是一个面向零基础求职者的中文知识库。仓库中包含两本独立的 `mdBook`，但共用同一套主题、质量检查和 GitHub Pages 部署流程：
 
 - **《Rust、C++ 与 HFT 基础宝典》**：市场微观结构、订单撮合、Rust/C++ 成本模型、网络、风控、性能验证和系统设计面试。
-- **《DeepSeek AI Agent Infra 面试宝典》**：从 AI/LLM 地基、DeepSeek 架构与 Agent Harness，一直覆盖沙箱、虚拟化、存储、网络、调度、可靠性和个性化面试实战。
+- **《DeepSeek AI Agent Infra 面试宝典》**：从 CPU、Linux、并发、网络、存储与分布式地基，走到 AI/LLM、GPU、Agent Harness、沙箱平台、可靠性和 120 题面试实战。
 
 ## 仓库结构
 

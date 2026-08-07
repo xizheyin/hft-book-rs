@@ -2,6 +2,8 @@
 
 > 难度：必会。官方职责包含大规模 VM 集群、应用层调度、节点自动上下线和稳定运行。
 
+> 先修桥梁：本章默认你已理解[进程调度](../systems/process_threads_syscalls.md)、[并发与取消](../systems/concurrency_async_io.md)以及[分布式部分失败](../systems/distributed_foundations.md)。
+
 调度器不是“找一台 CPU 还空着的机器”。它像机场塔台：要检查机型与跑道是否兼容，安排时隙，处理取消与迫降，还要防止某家航空公司占满所有资源。
 
 ## 1. 先定义生命周期

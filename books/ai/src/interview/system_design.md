@@ -16,6 +16,8 @@
 
 所以 DSec 不是一个聊天页面，而是一个**不可信任务执行平台**。模型给出意图；策略系统决定是否允许；沙箱执行动作；状态机记录进度；验证器检查结果；人类在高风险边界作最终决定。
 
+如果上面一串名词还像“组件拼盘”，先用系统地基补因果链：从[一次程序怎样跑起来](../systems/computer_execution.md)开始，再读[进程与系统调用](../systems/process_threads_syscalls.md)、[网络与 RPC](../systems/network_rpc.md)、[文件系统与数据库](../systems/filesystem_database.md)和[分布式系统地基](../systems/distributed_foundations.md)。白板中的每条箭头都应能继续下钻到线程、内存、协议、持久化或共识，而不是停在产品名。
+
 ## 2. 30 秒答法
 
 > 我会先把模型和仓库都视为不可信输入，把平台拆成控制面和数据面。控制面负责鉴权、配额、任务状态机、策略版本、调度和审批；高频的模型与工具请求走数据面。一次性沙箱中的所有动作都经过 Tool Proxy，接受 schema、最小权限、网络、预算和审计检查。任务用持久状态、事件和快照恢复；队列允许至少一次投递，调度租约携带单调递增的 fencing epoch，让旧 worker 不能提交。step 的 attempt 用于追踪，外部副作用则使用跨 attempt 稳定的 logical_effect_id。模型输出不能直接改变生产状态，平台规定的 verifier 和必要人工审批才决定结果。
