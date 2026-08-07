@@ -1,196 +1,229 @@
-# 配置热加载 (Configuration)
+# 配置热更新：先保证一致，再追求无锁
 
-在 HFT 中，"重启" 是一个脏词。重启意味着丢失市场数据流、丢失订单队列位置 (Queue Position)、甚至触发交易所的断连惩罚。
-然而，市场瞬息万变。我们可能需要调整风控阈值、启用新的策略参数，或者开关某些交易所连接。
+> **面试优先级：P1。** 必须会讲“解析、验证、原子发布、审计、回滚”这条链路；`ArcSwap`、RCU 和文件监听库属于实现选项，不应抢在正确性之前。
 
-本章将介绍如何使用 **ArcSwap (RCU - Read Copy Update)** 模式实现零锁、原子的配置热加载。
+配置是程序运行时使用的一组外部参数，例如最大订单量、交易开关和超时阈值。把这些值写在配置中，是为了在不修改程序代码的情况下适应不同环境。
 
-## 1. 理论背景：RCU 模式
+**热更新**是指进程不退出便切换到新配置。它对交易系统有价值，因为重启可能让连接重建、缓存重热并丢失本地队列状态。但不是所有配置都应该热更新：错误地在线修改线程数、网卡队列或协议字段，可能比一次受控重启更危险。
 
-传统的读写锁 (`RwLock`) 在读多写少场景下依然有开销：
-1.  **Cache Line Bouncing**: 每次读取都要修改锁的状态（引用计数），导致缓存行在 CPU 核心间跳跃。
-2.  **写者饥饿**: 大量的读者可能导致写者一直拿不到锁。
+面试官真正关心的是：读线程会不会看到“半新半旧”的状态？错误配置会不会被发布？出了问题能否知道谁改了什么并迅速回滚？
 
-**RCU (Read-Copy-Update)** 是 Linux 内核中广泛使用的技术：
-- **Read**: 读者直接读取指针，无锁，无原子操作。
-- **Copy**: 写者先拷贝一份数据，在副本上修改。
-- **Update**: 写者原子地替换指针。旧数据在所有读者离开后回收 (Epoch Reclamation)。
+## 1. 先给配置分类
 
-在 Rust 中，`arc-swap` 库完美实现了这一模式。
+| 类别 | 例子 | 常见处理 |
+| --- | --- | --- |
+| 启动期配置 | CPU 绑核、网卡队列、内存池大小 | 修改后受控重启 |
+| 可在线调整 | 日志级别、采样率、非关键超时 | 验证后热更新 |
+| 风控关键 | 最大仓位、单笔上限、kill switch | 强校验、鉴权、审计，必要时双人审批 |
+| 密钥与凭证 | API key、证书私钥 | 使用密钥系统，不写入普通配置或日志 |
 
-## 2. 核心架构
+“能否热更新”取决于程序能否为这个字段定义清晰的切换时刻和失败语义，而不是取决于某个库是否支持原子指针。
 
-我们将构建一个全局配置管理器。下面 2–3 节的三段代码属于**同一个 Cargo 项目**，依赖 `arc-swap`、`serde`（启用 `derive`）、`toml` 和 `anyhow`，单独复制其中一段并不完整，因此标为 `rust,ignore`。
+## 2. 正确的生命周期
 
-验证时应把三段放进同一模块，在独立示例项目执行 `cargo add arc-swap toml anyhow`、`cargo add serde --features derive`，然后运行 `cargo check` 与包含并发读写、非法配置和文件替换的测试。`mdbook test` 本身不会替书中示例下载第三方依赖。
+一次安全更新通常经过七步：
 
-```rust,ignore
-use arc_swap::ArcSwap;
-use serde::Deserialize;
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
-
-#[derive(Debug, Deserialize, Default)]
-pub struct RiskConfig {
-    pub max_position: u32,
-    pub max_order_size: u32,
-    pub kill_switch: bool,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct StrategyConfig {
-    pub spread_threshold: f64,
-    pub alpha_beta: f64,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct AppConfig {
-    pub risk: RiskConfig,
-    pub strategy: StrategyConfig,
-}
-
-// 全局静态配置实例
-// lazy_static 或 once_cell 也可以，但在 Rust 1.70+ 用 OnceLock
-// 这里为了演示方便，假设它是通过 ArcSwap 包装的
-pub struct ConfigManager {
-    inner: ArcSwap<AppConfig>,
-}
+```text
+收到候选配置
+    ↓
+解析语法与类型
+    ↓
+字段校验 + 跨字段约束
+    ↓
+准备依赖资源 / 试运行
+    ↓
+一次性发布带版本的不可变快照
+    ↓
+记录操作者、版本、差异与结果
+    ↓
+监控异常，必要时回滚到旧快照
 ```
 
-## 3. 实现细节
+每一步都回答一个不同问题：
 
-### 3.1 初始化与读取 (Read)
+- **解析**：文本是不是合法 TOML/JSON/YAML？
+- **字段校验**：`max_order_size` 是否为正数？
+- **跨字段校验**：单笔上限是否不超过总仓位上限？
+- **准备**：新地址能否连接、证书能否加载？
+- **发布**：所有读者是否从同一个明确时刻看到完整新版本？
+- **审计**：出现事故后能否还原变化？
+- **回滚**：新配置合法但业务效果不好时怎么办？
 
-读取路径必须极快。`ArcSwap::load` 返回一个 `Guard`，它类似于 `Arc`，但通常无需原子递增（取决于实现策略）。
+解析成功绝不等于可以发布。
 
-```rust,ignore
-impl ConfigManager {
-    pub fn new(initial_config: AppConfig) -> Self {
-        Self {
-            inner: ArcSwap::from_pointee(initial_config),
-        }
-    }
+## 3. 为什么要发布“不可变快照”
 
-    // 热路径 API
-    pub fn get(&self) -> Arc<AppConfig> {
-        self.inner.load().clone() // 这里 clone 只是增加 Arc 引用计数，开销很小
-    }
-    
-    // 更快的 API: 如果不跨越 await/yield 点，可以直接用 Guard
-    pub fn get_ref(&self) -> arc_swap::Guard<Arc<AppConfig>> {
-        self.inner.load()
-    }
-}
+假设旧配置是：
+
+```text
+max_position = 1_000
+max_order_size = 100
 ```
 
-### 3.2 热加载逻辑 (Update)
+若两个字段分别更新，读线程可能暂时看到一个来自新版本、另一个来自旧版本。这叫**撕裂视图**，它会破坏跨字段不变量。
 
-后台线程监控配置文件（如 `config.toml`），一旦变化，解析并原子替换。
+更清晰的做法是：后台构造并验证完整 `Config`，然后一次替换指向它的共享引用。读者在一次业务决策内持有同一个快照。
 
-```rust,ignore
-use std::fs;
+只有彼此确实独立、允许不同时间生效的值，才适合拆成单独的原子变量。
 
-impl ConfigManager {
-    pub fn watch_file(self: Arc<Self>, path: &str) {
-        let path = path.to_string();
-        thread::spawn(move || {
-            let mut last_modified = fs::metadata(&path).unwrap().modified().unwrap();
-            
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                
-                if let Ok(metadata) = fs::metadata(&path) {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified > last_modified {
-                            println!("Config change detected, reloading...");
-                            match Self::load_from_file(&path) {
-                                Ok(new_config) => {
-                                    // 原子替换！
-                                    self.inner.store(Arc::new(new_config));
-                                    println!("Config reloaded successfully.");
-                                    last_modified = modified;
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to reload config: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
+## 4. 先用简单实现建立正确性
 
-    fn load_from_file(path: &str) -> anyhow::Result<AppConfig> {
-        let content = fs::read_to_string(path)?;
-        let config = toml::from_str(&content)?;
-        Ok(config)
-    }
-}
-```
+下面的标准库示例使用 `RwLock<Arc<Config>>`。它不是最低延迟实现，但容易验证，适合作为基线：
 
-## 4. 常见陷阱 (Pitfalls)
-
-### 4.1 部分更新 (Partial Updates)
-**千万不要** 把配置拆成多个 `Atomic` 变量（如 `AtomicU64` max_pos, `AtomicBool` kill_switch）。
-这会导致**状态不一致**：线程 A 可能读到了新的 `max_pos` 但旧的 `kill_switch`。
-**必须** 整体替换 `AppConfig` 结构体，保证事务性。
-
-### 4.2 验证 (Validation)
-在 `store` 之前，必须对 `new_config` 进行严格校验。
-例如，如果 `max_order_size` 被误设为 0，可能会导致除以零错误或无法下单。
-**Golden Rule**: 只有校验通过的配置才能被 swap 进去。
-
-下面把“先校验、后发布”写成独立的标准库示例，因此它会由 `mdbook test` 编译并执行断言：
+`Arc` 是线程安全的共享所有权指针，最后一个持有者离开时释放对象；`RwLock` 允许多个读者或一个写者进入。这里的“原子发布”是业务语义上的**不会看到半个新配置**，不声称整个更新只对应一条 CPU atomic 指令。
 
 ```rust
-#[derive(Debug)]
-struct RiskConfig {
-    max_position: u32,
-    max_order_size: u32,
+use std::sync::{Arc, RwLock};
+
+#[derive(Debug, PartialEq)]
+struct Config {
+    version: u64,
+    max_position: u64,
+    max_order_size: u64,
+    kill_switch: bool,
 }
 
-#[derive(Debug)]
-struct AppConfig {
-    risk: RiskConfig,
-}
-
-impl AppConfig {
-    fn validate(&self) -> Result<(), String> {
-        if self.risk.max_order_size == 0 {
-            return Err("max_order_size cannot be 0".into());
+impl Config {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.max_order_size == 0 {
+            return Err("max_order_size must be positive");
         }
-        if self.risk.max_order_size > self.risk.max_position {
-            return Err("max_order_size cannot exceed max_position".into());
+        if self.max_order_size > self.max_position {
+            return Err("order limit exceeds position limit");
         }
         Ok(())
     }
 }
 
-let valid = AppConfig {
-    risk: RiskConfig { max_position: 1_000, max_order_size: 100 },
-};
-assert!(valid.validate().is_ok());
-
-let invalid = AppConfig {
-    risk: RiskConfig { max_position: 1_000, max_order_size: 0 },
-};
-if let Err(message) = invalid.validate() {
-    assert_eq!(message, "max_order_size cannot be 0");
-} else {
-    panic!("zero order size must be rejected");
+struct ConfigStore {
+    current: RwLock<Arc<Config>>,
 }
+
+impl ConfigStore {
+    fn new(initial: Config) -> Result<Self, &'static str> {
+        initial.validate()?;
+        Ok(Self { current: RwLock::new(Arc::new(initial)) })
+    }
+
+    fn snapshot(&self) -> Arc<Config> {
+        Arc::clone(&self.current.read().expect("config lock poisoned"))
+    }
+
+    fn publish(&self, candidate: Config) -> Result<(), &'static str> {
+        candidate.validate()?;
+        let mut current = self.current.write().expect("config lock poisoned");
+        if candidate.version <= current.version {
+            return Err("config version must increase");
+        }
+        *current = Arc::new(candidate);
+        Ok(())
+    }
+}
+
+let store = ConfigStore::new(Config {
+    version: 1,
+    max_position: 1_000,
+    max_order_size: 100,
+    kill_switch: false,
+}).unwrap();
+
+let request_snapshot = store.snapshot();
+store.publish(Config {
+    version: 2,
+    max_position: 800,
+    max_order_size: 80,
+    kill_switch: true,
+}).unwrap();
+
+// 已开始的决策继续使用 v1；下一次决策取得 v2。
+assert_eq!(request_snapshot.version, 1);
+assert_eq!(store.snapshot().version, 2);
 ```
 
-### 4.3 昂贵的 Drop
-旧的 `AppConfig` 会在最后一个读者释放后被 Drop。如果 `AppConfig` 包含这就需要释放大量内存（例如大的 `Vec`），Drop 操作可能会在读者的线程中发生，导致延迟尖峰。
-**解决**: 尽量让 Config 保持轻量。如果必须包含重资源，考虑通过 Channel 发送到后台线程去 Drop。
+`Arc` 让旧快照在最后一个读者结束后再释放，因此不会产生悬空引用。`RwLock` 只保护“当前快照指针”的读取和替换；业务代码拿到 `Arc` 后，不必一直持锁。
 
-## 5. 延伸阅读
+## 5. 什么时候再考虑 ArcSwap / RCU 风格
 
-- [arc-swap Crate](https://docs.rs/arc-swap) - Rust 社区的标准 RCU 实现。
-- [notify Crate](https://github.com/notify-rs/notify) - 比轮询更高效的文件系统监控。
+若基准测试显示读锁造成可见的尾延迟，可以使用 `arc-swap` 等库原子地发布 `Arc<Config>`。它借鉴了 RCU（read-copy-update，读—复制—更新）的思想：
 
----
-**基础设施篇完结**。接下来我们将进入 **[网络篇 (Network)](../network/index.html)**，探讨如何处理 TCP/UDP 数据流。
+1. 读者取得当前快照；
+2. 写者在旁边创建新对象；
+3. 写者原子替换共享指针；
+4. 旧对象等现有读者离开后回收。
+
+这不等于“完全没有原子操作”，也不等于 Linux 内核 RCU 的全部语义。具体读开销、保护策略和回收时机取决于库实现。正确表述是：它能让高频读取避免传统读锁竞争，但增加了生命周期和回收分析的要求。
+
+```rust,ignore
+use arc_swap::ArcSwap;
+use std::sync::Arc;
+
+// 教学片段：initial_config 与 candidate 是前文生命周期中准备好的占位值，
+// 不能把这几行单独复制为完整程序；candidate 必须在 store 前完成验证。
+let store = ArcSwap::from_pointee(initial_config);
+let request_snapshot = store.load_full();
+store.store(Arc::new(candidate));
+```
+
+如果配置对象很大，最后一个读者释放旧快照时的析构可能造成延迟尖峰。解决方向是让配置只保存轻量数据，或把重资源放入有专门回收策略的对象中。
+
+## 6. 文件监听只是“变化提示”
+
+文件系统 watcher 可能收到重复事件，编辑器也可能采用“写临时文件再 rename”的方式保存。仅比较修改时间还会遇到时间精度和时钟问题。因此：
+
+1. 把通知当作“请重新读取”的提示，不当作新配置本身；
+2. 读取完整文件，解析并验证；
+3. 使用单调递增版本或内容哈希去重；
+4. 失败时保留旧配置，并记录结构化错误；
+5. 部署端可在目标目录创建临时文件，再以同一文件系统内的原子 rename 替换目录项，避免读到半写内容；跨文件系统移动不具备这一保证。
+
+生产系统也可以由配置服务推送版本，但发布和验证原则相同。
+
+## 7. 失败场景必须先设计
+
+| 失败 | 应有行为 | 不应做什么 |
+| --- | --- | --- |
+| 语法错误 | 拒绝候选，继续使用旧版本 | 用默认值悄悄覆盖 |
+| 跨字段约束失败 | 返回具体原因 | 发布一部分字段 |
+| 依赖资源准备失败 | 不切换并告警 | 先发布再碰运气连接 |
+| 版本倒退或重复 | 拒绝或幂等忽略 | 让旧消息覆盖新状态 |
+| 新版本引发业务异常 | 按策略回滚并保留证据 | 手工修改而不留记录 |
+| kill switch 变更 | 强鉴权、快速传播、确认生效 | 与普通 UI 参数同等处理 |
+
+kill switch（紧急停止开关）的**触发**通常还应有独立、快速、可锁存的控制路径，不能只等通用文件 watcher；恢复交易会重新增加风险，解除开关通常需要比触发更严格的权限和确认。
+
+回滚并不总是简单地恢复旧数字。例如新配置已撤单、断开连接或切换交易日状态时，副作用可能无法反向执行。面试时应主动说明“配置快照可回滚”和“业务副作用可补偿”是两个问题。
+
+## 8. 可观测性与安全
+
+至少记录：配置版本、内容哈希、来源、操作者、请求时间、生效时间、验证结果以及回滚原因。指标可包括加载失败次数、当前版本、各线程观察到的版本和传播耗时。
+
+不要把密钥或完整凭证写入 diff、日志和监控标签。风控上限与 kill switch 的修改通常还需要权限控制、变更范围限制和独立审批。
+
+## 9. 一分钟面试回答
+
+> 配置热更新不能只是监控文件后改几个全局变量。我会先把字段分成启动期、可热更和风控关键三类；候选配置先解析、做字段及跨字段校验、准备依赖，然后以带版本的不可变快照一次发布。读者在一次业务决策中固定使用同一快照，避免看到半新半旧状态。先用 `RwLock<Arc<Config>>` 建立正确基线，只有测出读锁是瓶颈才换 ArcSwap/RCU 风格。最后还要有鉴权、审计、指标和回滚方案。
+
+## 10. 高频追问
+
+### 为什么不把每个字段都做成 Atomic？
+
+单个原子只能保证自己的读写不可撕裂，不能让多个字段组成同一版本。有关联约束的字段应整体发布。
+
+### `RwLock` 一定慢吗？
+
+不一定。更新频率、核心数、读临界区长度和实现都会影响结果。先做正确基线，再用目标机器的尾延迟证明是否需要更复杂方案。
+
+### 热更新如何保证所有线程“同时”生效？
+
+通常保证的是一个清晰的快照切换点，而不是物理上的同一纳秒。已取得旧快照的操作可完成，新操作读取新版本；若业务要求硬切换，还需停流、屏障或按事件序号生效。
+
+### 合法配置为什么仍需回滚？
+
+静态规则无法证明真实市场效果。参数可能通过校验，却导致拒单率或敞口异常，所以发布后监控与回滚同样重要。
+
+## 11. 延伸阅读
+
+- [arc-swap 文档](https://docs.rs/arc-swap)
+- [notify 项目](https://github.com/notify-rs/notify)
+
+基础设施篇的概念至此闭环。下一篇进入 [网络基础](../network/index.html)。

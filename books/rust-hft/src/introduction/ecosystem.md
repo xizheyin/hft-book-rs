@@ -1,32 +1,84 @@
-# 低延迟系统 Rust 生态概览 (Ecosystem)
+# 低延迟系统 Rust 生态概览
 
-Rust 的高性能生态正在持续成熟。虽然它在某些传统系统软件领域仍不如 C++ 积累深厚，但在安全性、构建工具、依赖管理与库设计一致性方面，已经形成了鲜明优势。
+Rust 项目把可复用的第三方库称为 **crate**，依赖通常写在 `Cargo.toml` 中。本章不是让你背库名，而是训练一种面试和工程都更重要的能力：**先说清要解决的问题，再判断标准库是否够用，最后才选择第三方库。**
 
-以下是构建低延迟系统时经常会接触到的一组 Rust 库（Crates）：
+> **面试优先级**
+>
+> - **必会**：能按“并发、网络、协议、测量、FFI（Foreign Function Interface，跨语言调用接口）”给工具分类，并说明引入依赖的代价。
+> - **理解**：知道 Tokio、Crossbeam、Serde、Criterion 各解决哪类问题。
+> - **选读**：某个 crate 的具体 API、版本差异和内部实现；真实项目采用前再查当前文档。
 
-## 1. 并发与底层优化
-*   **[crossbeam](https://github.com/crossbeam-rs/crossbeam)**: 提供无锁队列、Epoch-based 内存回收和并发工具。它常用于高性能系统，但具体队列是否适合热路径仍要按生产者/消费者数量和背压要求选择。
-*   **[parking_lot](https://github.com/Amanieu/parking_lot)**: 提供紧凑且功能丰富的 Mutex 和 RwLock。它在许多负载下表现很好，但“比标准库快”不是无条件结论，应对目标竞争模式做基准。
-*   **[memmap2](https://github.com/RazrFalcon/memmap2)**: 内存映射文件（mmap）的安全封装，用于读取历史数据或共享内存 IPC。
-*   **[ahash](https://github.com/tkaitchuck/aHash)**: 面向性能的非加密哈希实现，可在支持的硬件上利用 AES 指令。使用前要评估输入是否可能由攻击者控制，并在目标数据分布上测量，而不是套用固定倍数。
+## 1. 为什么不能直接给一张“最快库”名单
 
-## 2. 网络与异步运行时
-*   **[mio](https://github.com/tokio-rs/mio)**: 轻量级非阻塞 I/O 库（epoll/kqueue 封装），构建 Event Loop 的基础。
-*   **[socket2](https://github.com/rust-lang/socket2)**: 提供了比标准库更底层的 Socket 配置能力（如 `SO_BUSY_POLL`, `SO_REUSEPORT`）。
-*   **[glommio](https://github.com/DataDog/glommio)**: 基于 `io_uring` 与 thread-per-core 思路的运行时，适合研究单核执行器和分片 I/O；是否优于 Tokio 取决于 I/O 类型、生态需求和部署内核。
-*   **[bytes](https://github.com/tokio-rs/bytes)**: 高效的字节缓冲区管理，支持零拷贝切片。
+库只提供能力，不替项目决定正确架构。例如“需要一条队列”至少还要先回答：
 
-## 3. 序列化与数据处理
-*   **[serde](https://github.com/serde-rs/serde)**: 序列化框架的标准。
-*   **[bincode](https://github.com/bincode-org/bincode)**: 极速二进制序列化格式。
-*   **[rkyv](https://github.com/rkyv/rkyv)**: 面向归档数据的零拷贝反序列化框架，可直接访问归档表示中的字段。外部字节仍需考虑校验、对齐、版本兼容和不受信输入，不能把任意数据直接强转为可信结构体。
-*   **[simd-json](https://github.com/simd-lite/simd-json)**: 利用 SIMD 指令加速 JSON 解析（虽然 HFT 尽量不用 JSON，但某些交易所配置接口还是需要的）。
+- 是单生产者单消费者（SPSC），还是多个生产者/消费者？
+- 队列必须有界吗？满了是拒绝、等待还是丢弃？
+- 消息能否复制，还是要转移缓冲区所有权？
+- 目标是吞吐量，还是 P99/P99.9 尾延迟（分别约有 99%/99.9% 的样本不超过该值）？
 
-## 4. 监控与分析
-*   **[hdrhistogram](https://github.com/HdrHistogram/HdrHistogram_rust)**: 高动态范围直方图，可在较大数值范围内记录延迟分布；配置精度、范围和 coordinated omission（协调遗漏）处理方式会影响结论。
-*   **[criterion](https://github.com/bheisler/criterion.rs)**: 统计学严谨的基准测试（Benchmark）框架。
-*   **[iai-callgrind](https://github.com/iai-callgrind/iai-callgrind)**: 基于 Valgrind/Callgrind 统计指令和缓存相关事件，适合做确定性更强的成本对比；它是模拟/插桩结果，不能替代真实机器上的端到端延迟测试。
+这些答案不同，合适的实现也会不同。库的 README 中出现 “lock-free” 或 “zero-copy”，不代表它自动满足你的线程模型、背压语义和生命周期要求。
 
-## 5. FFI 与 硬件交互
-*   **[bindgen](https://github.com/rust-lang/rust-bindgen)**: 自动生成 C 库的 Rust 绑定（如 DPDK, Onload）。
-*   **[core_affinity](https://github.com/Elzair/core_affinity_rs)**: 用于将线程绑定到特定的 CPU 核心。
+## 2. 按问题选择工具
+
+| 你要解决的问题 | 常见起点 | 为什么可能需要它 | 采用前必须确认 |
+|---|---|---|---|
+| 普通线程、锁、原子和网络 | Rust 标准库 | 依赖最少，语义稳定，很多场景已经足够 | 是否真的缺少所需 API，而不是为了“更快”换库 |
+| 并发队列和并发工具 | [Crossbeam](https://github.com/crossbeam-rs/crossbeam) | 提供多种队列、作用域线程和基于 epoch 的回收工具；epoch 可先理解为“等所有线程都离开可能访问旧对象的阶段后再回收” | 生产者/消费者数量、容量、进展保证和回收协议 |
+| 大量并发 I/O | [Tokio](https://tokio.rs/) | 提供异步运行时、定时器、网络和任务调度 | 任务是否会阻塞、Future（可暂停后继续推进的计算）大小、调度与尾延迟边界 |
+| 更底层的 socket 配置 | [socket2](https://github.com/rust-lang/socket2) | 暴露标准库未直接提供的 socket 选项 | 操作系统支持、权限、参数是否由测量证明必要 |
+| 字节缓冲区 | [bytes](https://github.com/tokio-rs/bytes) | 便于切片、共享和组合网络字节 | “切片不复制”不等于底层缓冲区可以立即复用 |
+| 通用序列化 | [Serde](https://serde.rs/) | 用统一 trait 支持多种格式，减少手写样板 | 目标协议是否真适合通用序列化；外部输入仍要校验 |
+| 微基准 | [Criterion](https://github.com/bheisler/criterion.rs) | 对一小段代码反复计时并做统计分析 | 微基准边界是否代表端到端负载，工作是否被优化掉 |
+| 延迟分布 | [HdrHistogram](https://github.com/HdrHistogram/HdrHistogram_rust) | 在较大范围内记录分位数 | 精度、范围、样本量，以及系统变慢时发压端也跟着少发请求所造成的“协调遗漏”怎样处理 |
+| 调用 C/C++ | [bindgen](https://github.com/rust-lang/rust-bindgen) / [cxx](https://cxx.rs/) | 生成或约束跨语言接口，复用已有系统 | ABI（Application Binary Interface，二进制调用约定）、所有权、异常/panic、销毁方和工具链版本 |
+
+这里的“常见起点”不是推荐排行榜。例如 Tokio 很适合大量连接和等待型 I/O，但有专用核心、单写者状态和严格尾延迟预算的行情内循环，可能更适合固定线程。反过来，为一个低频管理接口手写忙轮询通常没有价值。
+
+## 3. 三个容易混淆的词
+
+### 异步不等于并行
+
+异步（async）主要解决“任务等待 I/O 时，线程还能去推进别的任务”。并行（parallel）表示多个 CPU 核心同时做计算。Tokio 可以使用多个工作线程，但写了 `async fn` 并不会自动让一段 CPU 计算并行或更快。
+
+### 零拷贝必须说明边界
+
+`bytes`、内存映射或归档格式可能省掉某一次用户态复制，但网卡、内核、驱动和存储设备仍可能搬运数据。合格说法应是：“解析器返回借用原接收缓冲区的视图，因此省掉了 payload 到新 `Vec` 的复制；缓冲区要等消费者结束后才能复用。”
+
+### 无锁不等于无等待
+
+无锁（lock-free）描述算法的整体进展保证，不保证当前线程马上完成，也不保证队列不会满。高争用的原子操作仍可能让缓存行在核心间来回迁移。完整推导见[无锁数据结构](../infrastructure/lock_free.md)。
+
+## 4. 什么时候值得引入依赖
+
+可以用下面五问做代码评审：
+
+1. 标准库为什么不够？缺的是正确性能力、平台 API，还是已测量的性能？
+2. 这个库的线程模型、容量和失败语义是否匹配业务？
+3. 谁维护它，安全公告和版本升级怎样处理？
+4. 它会不会把分配、原子计数、后台线程或系统调用藏进热路径？
+5. 怎样用测试、回放、基准和故障注入验证它？
+
+面试中不必报出十几个 crate。能拿一个例子讲清“问题—选择—代价—验证”，比只背生态清单更有说服力。
+
+<details>
+<summary><strong>选读：岗位或项目需要时再认识的专用工具</strong></summary>
+
+- [mio](https://github.com/tokio-rs/mio)：较薄的非阻塞 I/O 抽象，适合需要自己组织事件循环的基础设施代码。
+- [memmap2](https://github.com/RazrFalcon/memmap2)：内存映射文件封装；映射不等于数据已驻留，也不自动解决文件变更和崩溃一致性。
+- [rkyv](https://github.com/rkyv/rkyv)：可直接访问归档表示的框架；外部字节仍要处理校验、对齐、版本和不受信输入。
+- [glommio](https://github.com/DataDog/glommio)：面向单核执行器、分片和 Linux I/O 的运行时；是否合适取决于部署内核、I/O 类型和生态需求。
+- [iai-callgrind](https://github.com/iai-callgrind/iai-callgrind)：用指令与缓存模拟结果做稳定对比，不能替代真实机器的端到端延迟测试。
+- `core_affinity` 等绑核封装：只完成线程亲和性的一部分；IRQ、SMT sibling、NUMA 和操作系统任务仍需整体规划。
+
+这些名称通常不是通用面试的背诵要求。只有简历项目确实使用，或岗位说明明确涉及对应领域时，才需要深入 API 与版本行为。
+
+</details>
+
+## 5. 面试回答示例
+
+**问题：Rust 低延迟系统会选哪些库？**
+
+> 我不会先按“最快”列库，而会先拆问题。普通线程和原子先看标准库；明确的一对一通道会比较 SPSC 实现；大量等待型网络 I/O 会评估 Tokio；协议和配置可用 Serde，但逐笔二进制热路径可能手写经过验证的解析器；Criterion 和延迟直方图负责测量。每个选择都要核对容量、所有权、失败路径和目标负载，库名本身不是性能证据。
+
+这段回答展示了分类、边界和验证思路，也给面试官留下了继续追问具体项目的入口。

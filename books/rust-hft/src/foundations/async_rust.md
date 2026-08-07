@@ -1,16 +1,27 @@
 # Async Rust 原理与 Tokio (Async Rust & Tokio)
 
-在上一章中，我们对比了 Thread-per-Core 和 Async 模型。尽管 HFT 的核心交易逻辑倾向于避免使用 `async`，但现代交易系统是一个复杂的异构体。网关 (Gateways)、WebSockets 行情接入、数据库日志归档等**非关键路径**组件，仍然大量依赖 Rust 强大的异步生态。
+在上一章中，我们对比了 Thread-per-Core 和 Async 模型。现代交易系统不会只用一种并发方式：有专用核心、状态单写者且追求极低尾延迟的数据面常从固定线程开始；大量连接、主要时间花在等待 I/O 的网关连接、控制面和归档服务，则常从异步运行时开始评估。关键不是给组件贴上“关键/非关键”标签，而是看它在等什么、由谁调度、延迟预算是多少。
 
 本章将深入剖析 Rust 的异步原理及 Tokio 运行时，帮助你在系统中做出正确的架构决策。
 
+> **面试优先级**
+>
+> - **P0 必会**：异步解决等待问题，不等于并行；Future 是可暂停和恢复的计算；executor 负责推进，I/O 驱动在就绪时唤醒。
+> - **P1 理解**：`.await` 两侧保存哪些状态、协作式调度为何会被阻塞任务拖慢、什么时候选固定线程或 Tokio。
+> - **P2 选读**：`Pin` 的自引用背景、嵌套 Future 布局、Tokio 工作窃取的具体队列路径。普通面试先讲清模型，不必背运行时内部函数名。
+
 ## 1. 异步原理：零成本抽象的真相
 
-Rust 所说的“零成本抽象”更准确的含义是：`async/await` 会被编译成状态机，不要求语言自带 GC 或为每个任务维护可增长线程栈；你不用的抽象原则上不应付费。它**不等于零内存、零分配、零调度开销**。
+Rust 所说的“零成本抽象”更准确的含义是：`async/await` 会被编译成状态机，不要求语言自带 GC（Garbage Collector，运行时自动回收不可达对象的机制）或为每个任务维护可增长线程栈；你不用的抽象原则上不应付费。它**不等于零内存、零分配、零调度开销**。
 
 Future 的大小通常在编译期确定，但它可能很大；Future 值放在栈、父 Future 内部还是堆上，取决于调用方式。`tokio::spawn` 还需要为可调度 task 保存头部、状态与 Future，通常会有运行时分配。
 
+先用一个最小流程建立画面：调用 `async fn` 得到 Future；executor 第一次 `poll` 它；遇到尚未就绪的 I/O 时返回 `Pending` 并登记唤醒方式；线程转去推进其他任务；I/O 就绪后任务重新入队，下一次 `poll` 从保存的状态继续。异步的价值就在于等待期间不必让一个线程只服务这一个任务。
+
 ### 1.1 Future 与状态机 (State Machines)
+
+<details>
+<summary><strong>P2 选读：Future 状态布局、Pin 与嵌套状态机</strong></summary>
 
 当你编写一个 `async fn` 时，编译器会把它降低为一个实现 `Future` 的匿名状态机。把它想成枚举很有帮助，但**真实布局是编译器实现细节，不保证就是你能手写出来的某个 enum**。
 
@@ -102,13 +113,15 @@ trait Future {
 * **状态分支**：poll 需要判断当前状态，实际分支成本应通过 profile 判断；
 * **调用方式**：具体类型之间的 poll 可以静态分发并被内联；executor 为统一调度 task 可能使用类型擦除。`Waker` 有自己的 vtable，但这不代表每次 Future::poll 都“通过 Waker 虚调用”。
 
+</details>
+
 ### 1.4 Waker、Executor 与 Reactor
 
 Rust 的异步模型是 **Reactor-Executor** 模式的典型实现，但初学者往往会混淆各个组件的角色。让我们用 HFT 的术语来重新解释：
 
-*   **Future (任务)**: 相当于一个“回调函数”的容器。它包含了自己的状态（读到哪了、写了多少）。
+*   **Future（可推进的计算）**：保存“执行到哪里”和跨挂起点仍需保留的数据；它被放进 runtime 后才通常称为 task。
 *   **Executor (调度器)**: 相当于一个 `while loop`。它不断地从队列里取出 Future，调用它们的 `poll` 方法。
-*   **Reactor (驱动器)**: 对 Linux `epoll`、BSD `kqueue`、Windows IOCP 等系统 I/O 机制进行抽象，负责跟踪事件就绪。
+*   **Reactor / I/O Driver（I/O 驱动器）**：对 Linux `epoll`、BSD `kqueue`、Windows IOCP 等系统机制进行抽象，跟踪“现在可尝试操作”或“操作已经完成”的事件。
 *   **Waker (唤醒器)**: 这是一个至关重要的**桥梁**。当 I/O 未就绪时，Future 会把 Waker 扔给 Reactor 说：“等有数据了，用这个叫醒我”。
 
 **完整流程图解**:
@@ -149,7 +162,7 @@ runtime 通常会合并重复 wake，且同线程 fast path 可能很便宜，�
 
 ## 2. Tokio 运行时深度解析
 
-Tokio 是 Rust 事实上的标准异步运行时。它包含两个核心组件：**Executor (调度器)** 和 **Reactor (驱动器)**。
+Tokio 是 Rust 生态中广泛使用的异步运行时。建立模型时，可以先把它看成两个核心部分：**Executor（调度器）** 和 **I/O Driver（I/O 驱动器）**，此外还有定时器等能力。
 
 ### 2.1 多核调度原理：Task 与 Worker
 
@@ -168,6 +181,9 @@ Tokio 是 Rust 事实上的标准异步运行时。它包含两个核心组件�
 
 ### 2.2 工作窃取调度器 (Work-Stealing Scheduler)
 
+<details>
+<summary><strong>P2 选读：Tokio 工作窃取为什么有收益也有抖动</strong></summary>
+
 Tokio 的多线程运行时 (`rt-multi-thread`) 使用工作窃取算法：
 
 * worker 有本地调度状态，也会处理注入队列中的任务；
@@ -178,6 +194,8 @@ Tokio 的多线程运行时 (`rt-multi-thread`) 使用工作窃取算法：
 
 * **跨核迁移 (Migration)**：task 可在一次 poll 返回后由另一 worker 继续，热状态可能失去 L1/L2 局部性；
 * **共享调度资源**：入队、窃取和 worker 唤醒需要同步；实际尾延迟必须在目标负载测量，不能固定成某个微秒数。
+
+</details>
 
 ### 2.3 协作式调度与饥饿
 
@@ -205,7 +223,7 @@ async fn heavy_computation() {
 
 ## 3. HFT 系统中的混合架构 (Hybrid Architecture)
 
-在 HFT 中，我们通常采用 **混合架构**：边缘用 Async，核心用 Sync。
+HFT 系统常把混合架构作为起点：大量等待型 I/O 可以用 Async，已确认的固定低延迟数据面可以用专用同步线程。这是按负载做的选择，不是“边缘/核心”位置自动决定模型。
 
 ### 3.1 架构图
 
@@ -233,16 +251,16 @@ graph TD
 | **行情解码 (Feed Handler)** | **按数据率选择专用线程/忙轮询** | 高数据率路径可能值得独占核心；低速源不必照搬。 |
 | **订单发送 (Order Entry)** | **按延迟预算选择专用线程** | 关键发送路径常希望避免与无关 task 共享调度。 |
 | **Web 监控台 (Dashboard)** | **Async (Tokio)** | 处理大量并发 WebSocket 连接，吞吐量优先。 |
-| **历史数据落库** | **Async (Tokio)** | 磁盘 I/O 慢，不需要占用核心线程。 |
-| **REST API 接口** | **Async (Tokio)** | HTTP 请求天然适合 Request-Response 模型。 |
+| **历史数据落库** | **异步客户端或有界专用写线程** | 数据库网络等待可由 Async 复用线程；普通阻塞文件 I/O 则应隔离到受控线程，不能只加 `async`。 |
+| **REST API 接口** | **常见为 Async (Tokio)** | 大量连接会等待网络；若连接很少，简单线程模型同样可能足够。 |
 
 ## 4. 实战：在 HFT 中正确使用 Tokio
 
 如果你必须在关键路径附近使用 Tokio，请遵循以下原则：
 
-### 4.1 使用单线程运行时 (`current_thread`)
+### 4.1 评估单线程运行时 (`current_thread`)
 
-不要依赖宏的默认 flavor；显式配置单线程 runtime，并在需要时用操作系统 affinity 把承载它的线程绑定到非关键核心。
+如果目标是避免 task 在多个 worker 间迁移，可以显式评估单线程 runtime；它不会自动降低尾延迟，也不等于独占一个核心。需要时还要用操作系统 affinity 约束承载它的线程，并测量其他 task 是否造成协作式排队。
 
 下面代码依赖 Tokio runtime 的 Cargo feature，并且线程亲和性还必须在运行时外部单独配置；mdBook 因而只展示构建方式，不执行它。
 

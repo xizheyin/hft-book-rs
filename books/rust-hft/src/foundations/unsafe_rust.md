@@ -4,6 +4,8 @@
 
 本章按“场景—约束—实现—验证”的顺序展开。我们不追求把所有代码改成 `unsafe`，而是建立一套可复查的决策方式：什么时候值得用 `unsafe`，如何把不安全边界压缩到最小，以及如何用工具验证这些边界没有被破坏。
 
+> **面试主线**：P0 是说清 `unsafe` 允许做什么、为什么它转移了证明责任，以及怎样写 `SAFETY` 不变量。`get_unchecked` 和安全协议解析是 P1；手写 AVX2 intrinsic 属于 P2，目标岗位未涉及 SIMD 时不要求默写。
+
 ## 1. 理论背景 (Theory & Context)
 
 ### 1.1 为什么 HFT 需要 Unsafe？
@@ -47,19 +49,10 @@ fn sum_unchecked(arr: &[u64]) -> u64 {
 
 ### 2.2 协议解析：避免滥用 `transmute`
 
-网络包解析是 `unsafe` 高发区。常见错误是直接 `transmute` 成结构体引用，这会把对齐、字节序、生命周期问题绑在一起，审计难度很高。更可控的方式是使用“长度检查 + 非对齐读取 + 显式字节序转换”。
+网络包解析是 `unsafe` 高发区。常见错误是直接把字节 `transmute` 成结构体引用，这会把长度、填充、对齐、字节序、合法位模式和生命周期问题绑在一起。更好的第一选择往往是不使用 `unsafe`：按协议给出的字节偏移切片，再显式转换字节序。
 
 ```rust
-use std::mem::size_of;
-use std::ptr;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct PacketHeaderRaw {
-    seq_num_le: u64,
-    timestamp_le: u64,
-    msg_type: u8,
-}
+use std::convert::TryInto;
 
 #[derive(Clone, Copy, Debug)]
 struct PacketHeader {
@@ -69,25 +62,27 @@ struct PacketHeader {
 }
 
 fn parse_header(data: &[u8]) -> Option<PacketHeader> {
-    if data.len() < size_of::<PacketHeaderRaw>() {
-        return None;
-    }
-    let raw = unsafe {
-        // SAFETY: 已检查 data 长度至少覆盖 PacketHeaderRaw 大小；
-        // 使用 read_unaligned 避免对齐假设。
-        ptr::read_unaligned(data.as_ptr() as *const PacketHeaderRaw)
-    };
+    // 假设协议明确规定：0..8 是小端序号，8..16 是小端时间戳，16 是类型。
+    let seq_num = u64::from_le_bytes(data.get(0..8)?.try_into().ok()?);
+    let timestamp = u64::from_le_bytes(data.get(8..16)?.try_into().ok()?);
+    let msg_type = *data.get(16)?;
+
     Some(PacketHeader {
-        seq_num: u64::from_le(raw.seq_num_le),
-        timestamp: u64::from_le(raw.timestamp_le),
-        msg_type: raw.msg_type,
+        seq_num,
+        timestamp,
+        msg_type,
     })
 }
 ```
 
-这种写法把风险点拆开处理：长度、对齐、字节序都可单独审查。相比“直接转引用”，它通常更容易通过代码评审与长期维护。
+`get` 让每段长度检查靠近对应字段，`from_le_bytes` 明确了线上的小端序；结构体自身有没有填充不再影响协议长度。这段代码也给出一个重要面试结论：**先证明安全版本确实是瓶颈，再考虑局部非对齐读取；进入 `unsafe` 不是协议解析的必经步骤。**
 
 ### 2.3 SIMD (Single Instruction, Multiple Data)
+
+<details>
+<summary><strong>P2 选读：带运行时特性检测的 AVX2 示例</strong></summary>
+
+SIMD（Single Instruction, Multiple Data，单指令多数据）让一条指令同时处理多个同类元素。只有批量数据足够、布局连续、标量版本已经测出瓶颈时，才值得进入下面的平台相关实现。
 
 手写 SIMD 的前提是两层保护同时到位：编译期架构约束与运行期特性检测。下面给出一个 AVX2 计数示例，并保留标量回退路径。
 
@@ -163,9 +158,11 @@ criterion_main!(benches);
 
 如果 SIMD 实现收益不稳定，优先检查数据布局和访存模式，而不是继续增加 `unsafe` 代码面积。
 
+</details>
+
 ## 4. 常见陷阱 (Pitfalls)
 
-最危险的错误是把 `unsafe` 当作“局部性能 patch”，却没有同步维护不变量文档。没有不变量说明的 `unsafe`，在代码演进后几乎必然退化为隐患。第二个高发问题是架构与特性假设不完整，例如只写了 AVX2 路径却没有运行时检测与回退。第三个问题是生命周期欺骗，尤其是通过 `transmute` 延长引用生命周期，这类写法短期可能“能跑”，长期几乎不可维护。
+最危险的错误是把 `unsafe` 当作“局部性能 patch”，却没有同步维护不变量文档。没有不变量说明的 `unsafe` 会随着调用方和数据结构演进迅速变得难以审计。第二个高发问题是架构与特性假设不完整，例如只写了 AVX2 路径却没有运行时检测与回退。第三个问题是生命周期欺骗，尤其是通过 `transmute` 延长引用生命周期，这类写法短期可能“能跑”，长期几乎不可维护。
 
 建议把以下检查加入常规流程：单元测试覆盖边界输入，`cargo miri test` 做 UB 检测，必要时增加模糊测试（fuzzing）验证协议解析路径。
 
@@ -175,8 +172,8 @@ criterion_main!(benches);
 
 ## 6. 延伸阅读
 
-- [The Rustnomicon](https://doc.rust-lang.org/nomicon/) - Rust 官方的 Unsafe 编程圣经（死灵书）。
-- [portable-simd](https://github.com/rust-lang/portable-simd) - Rust 官方正在推进的便携式 SIMD 库（Nightly）。
+- [The Rustonomicon](https://doc.rust-lang.org/nomicon/) - Rust 官方的高级 Unsafe 编程参考。
+- [portable-simd](https://github.com/rust-lang/portable-simd) - 实验性的便携 SIMD 项目；接口和稳定性以使用时的官方文档为准。
 
 ---
 下一章：[并发模型选择 (Async vs Thread vs Actor)](concurrency.md)

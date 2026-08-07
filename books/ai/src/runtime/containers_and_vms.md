@@ -1,8 +1,8 @@
-# 容器、用户态内核与 microVM：隔离边界之下发生了什么
+# 容器、用户态内核与微型虚拟机（microVM）：隔离边界之下发生了什么
 
 > 难度：必会。JD 明确要求大规模 VM、容器隔离与多样操作系统环境；具体产品名属于备考方案，不是官方内部选型事实。
 
-> 事实边界：本章只解释 Linux KVM、QEMU、virtio、gVisor 与 Firecracker 等公开机制。DeepSeek/DSec 是否使用这些组件、如何定制、性能数据和线上参数均未知；面试时应把它们说成“通用机制或可选方案”，不能包装成对内部实现的了解。
+> 事实边界：本章只解释 Linux KVM（Kernel-based Virtual Machine，内核虚拟机接口）、QEMU、virtio、gVisor 与 Firecracker 等公开机制。DeepSeek/DSec 是否使用这些组件、如何定制、性能数据和线上参数均未知；面试时应把它们说成“通用机制或可选方案”，不能包装成对内部实现的了解。
 
 > 先修桥梁：先用[程序执行](../systems/computer_execution.md)、[进程与系统调用](../systems/process_threads_syscalls.md)和[虚拟内存](../systems/virtual_memory.md)理解“共享内核”和“独立地址空间”，再读本章。
 
@@ -13,9 +13,11 @@
 | 优先级 | 必须掌握 | 通过标准 |
 |---|---|---|
 | **P0：不能答错** | 容器、用户态内核与 VM 的隔离边界；快照需要覆盖 CPU、内存、设备和磁盘一致性并刷新克隆身份；按威胁模型、兼容性、启动、密度和运维选型 | 能在 30 秒内比较三类边界；能解释“dirty bitmap 不等于一致快照”；不会声称某一种运行时永远最安全 |
-| **P1：连续深挖** | vCPU、`KVM_RUN` 与 VM entry/exit；`GVA → GPA → HPA` 和 EPT/NPT；设备模拟、virtio、虚拟中断及块/网路径；超卖、NUMA、pinning、noisy neighbor 与证据链 | 能画出 CPU、地址翻译和 I/O 三条路径；能从 guest、VMM/KVM、宿主三层提出指标与可证伪实验 |
+| **P1：连续深挖** | 虚拟 CPU（vCPU）与 VM 进入/退出；guest 地址到宿主物理地址的两阶段翻译；设备模拟、virtio、虚拟中断及块/网路径；超卖、内存位置、绑核、共享资源竞争与证据链 | 能画出 CPU、地址翻译和 I/O 三条路径；能从 guest、VMM/KVM、宿主三层提出指标与可证伪实验 |
 
 把宿主机想成一栋公寓。普通容器像共用楼体和物业系统的独立房间；虚拟机像在楼内再建一套有自己物业的小楼；用户态内核则像在房门内增加一层翻译与门卫。三者都能隔开住户，但成本、兼容性和攻击面不同。
+
+第一次阅读先掌握三类隔离边界、选型维度和快照一致性。下面折叠的 VM entry/exit、两阶段页表、virtio 队列与脏页迁移属于 P1：面试官沿硬件或数据路径继续追问时再展开。
 
 ## 1. 容器隔离了什么，没有隔离什么
 
@@ -53,6 +55,9 @@ vCPU 是 VM 看到的逻辑处理器。VMM 通过 `/dev/kvm` 创建 VM，再创�
 - guest 内还有一层调度器，因此系统同时存在“宿主调度 vCPU”和“guest 调度应用线程”两层调度。
 
 不要把 vCPU 解释成纯软件模拟。启用硬件辅助虚拟化时，大量普通 guest 指令直接在物理 CPU 上执行，只是处于受控的 guest 模式。
+
+<details>
+<summary><strong>P1 深挖：VM entry/exit 与两阶段地址翻译</strong></summary>
 
 ### 2.2 一次 VM entry/exit 如何发生
 
@@ -111,6 +116,8 @@ VMM 还会把一段自己的宿主虚拟地址空间注册为 guest memory backi
 
 旧式或不支持第二阶段翻译的方案可维护 shadow page table，把两层关系合成宿主可执行的映射。它需要虚拟化层追踪 guest 页表变化。面试若讨论现代 x86 KVM，先讲 EPT/NPT 即可，再把 shadow paging 作为历史或兼容路径。
 
+</details>
+
 ## 4. 虚拟设备：模拟、virtio 与直通
 
 guest 不能直接假设自己独占宿主的网卡和 NVMe。VMM 必须给它呈现某种设备接口，常见有三种思路：
@@ -122,6 +129,9 @@ guest 不能直接假设自己独占宿主的网卡和 NVMe。VMM 必须给它�
 | 设备直通 | guest 直接管理物理功能或虚拟功能 | 可减少设备模型参与，性能潜力高 | 需要 IOMMU 等隔离，迁移、共享、重置和运维更复杂 |
 
 “半虚拟化”不是“半台虚拟机”，而是 guest 驱动主动遵守为虚拟环境设计的接口。virtio 是 OASIS 标准；QEMU 可以在用户态提供 backend，也可配合内核 vhost 或外部 vhost-user backend。
+
+<details>
+<summary><strong>P1 深挖：virtqueue、虚拟中断以及块/网络数据路径</strong></summary>
 
 ### 4.1 virtqueue 如何工作
 
@@ -177,6 +187,8 @@ guest 应用
 
 入站路径大致反向。额外的 NAT、overlay、策略、conntrack 和 service mesh 都可能继续加层。小包吞吐差时要特别看每包固定成本、队列与中断；大包或大流量异常时还要看 MTU、分段卸载、拥塞和拷贝。
 
+</details>
+
 ## 5. 用户态内核为什么在中间
 
 gVisor 通过 Sentry 在用户态实现 Linux 风格的系统接口，让大量系统调用不直接进入宿主内核；`runsc` 又保持 OCI 运行时接口。它不等同于 VM，也不只是 syscall allowlist。
@@ -222,6 +234,9 @@ Firecracker 的公开文档提供了一个具体例子：创建快照前 microVM
 
 暂停 vCPU 只阻止 guest CPU 继续执行，不自动让数据库完成业务级 flush；保存内存也不自动保存外部对象存储、远端数据库和网络对端状态。
 
+<details>
+<summary><strong>P1 深挖：dirty-page tracking 与增量迁移为什么不等于一致快照</strong></summary>
+
 ### 7.2 dirty-page tracking 只回答“哪些页写过”
 
 KVM 的 dirty log 可为 guest memory slot 返回 bitmap，通常每个 guest page 对应一位。某位为 1，表示跟踪窗口内该页被写脏。它可用于增量快照或迁移：先复制全量内存，之后只复制变化页。
@@ -244,6 +259,8 @@ KVM 的 dirty log 可为 guest memory slot 返回 bitmap，通常每个 guest pa
 
 因此，“有 dirty tracking，所以快照一致”是错误答案。
 
+</details>
+
 ### 7.3 从模板恢复时必须刷新身份
 
 若快照被当作新实例模板，而不是同一实例的暂停/继续，至少要检查并刷新：
@@ -258,7 +275,9 @@ KVM 的 dirty log 可为 guest memory slot 返回 bitmap，通常每个 guest pa
 
 假设冷启动 800 ms、恢复 80 ms，每秒新建 2,000 个沙箱，仅按 Little's Law 估算，启动中的平均并发约为 `2000 × 0.8 = 1600` 与 `2000 × 0.08 = 160`。这是教学数字，不是任何产品性能数据，也没有计入排队和长尾。
 
-## 8. vCPU 超卖、NUMA、pinning 与 noisy neighbor
+## 8. vCPU 超卖、非一致内存访问（NUMA）、绑核与“吵闹邻居”
+
+NUMA（Non-Uniform Memory Access）表示 CPU 访问本地内存通常比访问另一颗处理器附近的远端内存更快；pinning 是把线程绑定到指定 CPU；noisy neighbor 是同机租户争用共享资源，导致别人的延迟或吞吐恶化。三者放在一起，是因为错误放置和未隔离的共享资源都会制造长尾。
 
 ### 8.1 超卖为什么提高利用率，也伤害长尾
 
@@ -268,9 +287,9 @@ KVM 的 dirty log 可为 guest memory slot 返回 bitmap，通常每个 guest pa
 
 ### 8.2 pinning 是隔离工具，不是免费加速按钮
 
-把 vCPU 线程固定到一组 pCPU，可减少迁移、改善缓存局部性，并让延迟更可预测。但错误 pinning 会：
+把 vCPU 线程固定到一组 pCPU（物理 CPU 执行单元），可减少迁移、改善缓存局部性，并让延迟更可预测。但错误 pinning 会：
 
-- 把多个热点线程挤在同一个物理核或 SMT siblings 上。
+- 把多个热点线程挤在同一个物理核或 SMT（Simultaneous Multithreading，同时多线程）的兄弟逻辑核上。
 - 忘记给 VMM、vhost 和宿主中断线程留 CPU。
 - 让空闲核心无法接手热点，造成容量搁置。
 - 只固定 CPU，却让内存和网卡仍在远端 NUMA node。
@@ -279,7 +298,7 @@ KVM 的 dirty log 可为 guest memory slot 返回 bitmap，通常每个 guest pa
 
 ### 8.3 CPU quota 挡不住所有 noisy neighbor
 
-即使两个 VM 的 CPU 时间隔离得很好，它们仍可能争用 LLC、内存带宽、NUMA interconnect、I/O 队列、网卡、宿主锁和中断处理。noisy neighbor 的本质是共享资源竞争，所以排查时要问“还共享了什么”，而不是看到 cgroup quota 就停止。
+即使两个 VM 的 CPU 时间隔离得很好，它们仍可能争用 LLC（Last-Level Cache，末级缓存）、内存带宽、NUMA 互连、I/O 队列、网卡、宿主锁和中断处理。noisy neighbor 的本质是共享资源竞争，所以排查时要问“还共享了什么”，而不是看到 cgroup quota 就停止。
 
 资源隔离与安全隔离也不同：microVM 提供更强的内核边界，仍需 CPU、内存、I/O 和网络公平调度；容器配额做得很好，也不等于能安全运行任意恶意内核攻击代码。
 
@@ -311,11 +330,11 @@ cat /proc/pressure/cpu
 先提出可证伪假设：“vCPU 被宿主抢占或放置不当”。证据链可以是：
 
 1. guest 的 steal time、run-queue 等待或应用调度延迟与尖刺同窗上升。
-2. 宿主 CPU PSI/run queue 同窗上升，或同核上有其他繁忙 vCPU。
+2. 宿主 CPU PSI（Pressure Stall Information，压力停顿信息）或运行队列在同一时间窗口上升，或同核上有其他繁忙 vCPU。
 3. vCPU 迁移频繁，或 vCPU 在一个 NUMA node、内存/设备在另一个 node。
 4. 在同负载下做受控降超卖、调整亲和性或 NUMA 放置后，p99 明显恢复。
 
-只有前两项是相关性；最后的受控实验才更接近因果验证。若宿主 CPU 压力不高，就继续查 guest 锁、I/O、暂停和应用 GC，不要强行归因超卖。
+只有前两项是相关性；最后的受控实验才更接近因果验证。若宿主 CPU 压力不高，就继续查 guest 锁、I/O、暂停和应用 GC（Garbage Collection，垃圾回收）停顿，不要强行归因超卖。
 
 ### 故障 B：guest 磁盘很慢，宿主盘却不忙
 

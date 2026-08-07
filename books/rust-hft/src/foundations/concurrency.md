@@ -4,6 +4,8 @@
 
 本章将深入操作系统的调度原理，剖析不同并发模型的底层开销，并解释为什么 HFT 系统往往选择看似原始的 "Thread per Core" 模型。
 
+> **面试主线**：必须先按任务性质选择模型——等待型 I/O、固定低延迟流水线、单写者状态和 CPU 密集计算并不是同一个问题。`async`、线程和 Actor 的概念与权衡是 P0；具体 `isolcpus`/cgroup 参数、NUMA 工具 API 和实时调度配置属于 P2，知道为什么需要并能验证即可。
+
 ## 1. 理论背景：操作系统调度的代价
 
 要理解并发模型的选择，首先必须理解操作系统内核在做什么。
@@ -50,6 +52,9 @@ Rust 的 `async/await` 基于状态机 (State Machine) 和协作式调度 (Coope
 
 下面是 thread-per-core 的 **架构骨架**：它依赖第三方 `core_affinity` crate，并把 `receive_packet`、`process` 留给具体行情接入实现。由于还涉及核心数量和持续运行的忙轮询，mdBook 不执行该片段。
 
+<details>
+<summary><strong>P2 动手资料：用第三方库绑定当前线程</strong></summary>
+
 ```rust,ignore
 use std::thread;
 use core_affinity;
@@ -84,8 +89,16 @@ fn main() {
 }
 ```
 
+</details>
+
 ### 2.3 隔离核心 (Isolcpus)
-仅仅在代码里绑定是不够的。操作系统仍然可能在这个核心上调度一些杂务（如 SSH 守护进程、cron 任务、RCU 回调）。
+
+仅仅在代码里绑定是不够的：亲和性限制业务线程可以在哪些 CPU 上运行，却不会自动赶走中断、内核线程和其他任务。面试主线先讲清这一区别；具体部署开关按岗位选读。
+
+<details>
+<summary><strong>P2 部署资料：Linux CPU 隔离要一起检查什么</strong></summary>
+
+操作系统仍然可能在这个核心上调度一些杂务（如 SSH 守护进程、cron 任务、RCU 回调）。
 
 `isolcpus=2-5` 只能解决隔离问题的一部分，不能让内核“完全忽略”这些 CPU。完整方案通常还要规划：
 
@@ -96,6 +109,8 @@ fn main() {
 - 至少保留 housekeeping CPU 处理系统杂务。
 
 这些选项依赖内核版本与部署环境，不能复制一串启动参数就宣称完成。应以 [Linux CPU Isolation 官方文档](https://docs.kernel.org/admin-guide/cpu-isolation.html) 为准，并用 trace 验证关键 CPU 上实际发生了什么。
+
+</details>
 
 ### 2.4 NUMA 架构感知 (NUMA Awareness)
 
@@ -113,12 +128,17 @@ fn main() {
 
 下面是用于表达“先查拓扑、再决定放置”的 **伪代码骨架**。它依赖具体版本的 `hwloc` 绑定，类型名和返回值还会随 crate API 变化，不能作为独立 Rust 程序执行。
 
+<details>
+<summary><strong>P2 选读：NUMA 拓扑库的伪代码形状</strong></summary>
+
 ```rust,ignore
 // 伪代码骨架：检查 NUMA 拓扑
 let topology = hwloc::Topology::new();
 let core = topology.objects_with_type(ObjectType::Core)[0];
 // 确保网卡、CPU 核心、内存都在同一个 NUMA 节点！
 ```
+
+</details>
 
 ### 2.5 Actor 不是第四种线程，而是一种所有权模型
 

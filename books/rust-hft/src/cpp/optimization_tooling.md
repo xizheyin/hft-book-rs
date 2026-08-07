@@ -6,6 +6,8 @@ C++ 给了开发者很多性能旋钮：`-O3`、LTO、PGO、SIMD、`perf`……�
 
 > 本章目标：能构建可分析的 C++20 Release 程序；能解释基准的计时边界；会用 `perf` 区分热点与等待；知道 LTO/PGO/SIMD 的收益条件；会用 ASan、UBSan、TSan 先排查正确性问题。
 
+> **面试优先级**：P0 必会“指标—基线—定位—单一改动—复验”的证据链、基准陷阱，以及 Sanitizer 分别检查什么；P1 理解优化级别、LTO/PGO/SIMD 与 `perf` 的适用条件；完整 CMake、PGO 命令和编译器向量化报告属于 P2 动手资料，不需要逐字背诵。
+
 先认识本章会反复出现的最小术语：
 
 | 术语 | 先这样理解 |
@@ -62,6 +64,9 @@ main.o
 ### 2.1 一个最小而可扩展的 CMakeLists
 
 假设目录中有本章稍后的 `benchmark.cpp`，旁边新建 `CMakeLists.txt`：
+
+<details>
+<summary>P2 动手资料：完整 CMake 配置与构建命令</summary>
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)
@@ -120,6 +125,8 @@ cmake --build build/release --parallel --verbose
 - 单配置生成器使用 `CMAKE_BUILD_TYPE`；Visual Studio、Xcode 等多配置生成器通常在构建时写 `--config Release`。
 
 不要在 `CMakeLists.txt` 中无条件覆盖用户的 `CMAKE_CXX_FLAGS`。优先使用 target 级配置和 CMake 自带的 IPO 能力，让工具链负责选择相容的编译、链接参数。
+
+</details>
 
 ## 3. GCC / Clang 的优化级别
 
@@ -343,6 +350,9 @@ PGO（Profile-Guided Optimization，基于剖面的优化）通常分三步：
 
 编译器可以利用这些信息调整分支布局、内联和代码布局。关键不是“跑得久”，而是训练流量是否代表生产关键路径。
 
+<details>
+<summary>P2 动手资料：GCC 与 Clang 的最小 PGO 命令</summary>
+
 ### 6.1 GCC 最小流程
 
 ```bash
@@ -370,6 +380,8 @@ clang++ -std=c++20 -O3 \
 
 这些命令用于理解流程；真实项目应让 CMake/CI 管理相同的编译参数和 profile 产物。训练后要检查 missing/stale profile 警告，不能悄悄退回无 PGO 构建。
 
+</details>
+
 PGO 的常见故障模式：
 
 - 只用“平静行情”训练，极端路径反而布局更差；
@@ -385,6 +397,11 @@ PGO 的常见故障模式：
 SIMD（Single Instruction, Multiple Data）让一条指令并行处理多个整数或浮点数。上一节基准中的连续数组求和，就是编译器可能自动向量化的形状。
 
 ### 7.1 先看编译器报告
+
+知道“先让编译器报告是否向量化、再看汇编和端到端指标”即可。不同编译器的精确参数属于查阅型知识：
+
+<details>
+<summary>P2 动手资料：GCC / Clang 向量化报告命令</summary>
 
 GCC：
 
@@ -403,6 +420,8 @@ clang++ -std=c++20 -O3 -march=native \
 ```
 
 报告只能告诉你编译器做了什么或为什么放弃，不能证明向量化后端到端更快。还要检查汇编和目标指标。
+
+</details>
 
 ### 7.2 更容易自动向量化的数据形状
 

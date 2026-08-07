@@ -1,5 +1,7 @@
 # AF_XDP 实战：XDP、UMEM 与 buffer 所有权
 
+> **面试优先级：P2 / 岗位专项。** 先理解 copy 与 zero-copy 不是一回事，以及四个 ring 如何交接 buffer；驱动能力、BPF 权限和 UMEM 细节只在相关岗位深入。
+
 AF_XDP 是 Linux 的高性能 packet socket。XDP 程序可以把指定网卡 queue 的报文重定向到 XSK，应用再通过共享 ring 和 UMEM 收发 packet。
 
 它保留 Linux 驱动与 BPF 控制面，但被 `XDP_REDIRECT` 到 XSK 的 packet 不再继续经过普通 socket、iptables/nftables 等后续网络栈。所谓“与内核共存”不等于每个工具都能看到 fast-path 流量。

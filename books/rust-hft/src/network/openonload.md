@@ -1,5 +1,7 @@
 # AMD/Solarflare OpenOnload、TCPDirect 与 ef_vi
 
+> **面试优先级：P2 / 厂商专项。** 没有相关项目经历时，只需区分 socket 兼容栈与底层 packet API；不要为通用面试背厂商初始化函数和参数。
+
 AMD/Solarflare NIC 在低延迟网络中较常见，但是否采用仍取决于交易所认证、NIC/固件、团队运维和实测结果。这个生态中有三个容易混淆的层次：
 
 | 方案 | 抽象层 | 应用看到什么 |

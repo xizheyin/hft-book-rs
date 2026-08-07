@@ -1,5 +1,7 @@
 # io_uring 深度解析：提交了，不等于上网线了
 
+> **面试优先级：P2。** 通用面试能区分 SQE、CQE 和 completion 边界即可；注册资源、多次完成和各 opcode 生命周期只在岗位或项目确实使用时深入。
+
 `io_uring` 是 Linux 的异步 I/O 接口。与 `epoll` 常见的“先等 readiness，再调用 `recv`/`send`”不同，它允许应用直接提交读写操作，再从完成队列取得结果。
 
 它的主要价值是批量提交、减少 syscall 次数、注册资源和统一 completion 模型。它不会自动绕过 TCP/IP 协议栈，也不承诺运行期间完全避免 syscall 或 payload copy。

@@ -4,13 +4,24 @@
 
 理解这条路径的意义在于：很多时候，程序的瓶颈并不来自业务逻辑，而来自数据在不同保护域和不同缓存层次之间的移动成本，以及这些移动成本对延迟与吞吐量的双重影响。
 
+## 新人学习顺序
+
+| 优先级 | 章节 | 学到什么程度 |
+| --- | --- | --- |
+| P0 必会 | 网络基础、I/O 模型、TCP 优化 | 能从 NIC 讲到 socket；能区分 blocking、readiness、completion；能解释短读、Nagle 与连接状态 |
+| P1 应会 | UDP 组播、Linux 网络调优 | 能设计 gap recovery，并能用分层指标定位丢包和尾延迟 |
+| P2 选读 | `io_uring` | 岗位涉及异步文件/网络 I/O 时，理解 SQ/CQ、buffer 生命周期与完成语义 |
+| P2 岗位专项 | Kernel Bypass、DPDK、AF_XDP、OpenOnload | 只在岗位或简历明确涉及时，继续学习驱动、DMA、UMEM/mbuf 与部署边界 |
+
+P2 不是“不重要”，而是**不应挡住新人先掌握网络主线**。面试没有追问底层框架时，能准确说明语义和取舍，比罗列技术名词更有价值。
+
 ## 章节概览
 
 1.  **[网络协议栈基础 (Network Stack Basics)](basics.md)**
     *   网络设备、中断、驱动与内核协议栈的关系。
     *   用户态程序如何与内核态 I/O 路径交互。
 
-2.  **[I/O 模型演进 (Evolution of I/O Models)](io_models.md)**
+2.  **[I/O 模型：就绪、完成与忙轮询](io_models.md)**
     *   阻塞 I/O、非阻塞 I/O、复用与异步 I/O 的差异。
     *   吞吐优先与低延迟优先模型的权衡。
 
@@ -22,11 +33,11 @@
     *   多播组管理、丢包检测与恢复策略。
     *   高速消息流的接收与分发。
 
-5.  **[io_uring 深度解析](io_uring.md)**
+5.  **[io_uring 深度解析（P2）](io_uring.md)**
     *   提交队列、完成队列与系统调用折叠。
     *   批处理、注册缓冲区与用户态驱动边界。
 
-6.  **[内核旁路技术 (Kernel Bypass)](kernel_bypass.md)**
+6.  **[内核旁路技术（P2 / 岗位专项）](kernel_bypass.md)**
     *   为什么 `epoll` 在某些负载下仍然不够快。
     *   DPDK、AF_XDP、OpenOnload 的适用边界。
 

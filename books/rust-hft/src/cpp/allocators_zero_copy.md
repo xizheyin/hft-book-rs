@@ -6,6 +6,8 @@
 
 > **本章目标**：读完后，你能解释分配与对象生命周期的区别，正确使用 `reserve` 和 `std::pmr`，写出有容量上限的对象池，并识别 `std::span` 零拷贝视图的生命周期风险。
 
+> **面试优先级**：P0 必会分配与对象生命周期的区别、`reserve`/`resize`、视图不拥有数据以及缓冲区何时可复用；P1 理解 Arena、对象池和容量耗尽策略；`std::pmr` 的完整 API、Scatter/Gather 系统调用形状属于 P2 岗位选读。面试重点是所有权与失败边界，不是背接口名字。
+
 ## 1. 动态分配到底做了什么
 
 对下面的表达式：
@@ -91,6 +93,9 @@ flowchart LR
 
 `std::pmr` 是标准库的多态内存资源接口。`std::pmr::monotonic_buffer_resource` 提供接近 Arena 的“只向前分配、整体释放”行为：
 
+<details>
+<summary>P2 岗位选读：`std::pmr` 的完整示例</summary>
+
 ```cpp
 #include <array>
 #include <cassert>
@@ -129,6 +134,8 @@ int main() {
 - 使用该资源的容器或视图不能活过资源及其底层缓冲区；
 - `std::pmr` 的“多态”意味着运行时通过资源接口分配，不等于每次一定更慢或更快；
 - 嵌套容器是否都使用同一资源取决于类型和构造方式，不能只给最外层换名字就假定所有内部字符串都进入 Arena。
+
+</details>
 
 ### 3.2 Arena 的失败策略必须明确
 
@@ -319,6 +326,9 @@ stateDiagram-v2
 
 某些 I/O API 能一次提交多个不连续缓冲区，例如一个头部和一个 payload，从而避免先拼成连续大包。下面只是接口形状示意，具体函数、头文件和完成语义依平台而定：
 
+<details>
+<summary>P2 岗位选读：Scatter/Gather 的接口形状</summary>
+
 ```cpp,ignore
 std::array<iovec, 2> parts{
     iovec{header.data(), header.size()},
@@ -332,6 +342,8 @@ const auto bytes_sent = ::sendmsg(socket_fd, &message, 0);
 ```
 
 它可以消除用户态拼包复制，却不自动消除内核、驱动或设备中的其他复制，也不自动延长两个缓冲区的生命周期。
+
+</details>
 
 ## 8. HFT 场景：预分配的消息流水线
 

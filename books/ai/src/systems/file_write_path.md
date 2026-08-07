@@ -1,8 +1,18 @@
 # 一次文件写入：从 `write()` 到真正落盘
 
-> 难度：必会。系统基础面试经常要求候选人讲清一次文件写入的完整路径、每一层的完成语义，以及延迟可能出现在哪里。
+> 系统基础面试经常问“`write()` 返回后，数据到底在哪里”。你必须讲清稳定的主路径和完成语义；内核辅助结构、设备直接访存描述符和 SSD 内部实现只在面试官继续追问时展开，不需要背具体调用栈。
 
 > 先修桥梁：若系统调用、页缓存、inode 或 WAL 还陌生，先读[进程、线程、系统调用与调度](process_threads_syscalls.md)、[虚拟内存](virtual_memory.md)与[文件系统和数据库](filesystem_database.md)。本章把这些概念串成一次真实操作。
+
+## 本章怎么读
+
+| 优先级 | 阅读范围 | 面试通过标准 |
+|---|---|---|
+| **P0：必会** | 第 0～5、8～10、16～19 节的主线 | 能用 30 秒区分 `write`、`fsync` 与真正持久化，能解释短写和晚到错误 |
+| **P1：理解** | Writeback、块层、文件系统一致性、慢路径与诊断 | 面试官追问延迟或故障时，能沿层次提出证据，而不是只背名词 |
+| **P2：选读** | 折叠起来的页缓存、处理器缓存、设备直接访存与 SSD 内部细节 | 只在被追到内核版本或硬件数据路径时展开；记住因果，不背结构名 |
+
+第一次阅读先沿 P0 走通“用户缓冲 → 内核页缓存 → 后台回写 → 设备持久边界”。折叠内容用于回答读者常追问的“软硬件具体做了什么”，不是每位候选人的背诵清单。
 
 ## 0. 先限定问题：这里讲的是哪一种 `write`
 
@@ -13,7 +23,7 @@
 - 文件已经打开，应用持有可写文件描述符 `fd`；
 - 普通 Buffered I/O（缓冲 I/O）；
 - 没有设置 `O_DIRECT`、`O_SYNC` 或 `O_DSYNC`；
-- 以 ext4/XFS 一类本地文件系统和 NVMe SSD 帮助建立画面；
+- 以 ext4/XFS 一类本地文件系统和 NVMe（Non-Volatile Memory Express，一种面向非易失存储的高速协议）SSD 帮助建立画面；
 - 示例假设页面大小为 4 KiB，但真实值应从目标机器查询。
 
 具体函数名、锁和数据结构会随内核版本、文件系统与设备变化。本章给出的是**稳定的分层模型**，不是要求背诵某个 Linux 版本的调用栈。
@@ -56,7 +66,7 @@ ssize_t n = write(fd, buf, 4096);
 |---:|---|---|---|---|
 | 0 | 只在应用缓冲区 | 还没调用 `write` | 可能丢失 | 丢失 |
 | 1 | 用户态运行库缓冲区 | `BufWriter::write_all` / `fwrite` | 可能丢失 | 丢失 |
-| 2 | 内核页缓存中的 Dirty Folio | 普通 `write` 返回 | 通常仍可由内核回写 | 可能丢失 |
+| 2 | 内核页缓存中的脏页（现代 Linux 常以 Folio 管理） | 普通 `write` 返回 | 通常仍可由内核回写 | 可能丢失 |
 | 3 | 块 I/O 已提交或设备已完成普通写 | 后台 Writeback | 取决于后续完成 | 若设备缓存易失，仍可能丢失 |
 | 4 | 文件数据和所需元数据达到设备承诺的持久化边界 | `fdatasync` / `fsync` 成功 | 应可恢复 | 取决于文件系统、设备是否正确兑现协议及故障范围 |
 | 5 | 远端副本或业务系统确认 | 复制 ACK / 业务 ACK | 由上层协议定义 | 由副本与故障模型定义 |
@@ -122,7 +132,14 @@ flowchart LR
 - 根本无效，最终得到 `EFAULT`；
 - 跨越多个页面，需要分段处理。
 
-因此，概念上的“用户态到内核复制”不是“永远固定成本的一次 memcpy”。现代通用 Buffered Write 源码通常通过 `iov_iter` 和 Folio Copy Helper 分段复制，而不是由 VFS 裸调用一次名为 `copy_from_user` 的函数；即使如此，User Access 校验、缺页与 `EFAULT` 等机制仍然存在。
+因此，概念上的“用户态到内核复制”不是“永远固定成本的一次 memcpy”。
+
+<details>
+<summary><strong>P2 选读：为什么源码里未必直接出现 <code>copy_from_user</code></strong></summary>
+
+现代 Linux 的通用 Buffered Write 通常通过 `iov_iter` 和 Folio Copy Helper 分段复制，而不是由文件系统公共入口裸调用一次名为 `copy_from_user` 的函数。具体辅助函数会随内核路径变化；稳定结论是 User Access 校验、缺页与 `EFAULT` 等机制仍然存在。
+
+</details>
 
 ## 3. 第一道边界：CPU 怎样从用户态进入内核态
 
@@ -227,10 +244,13 @@ Page Cache 用 RAM 缓存文件内容。现代 Linux 常用 Folio 管理一页�
 
 ### 5.3 用户数据复制期间硬件还在工作
 
+<details>
+<summary><strong>P2 选读：把一次 4 KiB 复制继续追到地址翻译与处理器缓存</strong></summary>
+
 复制看似只是“把 4096 字节从 A 搬到 B”，实际涉及：
 
-- MMU 把用户虚拟地址和内核页缓存地址翻译成物理地址；
-- TLB 缓存地址翻译；
+- MMU（Memory Management Unit，内存管理单元）把用户虚拟地址和内核页缓存地址翻译成物理地址；
+- TLB（Translation Lookaside Buffer，地址翻译缓存）保存近期的翻译结果；
 - CPU 从用户缓冲对应的缓存行/内存读取；
 - CPU 把数据写入页缓存对应的缓存行；
 - Cache Coherence 保证多个核心对这些缓存行的观察符合架构规则；
@@ -240,6 +260,8 @@ Page Cache 用 RAM 缓存文件内容。现代 Linux 常用 Folio 管理一页�
 以 4096 字节、常见 64 字节 Cache Line 为教学假设，它覆盖 64 条缓存行。仅计算数据本体，复制至少涉及约 4 KiB 读取和 4 KiB 写入；真实内存流量还可能包含写分配、回写和元数据访问。
 
 不要把这个算术直接换成生产延迟。缓存命中、NUMA、内存带宽竞争、预取和实现方式都会改变结果。
+
+</details>
 
 ### 5.4 文件系统还要更新什么
 
@@ -279,7 +301,7 @@ sequenceDiagram
 
     W->>P: 后台条件或 fsync 触发回写
     P->>W: 映射块并构造 I/O
-    W->>N: 驱动提交命令，设备 DMA 读取主机内存
+    W->>N: 驱动提交命令，设备通过直接内存访问（DMA）读取主机内存
     N-->>W: Completion
     W->>P: 完成 Writeback，记录成功或错误
 ```
@@ -375,6 +397,9 @@ flowchart LR
 - 多次 `write` 也可能被合并成更少请求；
 - 设备看到的顺序不应由“我先调用了哪个 `write`”猜测，持久化依赖关系要通过文件系统和块层协议明确表达。
 
+<details>
+<summary><strong>P2 选读：从驱动、DMA 继续追到 NVMe 控制器与 NAND</strong></summary>
+
 ## 7. 从驱动到 SSD：硬件具体做了什么
 
 ### 7.1 驱动不是把虚拟地址直接塞给设备
@@ -410,7 +435,7 @@ sequenceDiagram
     participant SQ as Submission Queue
     participant C as NVMe 控制器
     participant RAM as 主机 RAM/Page Cache
-    participant VC as 控制器缓存/FTL
+    participant VC as 控制器缓存/闪存映射层
     participant NAND as 非易失介质
     participant CQ as Completion Queue
 
@@ -450,6 +475,8 @@ sequenceDiagram
 - **PLP（Power Loss Protection）**：设备用电容等手段在掉电时保护缓存数据。
 
 文件系统通过正确的 Flush/FUA/Barrier 顺序表达崩溃一致性。应用不应自己猜测“NVMe 很快，所以普通完成肯定已经安全”。
+
+</details>
 
 ## 8. `fsync` 到底比 `write` 多做了什么
 
@@ -586,8 +613,8 @@ Linux 会追踪 Writeback Error。某批脏页稍后写设备失败时，错误�
 | Cache | 在哪里 | 保存什么 | 谁管理 |
 |---|---|---|---|
 | 用户态缓冲 | 进程虚拟内存 | 应用尚未交给内核的数据 | Rust/C 运行库或应用 |
-| CPU Cache | CPU 核心/共享缓存层次 | 最近访问的内存 Cache Line | CPU 硬件与一致性协议 |
-| TLB | CPU | 虚拟页到物理页的地址翻译 | CPU + OS 页表维护 |
+| CPU 高速缓存（CPU Cache） | CPU 核心/共享缓存层次 | 最近访问的内存 Cache Line | CPU 硬件与一致性协议 |
+| TLB（地址翻译缓存） | CPU | 虚拟页到物理页的地址翻译 | CPU + OS 页表维护 |
 | Page Cache | 内核管理的 RAM | 文件内容和 Dirty/Writeback 状态 | Linux VM + 文件系统 |
 | SSD Write Cache | 存储控制器 | 等待落到非易失介质的数据 | 设备固件和协议 |
 
@@ -728,7 +755,7 @@ HFT 或其他低延迟系统则常把持久化移出热路径：生产线程写�
 
 ### 16.1 30 秒版本
 
-> 我先限定为 Linux 本地普通文件的 Buffered I/O。`write` 进入内核后根据 fd 找到文件对象，经 VFS 分派给具体文件系统，把用户缓冲复制到 Page Cache，标记为 Dirty 并更新文件状态，通常到这里就可以返回。之后后台 Writeback 或 `fsync` 才把脏页经文件系统块映射、bio、blk-mq 和 NVMe 驱动提交给设备；控制器通过 DMA 读取主机内存，再处理缓存、FTL 和 NAND。普通 `write` 成功不等于断电安全，需要根据恢复要求使用 `fdatasync`、`fsync`，新建或重命名文件时还要考虑父目录同步。
+> 我先限定为 Linux 本地普通文件的 Buffered I/O。`write` 进入内核后根据 fd 找到文件对象，经 VFS 分派给具体文件系统，把用户缓冲复制到 Page Cache，标记为 Dirty 并更新文件状态，通常到这里就可以返回。之后后台 Writeback 或 `fsync` 才把脏页经文件系统和块层提交给设备。普通 `write` 成功不等于断电安全，需要根据恢复要求使用 `fdatasync`、`fsync`，新建或重命名文件时还要考虑父目录同步。若面试官继续追硬件，再补充驱动、DMA、设备缓存和非易失介质的完成边界。
 
 ### 16.2 90 秒答题骨架
 
@@ -736,7 +763,7 @@ HFT 或其他低延迟系统则常把持久化移出热路径：生产线程写�
 2. **入口**：语言库按 ABI 发起系统调用；模式切换不一定是线程上下文切换。
 3. **内核对象**：fd table → 打开文件对象 → VFS → 文件系统。
 4. **快速返回路径**：按 Folio 复制到 Page Cache、标脏、更新 offset/inode、返回实际字节数。
-5. **异步硬件路径**：Writeback → 块映射 → bio/blk-mq → 驱动 → DMA → NVMe/FTL/NAND。
+5. **异步设备路径**：Writeback → 块映射 → 块层 → 驱动 → 设备；被追问时再展开 DMA、NVMe 控制器和介质内部处理。
 6. **完成语义**：`write`、`fdatasync`、`fsync`、目录同步和业务 ACK 不同。
 7. **慢路径和错误**：缺页、Dirty Throttling、锁、空间、队列、晚到的 EIO。
 8. **工程取舍**：批量、RPO、P99、隔离和故障验证。
@@ -859,12 +886,13 @@ CPU 执行系统调用入口 → VFS 根据 fd 分派 → Page Cache Folio 标�
 2. Buffered `write` 的常见快速路径是：Syscall → fd/VFS → 文件系统 → Page Cache Dirty。
 3. 模式切换不等于线程上下文切换。
 4. 用户页缺页、内存回收和 Dirty Throttling都可能让 `write` 产生长尾。
-5. Writeback 再经过块映射、BIO、blk-mq、驱动、DMA、NVMe、FTL 与 NAND。
-6. 对主机写盘而言，NVMe 控制器通常 DMA Read 主机内存。
-7. `write`、`fflush`、`fdatasync`、`fsync`、目录同步与业务 ACK 是不同完成点。
-8. `O_DIRECT` 改变数据路径，不自动提供持久性。
-9. Partial Write 和延迟错误必须进入业务恢复协议。
-10. 优化必须同时写清吞吐、尾延迟、数据丢失窗口和验证方法。
+5. Writeback 再经过文件系统块映射、块层和驱动提交给设备。
+6. `write`、`fflush`、`fdatasync`、`fsync`、目录同步与业务 ACK 是不同完成点。
+7. `O_DIRECT` 改变数据路径，不自动提供持久性。
+8. Partial Write 和延迟错误必须进入业务恢复协议。
+9. 优化必须同时写清吞吐、尾延迟、数据丢失窗口和验证方法。
+
+> **P2 被追问再补**：对主机“写 SSD”而言，控制器通常通过 DMA Read 读取主机内存；NVMe 队列、设备缓存、FTL 与 NAND 又构成设备内部的下一段路径。
 
 ## 20. 一手资料
 

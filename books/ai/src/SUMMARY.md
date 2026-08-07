@@ -4,7 +4,7 @@
 - [官方岗位要求与知识边界](orientation/role_map.md)
 - [候选人能力矩阵与面试定位](orientation/candidate_strategy.md)
 
-# 第一部分：计算机系统地基
+# 第一部分：操作系统与计算机系统地基
 
 - [一次程序怎样跑起来：CPU、内存、内核与设备](systems/computer_execution.md)
 - [进程、线程、系统调用与调度](systems/process_threads_syscalls.md)

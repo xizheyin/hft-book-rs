@@ -1,121 +1,202 @@
-# UDP 多播处理 (UDP Multicast)
+# UDP 组播：快速分发行情，可靠性由应用补齐
 
-在交易所的世界里，市场数据 (Market Data) 是生命之源。为了将海量的订单簿更新推送给所有参与者，交易所通常采用 **UDP 多播 (Multicast)**。
-相比 TCP，UDP 没有握手、没有重传、没有拥塞控制，它是真正的“发射后不管 (Fire and Forget)”。
+> **面试优先级：P1。** 必须会讲组播为什么适合一对多 feed，以及序列号、A/B 线路、重传、快照如何组成恢复链路。交换机 IGMP 参数和特定交易所字段属于岗位相关细节。
 
-本章将介绍如何高效、可靠地处理这些高速数据流。
+**UDP** 提供独立数据报：一次发送对应一个数据报边界，但协议本身不保证送达、顺序或只送一次。**IP 组播**让发送端把数据发往一个组地址，由网络按订阅关系复制给多个接收端。
 
-## 1. 基础配置
+交易行情常用它，不是因为“UDP 永远最快”，而是因为同一份高频 feed（数据流）可以高效发给很多参与者。代价是接收方必须明确回答：出现 gap（序列缺口）怎么办、两条线路重复怎么办、状态变成 stale（陈旧且不可信）后怎样 recovery（恢复）。
 
-### 1.1 加入多播组
-要接收多播数据，你需要加入特定的 IP 组（如 `239.0.0.1`）。
+## 1. 单播、广播和组播
 
-下面使用第三方 `socket2`，因为它能暴露地址复用和接收缓冲等底层选项。代码依赖真实网卡、路由与组播环境，所以标为 `ignore`；验证时在独立 Cargo 项目执行 `cargo add socket2`、`cargo check`，再在隔离 network namespace/VLAN 中用发送端与抓包/计数器做集成测试。
+| 方式 | 接收者 | 复制发生在哪里 | 常见用途 |
+| --- | --- | --- | --- |
+| 单播 | 一个目标地址 | 发送端或上游逐个发送 | TCP 订单会话、重传服务 |
+| 广播 | 一个二层广播域内的所有主机 | 交换网络 | 地址发现等局部协议 |
+| 组播 | 加入某个组的接收者 | 支持组播的交换机/路由器 | 行情与实时数据分发 |
 
-```rust,ignore
-use socket2::{Socket, Domain, Type, Protocol};
-use std::net::{Ipv4Addr, SocketAddrV4};
+组播提高的是**分发效率**，不自动保证每个参与者在同一时刻收到数据。链路长度、交换机排队、接收主机和时钟都会造成差异。
 
-fn join_multicast(interface_ip: Ipv4Addr, multicast_ip: Ipv4Addr, port: u16) -> Socket {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-    
-    // 允许地址复用（允许多个进程监听同一端口）
-    socket.set_reuse_address(true).unwrap();
-    // socket.set_reuse_port(true).unwrap(); // Linux specific
-    
-    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-    socket.bind(&addr.into()).unwrap();
-    
-    // 关键一步：告诉内核我们要加入哪个组，并通过哪个网卡（interface）接收
-    socket.join_multicast_v4(&multicast_ip, &interface_ip).unwrap();
-    
-    socket
+## 2. 加入一个组时发生了什么
+
+接收程序需要知道三项信息：组播 IP、UDP 端口和接收网卡。
+
+```rust,no_run
+use std::io;
+use std::net::{Ipv4Addr, UdpSocket};
+
+fn join_feed(
+    group: Ipv4Addr,
+    interface: Ipv4Addr,
+    port: u16,
+) -> io::Result<UdpSocket> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port))?;
+    socket.join_multicast_v4(&group, &interface)?;
+    Ok(socket)
 }
 ```
 
-### 1.2 SO_RCVBUF
-Socket 缓冲区溢出是常见丢包原因之一；包也可能丢在交换机、NIC ring 或内核 backlog。接收缓冲要能吸收实测 microburst，但不是无脑设为系统最大值：过大的队列会积压过期行情并掩盖应用长期处理不过来的事实。
+`join_multicast_v4` 告诉内核：这个 socket 希望通过指定接口接收该组的数据。IPv4 中，内核维护 **IGMP**（Internet Group Management Protocol）membership（成员关系），并在协议需要时发送或响应成员报告；支持 IGMP snooping 的交换机据此学习哪些端口需要流量。
 
-```bash
-# 系统层面
-sysctl -w net.core.rmem_max=16777216
+`join` 成功只表示本机调用成功，不证明交换机 VLAN、querier（定期查询组成员的设备）、三层组播路由和交易所 feed 都正确。多网卡服务器必须显式选择接口，并用抓包与端口计数器验证实际流向。
+
+`SO_REUSEADDR`/`SO_REUSEPORT` 在不同系统上的绑定与分流语义不同。若多个进程都要收到完整副本，不能仅凭“允许重复绑定”推断内核一定复制给每个进程。
+
+## 3. 接收方先保护数据报边界
+
+UDP 保留数据报边界，但接收缓冲区太小时，超出部分会被截断或以平台接口规定的方式报告。程序应按协议最大包长分配缓冲区，并把“实际长度是否合法”作为解析前置条件。
+
+```text
+NIC / kernel 收到一个 UDP 数据报
+        ↓
+检查来源、目的组、长度、协议版本和协议规定的校验字段（若有）
+        ↓
+读取 packet sequence 与 message count
+        ↓
+去重 / A-B 仲裁 / gap 检测
+        ↓
+逐条解析消息并更新状态
+        ↓
+推进 next_expected_sequence
 ```
 
-下面一行延续上一段的 `socket2::Socket`，不是独立程序；系统还可能把请求值翻倍或受 `rmem_max` 限制，因此启动时应读回实际值并记录。
+不要先修改订单簿，再发现包尾损坏。更安全的顺序是先完成包级边界和校验，再把完整、顺序正确的消息交给状态机。
 
-```rust,ignore
-// 代码层面
-socket.set_recv_buffer_size(16 * 1024 * 1024).unwrap();
-```
+## 4. 序列号解决什么问题
 
-## 2. 丢包检测与恢复 (Gap Detection & Recovery)
+feed 通常为包或消息定义递增序列号。接收方保存 `next_expected`：
 
-UDP 不保证可靠传输。在网络拥塞时，你可能会发现 Sequence Number 跳变：
-`100, 101, 102, 104, 105` (丢了 103)。
+- `first == next_expected`：正好接上，并按 `message_count` 推进；
+- 整个序列范围都小于 `next_expected`：完整重复或迟到包；
+- 序列范围跨过 `next_expected`：部分重叠，必须按协议处理；
+- `first > next_expected`：中间存在缺口，当前状态可能不再可信。
 
-### 2.1 序列号检查
-交易所的协议（如 ITCH, SBE）通常会在包头包含一个 `Sequence Number`。
+下面的简化模型假设 `first_sequence` 是**包内第一条消息的序号**，一包可含多条消息，因此要同时读取它和 `message_count`。若目标协议给的是“每包一个序号”，下一包通常按协议规定的包步长推进，不能套用这里的消息数量。只记录“见过的最大序号”会错误跳过包内范围。
 
 ```rust
-struct GapDetector {
-    next_seq: u64,
+#[derive(Debug, PartialEq)]
+enum Decision {
+    Apply { next_expected: u64 },
+    DuplicateOrLate,
+    Overlap { first_new: u64, end_inclusive: u64 },
+    Gap { missing_from: u64, missing_to: u64 },
 }
 
-impl GapDetector {
-    fn on_packet(&mut self, seq: u64, count: u64) {
-        if seq > self.next_seq {
-            println!("GAP DETECTED! Expected {}, got {}", self.next_seq, seq);
-            // 触发重传逻辑
-        } else if seq < self.next_seq {
-            // 可能是乱序包，或者是 A/B 通道的重复包
-        }
-        
-        self.next_seq = seq + count;
+fn classify(next_expected: u64, first: u64, count: u64) -> Option<Decision> {
+    if count == 0 {
+        return None;
+    }
+    let end_exclusive = first.checked_add(count)?;
+
+    if end_exclusive <= next_expected {
+        Some(Decision::DuplicateOrLate)
+    } else if first < next_expected {
+        Some(Decision::Overlap {
+            first_new: next_expected,
+            end_inclusive: end_exclusive - 1,
+        })
+    } else if first == next_expected {
+        Some(Decision::Apply { next_expected: end_exclusive })
+    } else {
+        Some(Decision::Gap {
+            missing_from: next_expected,
+            missing_to: first - 1,
+        })
     }
 }
+
+assert_eq!(classify(103, 103, 2), Some(Decision::Apply { next_expected: 105 }));
+assert_eq!(classify(105, 103, 2), Some(Decision::DuplicateOrLate));
+assert_eq!(
+    classify(104, 103, 3),
+    Some(Decision::Overlap { first_new: 104, end_inclusive: 105 })
+);
+assert_eq!(
+    classify(103, 106, 1),
+    Some(Decision::Gap { missing_from: 103, missing_to: 105 })
+);
 ```
 
-### 2.2 恢复策略
-1.  **Snapshot (快照)**: 如果丢包严重，直接请求最新的全量快照（如 TCP 连接）。
-2.  **Retransmission (重传)**: 向交易所的 TCP 重传服务器请求特定的 Seq 范围（如 "Give me 103"）。
-3.  **按协议降级或跳过**: 只有 feed 规范明确说明后续消息能完整覆盖缺失状态时才可跳过。维护订单簿的增量消息通常不能随意忽略，否则本地状态会永久错误。
+`Apply` 明确返回下一期望序号，所以 `message_count` 真正参与推进。`Overlap` 表示一部分范围已处理、一部分是新的；除非 feed 规范明确允许按消息去重，否则不要擅自只应用后半包，应进入协议规定的错误或恢复路径。这里的 `None` 表示 `count == 0` 或加法溢出，调用者应按协议错误处理。真实实现还要遵循序列号回绕、session reset、空包和消息计数规则，不能从这个简化函数猜测交易所语义。
 
-## 3. A/B 通道仲裁 (Arbitration)
+## 5. A/B 线路怎样仲裁
 
-为了提高可靠性，交易所通常提供两条完全独立的物理线路（Line A 和 Line B），发送完全相同的数据。
+交易所可能从相互独立的 Line A 和 Line B 发送相同序列。目标是：先到的有效副本进入主线，另一份用于补偿单路丢失。
 
-**目标**: 无论 A 还是 B，谁先到就用谁。如果 A 丢包了，B 补上。
-
-### 3.1 实现思路
-- **单线程轮询**: 在一个线程中轮询 socket A 和 socket B。
-- **序列号仲裁**: 按协议的 packet sequence 与 message count 维护下一个期望范围。不能只用 `max_seq_processed`：一包可能包含多条消息，A/B 还可能乱序，必须保留有限窗口并在确认两路都缺失后触发恢复。
-
-下面是**教学骨架**：`socket_a/socket_b`、buffer、频道枚举和仲裁状态由完整应用提供。它只表达“两路都要轮询”，不能直接用于生产；验证应注入重复、乱序、单路/双路丢包和 sequence wrap，并检查只应用一次且能进入恢复状态。
-
-```rust,ignore
-loop {
-    // 非阻塞读取 A
-    if let Ok((size, _)) = socket_a.recv_from(&mut buf_a) {
-        process(&buf_a[..size], Channel::A, &mut state);
-    }
-    // 非阻塞读取 B
-    if let Ok((size, _)) = socket_b.recv_from(&mut buf_b) {
-        process(&buf_b[..size], Channel::B, &mut state);
-    }
-}
+```mermaid
+flowchart LR
+    A["Line A"] --> W["有限重排 / 去重窗口"]
+    B["Line B"] --> W
+    W --> O["连续序列输出"]
+    W -->|"两路都缺同一范围"| R["Recovery"]
 ```
 
-## 4. 常见陷阱
+仲裁器至少要处理：
 
-1.  **多网卡困境**:
-    如果你的机器有多个网卡（eth0, eth1），且它们都能收到多播流量。如果不指定 Interface，内核可能会走默认路由，导致你收不到数据，或者从错误的网卡收数据。
-    **解决**: 始终显式指定 `join_multicast_v4` 的 `interface` 参数。
+1. 同一包 A 先到或 B 先到；
+2. 两路重复；
+3. 单路乱序；
+4. A 缺但 B 有；
+5. 两路都缺；
+6. session 切换或序列号重置。
 
-2.  **IGMP Snooping**:
-    程序加入组后由内核发送 IGMP membership report，交换机可以通过 snooping 学习成员端口。还要检查 VLAN、querier、组播路由和 membership 是否过期，不能只确认 `join_multicast` 返回成功。
+有限窗口的意义是给另一线路和轻微乱序一点时间，但等待过久会增加行情年龄。窗口大小必须由链路延迟差、feed 速率和策略容忍度测量决定。
 
-3.  **大包分片 (Fragmentation)**:
-    尽量避免 IP 分片。如果 UDP 包超过 MTU (1500)，会被分片。只要其中一个分片丢了，整个 UDP 包就废了。
+## 6. 缺口之后怎么恢复
 
----
-下一章：[交易所协议详解](../connectivity/protocols.md) —— 继续学习 FIX、ITCH、SBE、OUCH 等文本或二进制协议如何编码与解析。
+恢复方式由交易所 feed 规范定义，常见组合是：
+
+1. **等待另一线路**：成本最低，适合 A/B 单路丢失；
+2. **请求重传**：从单播恢复服务请求缺失序列范围；
+3. **取得快照**：得到某个明确序列点的完整状态；
+4. **回放快照后的增量**：追到实时流，再重新开放策略。
+
+收到 gap 后不能默认“跳过也没事”。对增量订单簿来说，少一次新增或撤单就可能让本地状态永久错误。恢复期间常见安全策略是标记 feed stale、暂停受影响产品的决策，并持续接收和暂存后续增量。
+
+快照也不是魔法：必须知道它对应哪个序列点，避免把快照之前的旧增量再次应用，或漏掉快照之后的新增量。
+
+## 7. 缓冲区应该多大
+
+用容量模型比抄固定 `sysctl` 更可靠。若需要承受最坏突发速率 `R` bytes/s、最长调度停顿 `T` s，再留安全余量 `H`，最低吸收容量可先估算为：
+
+```text
+buffer_budget ≥ R × T × H
+```
+
+例如峰值 400 MB/s、最坏停顿 2 ms、余量 2 倍，单层预算至少约 1.6 MB。但系统还有 NIC ring、内核 backlog、socket buffer 和应用队列，多层容量及排队时间要一起观察。短时间突然涌入的大量数据通常称为 **microburst（微突发）**。
+
+Linux 的 `SO_RCVBUF` 是 socket 接收缓冲区选项。过小会在 microburst 中丢包；过大则可能积压陈旧行情、扩大恢复时间，并掩盖处理能力不足。设置值还受系统上限和内核记账方式影响，因此启动后应读回并记录实际值。
+
+## 8. 分片为什么危险
+
+UDP 数据报超过路径 MTU 时可能被 IP 分片。任何一个分片丢失，整个原始数据报都无法交付；重组还消耗内核状态。交易 feed 通常应把最大包长限制在路径 MTU 内，并计入 VLAN、隧道和 IP 版本的额外头部。
+
+## 9. 故障定位表
+
+| 现象 | 可能原因 | 先验证什么 |
+| --- | --- | --- |
+| 完全收不到组播 | 接口/VLAN/IGMP/路由错误 | 抓包、membership、交换机端口计数 |
+| 两路同时出现同一 gap | 上游或共享网络丢包、接收机过载 | A/B 物理路径、NIC/kernel drop |
+| 只有一路持续缺包 | 单路光纤、交换机口、队列映射问题 | 分线路计数与链路告警 |
+| 无内核 drop 但应用 gap | 解析、应用队列、序列规则错误 | 原始包捕获与处理前计数 |
+| buffer 调大后延迟恶化 | 长期消费不足，排队变长 | 队列水位与数据年龄 |
+| 偶发重复更新 | A/B 去重或 session reset 处理错误 | 包序列范围与状态机日志 |
+
+## 10. 一分钟面试回答
+
+> UDP 组播适合行情，是因为发送端发一份数据，网络可以复制给多个订阅者；它保留数据报边界，但不保证送达、顺序或去重。接收方加入指定组和网卡后，先校验包长与协议头，再用 packet sequence 和 message count 做去重及 gap 检测。A/B 两条独立线路谁先到用谁，另一条补单路丢失；两路都缺时按协议走重传或“快照加增量追赶”，恢复完成前把状态标为 stale。缓冲区只能吸收短突发，大小应按峰值速率乘最坏停顿估算，并同时监控 NIC、内核、socket 和应用队列的丢包。
+
+## 11. 高频追问
+
+### 组播是否保证公平？
+
+不保证。它让源端和网络高效复制同一流，但物理路径、交换机排队、接收主机处理和时钟差异仍会影响到达时间。
+
+### 为什么需要 A/B，还需要重传和快照？
+
+A/B 主要覆盖单路故障；共享上游、两路同时拥塞或接收主机过载仍会让两份都丢。重传补小缺口，快照负责状态已严重落后时的重建。
+
+### 检测 gap 后还能继续交易吗？
+
+取决于协议和风险策略。增量订单簿通常已不可信，应隔离受影响产品并恢复；不能只因为后续价格“看起来合理”就继续。
+
+下一章：[交易所协议](../connectivity/protocols.md) 会把序列号、快照与增量放进完整会话协议中。

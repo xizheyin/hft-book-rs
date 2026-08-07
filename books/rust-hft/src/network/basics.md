@@ -1,396 +1,207 @@
-# 网络协议栈基础 (Network Stack Basics)
+# 网络基础：一条消息如何从网线走进程序
 
-在高频交易的世界里，网络就是生命线。如果你的代码执行只需 100 纳秒，但网络传输花了 50 微秒，那么你的优化就毫无意义。
+> **面试优先级：P0。** 必须理解收包路径、TCP/UDP 的语义差异、短读/丢包以及 MTU。VLAN、PTP、网卡 offload 和交换机模式先知道用途，网络岗位再深入。
 
-本章将剖析操作系统网络栈的开销，并解释为什么行情分发常使用 UDP 组播，而订单入口又常选择可靠、有会话语义的 TCP。协议没有脱离场景的“快慢排名”：是否可靠、能否恢复、交易所接口要求和尾延迟目标共同决定选择。
+网络不是一个只有“快或慢”的黑盒。程序发出的订单和收到的行情，会经过网卡、主存、内核协议栈、socket 缓冲区和用户缓冲区。理解这条路径，才能回答：延迟花在哪里、包可能丢在哪里、某项优化为什么有效。
 
-## 1. 从网卡到用户态：数据的漫长旅程
+本章只建立地图；TCP 参数、UDP 组播、`io_uring` 和内核旁路分别由后续章节深入，避免在一页里重复所有细节。
 
-当一张网卡（NIC）收到一个以太网帧时，它需要经过一系列繁琐的步骤才能到达你的 Rust 程序。理解这个路径是优化的前提。
+## 1. 先把基本名词对齐
 
-### 1.1 传统内核路径 (Kernel Path)
+| 名词 | 是什么 | 为什么需要 |
+| --- | --- | --- |
+| NIC | Network Interface Card，网卡 | 把线缆上的信号转换为帧，并与主存交换数据 |
+| DMA | Direct Memory Access，直接内存访问 | 让设备搬运数据，不要求 CPU 逐字节复制 |
+| descriptor | 描述一块缓冲区位置和状态的小记录 | 驱动与网卡用它交接“哪块内存可写/已完成” |
+| socket | 内核中的通信端点 | 保存协议状态、收发队列和地址等信息 |
+| FD | file descriptor，文件描述符 | 进程用一个小整数引用 socket |
 
-在标准的 Linux 网络栈中，数据包的处理流程如下：
+`Rx`（receive）表示接收，`Tx`（transmit）表示发送。不同层还会给数据单位不同名字：L2 常称 **frame（帧）**，IP 层常称 **packet（包）**，TCP 常称 **segment（段）**，UDP 常称 **datagram（数据报）**；**payload（载荷）**指当前这一层头部之外承载的数据。日常交流会混用“包”，面试解释路径时应说明所处层次。
 
-```mermaid
-sequenceDiagram
-    participant Wire as 网线/光纤
-    participant NIC as 网卡 (NIC)
-    participant RAM as 主存 (DMA Ring)
-    participant CPU as CPU (Kernel)
-    participant App as 用户态 App
+DMA 不等于“数据直接进入业务结构体”，也不自动等于零拷贝。普通 Linux 收包时，网卡通常 DMA 到驱动管理的缓冲区；应用调用 `recv` 后，payload 仍常被复制到用户缓冲区。
 
-    Note over Wire, NIC: 1. 物理信号到达
-    Wire->>NIC: 光信号转数字信号 (PHY/MAC)
-    NIC->>RAM: 2. DMA 写入 Rx Ring Buffer
-    NIC->>CPU: 3. 触发中断，驱动进入 NAPI 轮询
-    CPU->>CPU: 4. 批量处理 Rx descriptor
-    CPU->>CPU: 5. 在 SoftIRQ 中继续处理，繁忙时可能交给 ksoftirqd
-    Note over CPU: 6. 协议栈处理 (IP/TCP/UDP 校验, 路由, iptables)
-    CPU->>RAM: 7. 将数据放入 Socket 接收队列 (sk_buff)
-    CPU->>App: 8. 唤醒用户线程 (Context Switch)
-    RAM->>App: 9. 数据拷贝 (Kernel -> User Copy)
-```
+## 2. 普通 Linux 收包路径
 
-**延迟来源分析**：
-1.  **中断与批处理 (Interrupt/Batching)**: 现代 Linux 通常通过 NAPI 和中断合并批量收包，并非“一包一次中断”。批处理降低每包开销，却可能让首包等待，形成吞吐与延迟的取舍。
-2.  **上下文切换 (Context Switch)**: 当数据准备好后，内核需要唤醒用户线程。调度器（Scheduler）可能不会立即调度你的线程，导致不可预测的延迟。
-3.  **内存拷贝 (Memory Copy)**: 数据从内核空间的 `sk_buff` 拷贝到用户空间的 buffer。这不仅消耗 CPU 周期，还会污染 CPU Cache（Cache Pollution），导致后续计算变慢。
-4.  **协议栈处理**: 路由、过滤、socket 查找和 TCP/UDP 处理都需要 CPU。部分功能对特定专线可能不需要，但防火墙和隔离也承担安全职责，不能为了性能一概关闭。
-
-### 1.2 内核旁路 (Kernel Bypass)
-
-为了减少上述开销，部分 HFT 系统采用 **Kernel Bypass** 或加速技术（如 OpenOnload、DPDK、AF_XDP）。它们的旁路程度并不相同：DPDK PMD 通常完全由用户态轮询，AF_XDP 仍借助内核中的 XDP，OpenOnload 则透明加速 socket API。
+下面是现代 Linux 的典型路径，不是每块网卡和每个内核版本都完全相同：
 
 ```mermaid
 sequenceDiagram
-    participant Wire as 网线/光纤
-    participant NIC as 网卡 (NIC)
-    participant RAM as 主存 (User Space Ring)
-    participant App as 用户态 App (Polling)
+    participant Wire as "网线 / 光纤"
+    participant NIC as "网卡与 Rx 队列"
+    participant Kernel as "驱动 + Linux 网络栈"
+    participant Socket as "Socket 接收队列"
+    participant App as "Rust 程序"
 
-    Wire->>NIC: 物理信号到达
-    NIC->>RAM: 1. DMA 直接写入用户态 Ring Buffer
-    App->>RAM: 2. 忙轮询 (Busy Polling) 检测新数据
-    Note over App: 3. 直接处理数据 (零拷贝, 无中断, 无上下文切换)
+    Wire->>NIC: 以太网帧到达
+    NIC->>NIC: 校验并选择 Rx 队列
+    NIC->>Kernel: DMA 写缓冲区，更新 descriptor
+    NIC-->>Kernel: 中断提示有新工作
+    Kernel->>Kernel: NAPI 批量轮询并处理协议
+    Kernel->>Socket: 数据排入目标 socket
+    Kernel-->>App: 唤醒正在等待的线程
+    App->>Socket: recv/read 系统调用
+    Socket-->>App: 复制字节并返回长度
 ```
 
-**优势**：
-*   **减少拷贝**: 合适配置下，NIC 可 DMA 到用户态可访问的缓冲区。
-*   **减少中断**: 忙轮询让收包路径不依赖每次由中断唤醒。
-*   **减少调度抖动**: 绑核与 CPU 隔离可减少迁核和抢占，但不能保证“永远不被调度”；NMI、SMI 和内核活动仍可能产生噪音。
+### 2.1 为什么既有中断又有轮询
 
-## 2. 协议栈解剖：从 Bit 到 Byte (Protocol Deep Dive)
+如果每个包都触发一次中断，高包率会让 CPU 忙于进出中断。Linux 的 NAPI（New API，Linux 驱动的收包轮询框架）通常让中断先提示“有工作”，随后由内核在预算内批量轮询队列。
 
-为了深入优化，我们必须了解数据包在网络中传输的真实形态。网络协议是分层的，每一层都有其特定的职责和优化空间。
+批处理会摊薄每包开销，但也可能让第一个包多等一会。这就是高吞吐和低等待之间的基本取舍。
 
-### 2.0 分层模型概览 (Layered Model)
+### 2.2 中断、系统调用和上下文切换不是一回事
 
-在 HFT 语境下，我们主要关注 TCP/IP 模型的下四层：
+- **中断**：设备提醒 CPU 处理事件；
+- **系统调用**：用户程序主动进入内核请求服务；
+- **模式切换**：CPU 在用户态与内核态权限之间切换；
+- **线程上下文切换**：调度器停止一个线程，改运行另一个线程。
 
-| 层级 | 名称 | 主要协议 | 硬件/软件 | HFT 优化关键点 |
-| :--- | :--- | :--- | :--- | :--- |
-| **L4** | 传输层 (Transport) | TCP, UDP | OS Kernel / Userspace | Kernel Bypass, 拥塞控制调优, 零拷贝 |
-| **L3** | 网络层 (Network) | IP, ICMP | 路由器, OS Kernel | 路由选择, DSCP 优先级, 分片处理 |
-| **L2/L3 边界**| 地址解析 | **ARP / IPv6 ND** | OS Kernel | 邻居缓存、避免首包解析延迟 |
-| **L2** | 链路层 (Link) | Ethernet, VLAN | 网卡 (NIC), 交换机 | Jumbo Frames, VLAN Offload, 轮询驱动 |
-| **L1** | 物理层 (Physical)| - | 网线, 光纤, SFP+ | 低延迟光交换机, 短距离布线 (Twinax) |
+一次 `recv` 会发生用户态/内核态的模式切换，但线程若不阻塞，不一定切换成另一个线程。准确区分这些词，是 OS 与网络面试的常见考点。
 
-### 2.1 链路层 (L2): Ethernet 与 ARP
+### 2.3 包可能丢在哪里
 
-最外层是 Ethernet II 帧，它是数据链路层的标准。
-
-*   **MAC 地址 (Media Access Control)**: 硬件地址（如 `52:54:00:12:34:56`）。
-    *   **HFT 场景**: 同一二层网络中的交换机按 MAC 转发；跨子网流量会先交给网关，再由路由器按 IP 路由。组播网络还依赖 IGMP、PIM 等控制机制，不能只看数据帧的目的 MAC。
-*   **VLAN Tag (802.1Q)**: 许多交易所使用 VLAN 将不同的会员（Members）隔离，或将行情数据与交易数据隔离。如果你的网卡没有正确配置 VLAN Offload 或 stripping，你可能会在接收到的数据包中看到额外的 4 字节 Tag，导致解析错误。
-
-#### ARP: 地址解析协议 (Address Resolution Protocol)
-你问到的 ARP，正是连接 L2 (MAC) 和 L3 (IP) 的桥梁。
-*   **原理**: 当你知道对方的 IP (`192.168.1.10`) 但不知道 MAC 时，必须广播一个 ARP Request：“谁是 192.168.1.10？”。拥有该 IP 的机器会回复 ARP Reply：“我是，我的 MAC 是 XX:XX...”。
-*   **代价**: 邻居项未知时，内核会发 ARP Request；待发送包可能在解析期间排队，给首包带来额外延迟。缓存不会在“到期”瞬间总是失效，Linux 邻居状态机会先进入 stale，再在使用中探测。
-*   **优化**: 开盘前主动预热邻居项；只有网络拓扑和故障切换策略允许时才配置静态项，见后文 [ARP 缓存抖动](#52-arp-缓存抖动)。
-
-### 2.2 IP: 路由与服务质量
-
-*   **TTL (Time To Live)**: 防止数据包在网络中无限循环。
-*   **Protocol**: 标识上层协议（TCP=6, UDP=17）。
-*   **TOS (Type of Service) / DSCP**: 这是一个常被忽视的字段。
-    *   **优化**: 某些交易所或 ISP 允许高频交易商通过设置 DSCP 标记（如 EF - Expedited Forwarding）来获得更高优先级的路由转发。检查你的交易网关文档，看是否支持此功能。
-*   **DF (Don't Fragment)**: 现在的应用通常设置此标志，禁止中间路由器分片。
-
-### 2.3 TCP: 复杂的精密仪器
-
-TCP 头部通常为 20 字节（不含 Options）。
-
-*   **Flags (标志位)**:
-    *   **PSH (Push)**: 提示接收栈尽快把当前数据交给应用，但它**不是消息边界**。TCP 只提供字节流，应用必须依赖长度字段或分隔符完成 framing。
-    *   **RST (Reset)**: 表示连接被异常终止或对应连接不存在。RST 可能让未发送数据丢失，不应把它当作“更快的正常关闭方案”。
-*   **Window Size**: 告诉对方“我还剩多少接收缓冲区”。如果此值为 0，发送方将停止发送（Zero Window），导致通信暂停。
-*   **MSS (Maximum Segment Size)**:
-    *   **定义**: MSS 是 TCP 层的概念，指 TCP Payload 的最大长度。
-    *   **计算**: 对“IPv4 且没有 IP/TCP options”的常见情况，`MSS = MTU - 20 - 20`；IPv6 与 options 会改变结果。
-    *   **意义**: 双方在 SYN 中通告自己愿意接收的 MSS，发送栈还会结合路径 MTU。设置过小会增加头部占比；路径 MTU 配置错误可能造成分片或黑洞。
-    *   **HFT 建议**: 确保 MSS 与路径 MTU 匹配，避免任何形式的分片。
-
-### 2.4 UDP: 极简主义
-
-UDP 头部只有 8 字节：Source Port, Dest Port, Length, Checksum。
-
-*   **Checksum**: IPv4 UDP 的校验和可以为 0，但 IPv6 UDP 通常要求校验和。生产系统不应为了微小收益盲目关闭；校验和 offload 通常能把计算交给 NIC。
-*   **优势**: 相比 TCP 繁杂的状态维护，UDP 就像是一张明信片，发出去就不管了。这正是低延迟所需的特质。
-
-## 3. TCP: 可靠性与延迟的博弈
-
-TCP 的设计目标是**在不可靠的网络上提供可靠的字节流传输**。为了实现这一点，它引入了大量机制，而这些机制在低延迟场景下往往反而是阻碍。
-
-### 3.1 三次握手 (Three-Way Handshake)
-
-从客户端发 SYN 到收到 SYN-ACK，大约经过 1 个 RTT；第三个 ACK 到达服务端后，双方完成握手。客户端通常可以把首批数据与第三个 ACK 一起发送，因此“发出首批数据前的额外等待”通常按 1 RTT 理解，而不是固定 1.5 RTT。
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Server
-    
-    Note left of Client: CLOSED
-    Note right of Server: LISTEN
-    
-    Client->>Server: 1. SYN (seq=x)
-    Note left of Client: SYN_SENT
-    
-    Server->>Client: 2. SYN (seq=y), ACK (x+1)
-    Note right of Server: SYN_RCVD
-    
-    Client->>Server: 3. ACK (y+1)
-    Note left of Client: ESTABLISHED
-    Note right of Server: ESTABLISHED
-    
-    Client->>Server: Data Request...
+```text
+交换机出口队列
+  → NIC Rx ring
+  → 驱动 / NAPI 预算
+  → 内核 backlog
+  → socket 接收缓冲区
+  → 应用自己的队列
 ```
 
-1.  **SYN**: 客户端发送 SYN 包，告诉服务器“我想连你，我的初始序号是 x”。
-2.  **SYN-ACK**: 服务器回复“收到了，我的初始序号是 y，期待你的下一个包是 x+1”。
-3.  **ACK**: 客户端回复“收到，连接建立”。
+`SO_RCVBUF` 是 socket 接收缓冲区选项。只增大它只能缓解其中一层；若应用长期处理速度低于到达速度，更大的缓冲区只会延后丢包，并让程序处理已经过时的数据。
 
-**HFT 影响**:
-*   **握手代价**: 如果策略运行时才建连接，会多付握手、认证和会话恢复成本。
-*   **优化**: 订单会话通常在交易前建立并保持；应用层心跳用于检测会话健康。这里的“保持长连接”不要与 TCP 的 `SO_KEEPALIVE` 探测机制混为一谈。
+## 3. 协议为什么要分层
 
-### 3.2 四次挥手 (Four-Way Wave)
+分层让每一层只解决一类问题：
 
-TCP 是**全双工**的，每一方都要单独关闭发送方向。典型示意是四个报文，但 ACK 与本端 FIN 可以合并，因此线上抓包不一定总是恰好四个包。
+| 层 | 常见对象 | 回答的问题 |
+| --- | --- | --- |
+| L2 链路层 | Ethernet、MAC、VLAN | 同一个二层网络里把帧交给哪个接口？ |
+| L3 网络层 | IPv4/IPv6、IP、路由 | 跨网络时下一跳和最终主机是谁？ |
+| L4 传输层 | TCP、UDP | 进程之间提供怎样的传输语义？ |
+| 应用层 | FIX、ITCH、SBE、自定义协议 | 字节代表哪种业务消息？ |
 
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Server
-    
-    Note left of Client: ESTABLISHED
-    Note right of Server: ESTABLISHED
-    
-    Client->>Server: 1. FIN (seq=u)
-    Note left of Client: FIN_WAIT_1
-    Note right of Server: CLOSE_WAIT
-    
-    Server->>Client: 2. ACK (u+1)
-    Note left of Client: FIN_WAIT_2
-    
-    Note right of Server: Server 处理完剩余数据...
-    Server->>Client: 3. FIN (seq=v)
-    Note right of Server: LAST_ACK
-    
-    Client->>Server: 4. ACK (v+1)
-    Note left of Client: TIME_WAIT
-    Note right of Server: CLOSED
-    
-    Note left of Client: 等待 2MSL (60s)
-    Note left of Client: CLOSED
+例如 TCP 能保证有序字节流，却不知道某 46 个字节是不是一条订单；应用协议必须用长度字段、固定布局或分隔符定义消息边界。
+
+### 3.1 MAC、IP 和端口分别做什么
+
+- **MAC 地址**用于当前二层链路的帧转发；
+- **IP 地址**用于跨网络路由；
+- **端口**帮助操作系统把报文交给正确进程中的 socket。
+
+数据跨过路由器时，二层 MAC 头通常会改变，目标 IP 和传输层端口仍用于端到端识别。
+
+### 3.2 ARP / Neighbor Discovery 为什么存在
+
+应用通常知道下一跳 IP，但以太网发送还需要 MAC。IPv4 使用 ARP，IPv6 使用 Neighbor Discovery 来解析邻居地址。邻居项未知时，首批数据可能等待解析，因此低延迟系统会在开盘前预热并监控邻居状态。
+
+不要无条件写死静态 MAC：网关故障切换后，旧映射可能把流量送错地方。
+
+## 4. MTU、MSS 与分片
+
+**MTU**（Maximum Transmission Unit）是某条链路一次可承载的最大网络层包大小；常见以太网 MTU 是 1500 字节，但这不是所有路径的固定值。
+
+**MSS**（Maximum Segment Size）是 TCP 一段中可放的最大 TCP payload。对最简单的 IPv4、无 options 情况，可以用：
+
+```text
+MSS = MTU - 20 字节 IPv4 头 - 20 字节 TCP 头
 ```
 
-1.  **FIN**: 客户端说“我发完了”。进入 `FIN_WAIT_1`。
-2.  **ACK**: 服务器说“知道了”。此时服务器进入 `CLOSE_WAIT`，客户端进入 `FIN_WAIT_2`。**注意：此时服务器可能还有数据要发给客户端，连接处于半关闭状态。**
-3.  **FIN**: 服务器发完数据后，也说“我也发完了”。进入 `LAST_ACK`。
-4.  **ACK**: 客户端说“好的，再见”。进入 `TIME_WAIT`。
+IPv6、TCP options 和隧道封装会改变这个值。
 
-理解这个流程，是理解后文 `TIME_WAIT` 和 `CLOSE_WAIT` 陷阱的前提。
+IP 分片的问题是：多个分片中任意一个丢失，原始数据报就无法重组；重组也消耗状态与 CPU。低延迟专线通常尽量避免分片，并确保主机、交换机和中间封装对 MTU 的理解一致。
 
-### 3.3 Nagle 算法与 Delayed ACK 的延迟放大
+Jumbo Frame（巨型帧）是大于常见 1500-byte MTU 的以太网配置，可以提高大块传输效率，但不会让几十字节的订单消息自动更快。若包过大、禁止分片，而返回的“需要分片”控制消息又被过滤，发送端就可能不断发出无法通过的包，这叫 **Path MTU 黑洞**。
 
-两者叠加是小消息交互中常见的延迟来源。
+## 5. TCP 与 UDP：选的是语义，不是排行榜
 
-*   **Nagle 算法**: 为了减少小包（Tinygram）造成的网络拥塞，发送方会缓冲数据，直到凑够一个 MSS 或收到前一个包的 ACK。
-*   **Delayed ACK**: 接收方为了减少 ACK 包数量，可能短暂等待后续数据或可捎带的反向数据；具体计时与内核、路由和连接状态有关。
+| 问题 | TCP | UDP |
+| --- | --- | --- |
+| 数据形态 | 有序字节流 | 独立数据报 |
+| 连接状态 | 有连接建立与协议状态 | UDP 协议本身没有连接握手 |
+| 丢失处理 | 协议栈重传并按序交付 | 应用协议自行检测和恢复 |
+| 拥塞/流量控制 | 有 | UDP 本身没有 |
+| 消息边界 | 不保留 | 保留每个数据报边界 |
+| 常见交易用途 | 订单会话、恢复服务 | 行情组播、遥测 |
 
-当应用采用“写一小段、再写一小段、最后读”的模式时，两者可能形成等待，直到 ACK 定时器触发。它是有限时延停顿，并非双方永远无法前进的严格死锁：
+### 5.1 为什么订单连接常用 TCP
 
-```mermaid
-sequenceDiagram
-    participant Sender (Nagle ON)
-    participant Receiver (Delayed ACK ON)
+订单要求可靠、有序、可检测断线的会话语义，交易所接口也常直接规定 TCP。应用仍需处理：
 
-    Sender->>Receiver: 发送数据包 A (小包)
-    Note right of Receiver: 收到 A，但不立即回 ACK (等 40ms)
-    Note left of Sender: 还有数据包 B 要发，但 Nagle 阻止发送 (因未收到 A 的 ACK)
-    
-    Note over Sender, Receiver: ... 等待 40ms ...
-    
-    Receiver-->>Sender: 终于超时，发送 ACK (A)
-    Sender->>Receiver: 收到 ACK，终于发送数据包 B
-```
+- 一次 `read` 只读到部分消息；
+- 多条消息一次到达；
+- 连接恢复与业务序列号；
+- 内核“已发送”不等于交易所已经接收或成交。
 
-**优化**:
-*   **发送端**: 对延迟敏感的小消息连接通常设置 `TCP_NODELAY`；仍要测量小包数量和整体网络负担。
-*   **接收端**: 可以设置 `TCP_QUICKACK` 强制立即回复 ACK（但在 Linux 上这通常是一次性的，需要每次 recv 后重新设置，或者依赖 OS 调优）。
+TCP 的握手、Nagle、Delayed ACK 和状态机在 [TCP 优化](./tcp_optimization.md) 中讲解。
 
-### 3.4 拥塞控制 (Congestion Control)
+### 5.2 为什么行情常用 UDP 组播
 
-TCP 假设丢包意味着网络拥塞，因此会降低发送速率。
+组播让网络复制一份 feed 给多个订阅者，发送端不必为每位接收者维护一条 TCP 流。但 UDP 不保证送达、顺序或“参与者绝对公平”。feed 必须用序列号、A/B 线路、重传和快照建立应用层恢复协议，详见 [UDP 组播](./udp_multicast.md)。
 
-*   **慢启动 (Slow Start)**: 连接建立时从有限的初始拥塞窗口起步。低消息量的长连接通常感受不强，高带宽长距离突发传输更明显。不要擅自增大 `initcwnd`，它是路由级设置，应结合网络方要求与拥塞风险验证。
-*   **丢包恢复**: 重复 ACK、SACK、RACK 等机制可能在 RTO 前触发重传；若只能等超时，等待可能达到数百毫秒。TCP 的可靠有序语义对订单会话仍然重要，但应用必须监控 session heartbeat 和业务超时，不能把“TCP 最终重传”当作风险控制。
+Rust 的 `UdpSocket::connect` 只是给 socket 记录默认对端并过滤接收来源，不会像 TCP 那样在网络上执行握手，也不会获得可靠传输。
 
-## 4. UDP: 速度与危险
+## 6. “零拷贝”和内核旁路到底省什么
 
-UDP (User Datagram Protocol) 是无连接的数据报协议，头部开销小，也不提供 TCP 的可靠、有序字节流。许多交易所使用 UDP 组播发布行情，但具体协议仍以交易所接口规范为准。
+性能技术通常在减少以下一种或多种工作：
 
-### 4.1 组播 (Multicast) 架构
+- 用户态与内核态之间的数据复制；
+- 每批数据所需的系统调用；
+- 睡眠、唤醒和调度抖动；
+- 通用协议栈中当前业务不需要的处理。
 
-交易所通过组播将一份数据同时分发给所有订阅者，保证公平性。
+但“内核旁路”是一个家族而不是单一机制：DPDK 常由用户态轮询驱动接管队列；AF_XDP 仍使用内核 XDP 基础设施；OpenOnload 保留 socket API 并加速数据路径。是否零拷贝、是否用中断、是否与内核栈共存，都要看具体模式和配置。
 
-```mermaid
-graph TD
-    Exchange[交易所核心撮合引擎] -->|UDP Multicast| CoreSwitch[核心交换机]
-    CoreSwitch -->|IGMP Snooping| SwitchA[机房交换机 A]
-    CoreSwitch -->|IGMP Snooping| SwitchB[机房交换机 B]
-    SwitchA -->|Copy| HFT_Server1[HFT 服务器 1]
-    SwitchA -->|Copy| HFT_Server2[HFT 服务器 2]
-    SwitchB -->|Copy| HFT_Server3[HFT 服务器 3]
-```
+因此不要回答“旁路就是零拷贝、零中断、零上下文切换”。更好的答案是说明被绕过的层、缓冲区所有权、轮询线程和故障恢复分别怎么处理。
 
-**关键概念**:
-*   **IGMP (Internet Group Management Protocol)**: 程序通过 `IP_ADD_MEMBERSHIP` 告诉内核加入组，内核发送 IGMP membership report；交换机可以 snoop 这些报文，三层组播网络还需要 querier/路由配置。
-*   **IGMP Snooping**: 交换机据此限制组播只发往成员端口。没有 snooping 时，未知组播通常会在 VLAN 内泛洪（flood），行为还取决于交换机配置，并不等同于改写成广播帧。
+## 7. 优化前如何定位
 
-### 4.2 丢包与乱序处理
+先判断问题发生在哪一层：
 
-UDP 不保证顺序。你收到的包可能是：`Seq 1, Seq 3, Seq 2`。
+| 现象 | 优先检查 |
+| --- | --- |
+| 网卡统计已有 drop | NIC ring、流量突发、队列映射 |
+| backlog/softnet 丢包增长 | 内核待处理队列是否溢出、CPU 是否长期处理不过来 |
+| NAPI `time_squeeze` 等预算压力增长 | 轮询预算是否频繁耗尽、IRQ/线程亲和性与 CPU 负载 |
+| socket drop 增长 | 接收缓冲、应用是否及时读取 |
+| 应用队列积压 | 解析/策略速度、背压设计 |
+| 平均值好但 P99.99 差 | 调度、IRQ（中断请求）迁移、批量等待、NUMA（非一致内存访问）、缺页 |
 
-**应用层处理策略**:
-1.  **序列号检测 (Gap Detection)**: 每个 UDP 包头都包含一个递增的序列号。
-2.  **乱序缓冲**: 收到 `Seq 3` 时，如果 `Seq 2` 没到，先不处理，放入缓冲区等待一小会儿。
-3.  **丢包判断**: 如果 `Seq 2` 迟迟不到，或者收到了 `Seq 4, 5`，则判定 `Seq 2` 丢失。
-4.  **补救措施**:
-    *   **按协议处理**: 某些独立增量可以跳过，维护订单簿的增量通常不能随意忽略，否则状态会永久错误。应严格遵循 feed 的重传与快照规则。
-    *   **重传请求 (Replay Request)**: 通过 TCP 连接向交易所请求重传丢失的包（通常很慢，只用于恢复状态）。
-    *   **快照恢复 (Snapshot)**: 如果丢包太多，直接请求最新的全量快照 (Snapshot)。
+调优顺序应是：建立时间戳和计数器 → 复现实测流量 → 一次只改一个变量 → 同时比较延迟分位数、CPU 和丢包。直接复制一组 `sysctl` 或把所有 offload 都关闭，无法知道究竟哪项有效，也可能牺牲可靠性和吞吐。
 
-### 4.3 内核缓冲区溢出
+## 8. 岗位相关选读
 
-Socket 缓冲区溢出是常见原因之一；丢包也可能发生在交换机、NIC ring、驱动预算、内核 backlog 或应用解析层。
+<details>
+<summary>PTP、VLAN、Offload 与交换机模式分别是什么？</summary>
 
-*   **现象**: 交易所突发推送大量行情（Micro-burst），网卡瞬间收到 1000 个包，但内核缓冲区只能存 500 个。剩下的 500 个直接在内核层面被丢弃，应用层甚至不知道它们来过。
-*   **优化**:
-    *   增大 OS 全局 UDP 缓冲区限制: `sysctl -w net.core.rmem_max=26214400` (25MB)
-    *   代码中设置 Socket 选项: `socket.set_recv_buffer_size(26214400)`
+- **PTP（Precision Time Protocol）**：在支持硬件时间戳的网卡和网络中同步时钟，用于可追溯时间与单向延迟测量；仍需监控 offset、path delay 和失锁。
+- **VLAN**：在同一物理网络上划分逻辑二层广播域，常用于隔离行情、订单和管理网络。
+- **Checksum offload**：由网卡计算/验证校验和，通常降低 CPU；抓包时可能看到尚未由网卡补完的校验和。
+- **TSO/GSO、GRO/LRO**：发送端分段或接收端合并，能提高吞吐，但会改变应用看到的处理粒度与等待。
+- **Interrupt coalescing**：网卡积累包数或时间后再中断，减少中断率但可能增加首包等待。
+- **Cut-through switch**：交换机收到足够头部后便开始转发，可能降低转发等待；拥塞、端口速率转换和队列仍会影响延迟。
 
-### 4.4 组播实战 (Multicast in Practice)
+这些开关没有通用“最佳值”。面试时说明测量方法与副作用，比背某个数字更重要。
 
-在代码层面，加入组播组需要特殊的 Socket 选项：
+</details>
 
-1.  **`IP_ADD_MEMBERSHIP`**: 告诉内核“我要订阅这个组播 IP (如 224.0.0.1)”。
-2.  **`SO_REUSEADDR` / `SO_REUSEPORT`**: 多进程绑定同一地址/端口的语义在 Linux 与 BSD 系统上不同，且 `SO_REUSEPORT` 可能做负载分流而非复制。要先明确需要“一份流量复制给每个进程”还是“在进程间分担”，再按目标 OS 实测。
-3.  **`IP_MULTICAST_LOOP`**: 如果发送端和接收端在同一台机器上，是否允许回环。通常设为 0 (禁用)，防止自己收到自己发的数据。
-4.  **`IP_MULTICAST_IF`**: 指定从哪个网卡接口发送 IGMP 请求。如果不指定，内核可能默认走 eth0 (管理口)，导致你连不上位于 eth1 (光口) 的交易所网络。
+## 9. 一分钟面试回答
 
-## 5. 链路层与驱动优化 (L2/Driver Optimization)
+> 收包时，网卡通常把数据 DMA 到驱动缓冲区，通过中断提示并由 NAPI 批量处理；内核完成 Ethernet、IP 和 TCP/UDP 等处理后，把数据放进 socket 接收队列，唤醒应用，`recv` 再把字节交给用户缓冲区。延迟可能来自批处理、调度、协议处理和复制，丢包也可能发生在交换机、NIC ring、内核队列、socket 或应用队列。TCP 提供可靠有序字节流，适合订单会话；UDP 保留数据报边界但不保证可靠，组播行情要靠序列号、双线、重传和快照恢复。优化必须先用分层计数器定位，不能看到丢包就只增大一个缓冲区。
 
-### 5.1 MTU 与分片 (Fragmentation)
+## 10. 高频追问
 
-*   **MTU (Maximum Transmission Unit)**: 标准以太网帧最大 1500 字节。
-*   **分片危害**: 如果一个 IP 包大小为 4000 字节，它会被切分成 3 个片。
-    *   **CPU 开销**: 重组分片需要 CPU 计算。
-    *   **可靠性降低**: 只要丢失 1 个分片，整个 4000 字节的包都作废。
-*   **Jumbo Frames**: MTU 9000 常用于提升大吞吐效率，但必须保证 NIC、交换机和整条路径一致支持。小订单包不会因为 MTU 更大自动变快；错误配置反而会造成丢包或 PMTU 黑洞。
+### DMA 为什么不等于零拷贝？
 
-### 5.2 ARP 缓存抖动
+DMA 只说明设备能直接访问主存。普通 socket 路径中，应用取数据时仍可能从内核缓冲区复制到用户缓冲区。
 
-当你的程序试图向网关发送第一个包时，操作系统需要查找网关的 MAC 地址。如果 ARP 缓存过期，OS 会发送 ARP Request 并阻塞等待 ARP Reply。这会造成毫秒级的延迟。
+### UDP 一定比 TCP 快吗？
 
-*   **优化**: 开盘前用真实流量预热并监控邻居项。只有对端 MAC 固定且网络团队允许时才使用静态项，否则网关故障切换后可能仍发往旧 MAC。
-    ```bash
-    sudo ip neigh replace 192.168.1.1 lladdr aa:bb:cc:dd:ee:ff nud permanent dev eth0
-    ```
+UDP 协议状态更少，但完整系统还包括可靠性、恢复、排队和应用处理。若业务需要有序可靠传输，把这些能力搬到应用层未必更简单或更快。
 
-### 5.3 网卡卸载 (Offloading) 的双刃剑
+### 增大接收缓冲区为什么不是万能方案？
 
-现代网卡有很多智能功能（Offloading），旨在降低 CPU 负载，但对延迟不一定友好。
+它只能吸收短暂突发。长期消费不足时，积压会增加数据年龄和内存占用，最终仍会溢出。
 
-| 功能 | 描述 | HFT 建议 | 原因 |
-| :--- | :--- | :--- | :--- |
-| **TSO (TCP Segmentation Offload)** | 网卡负责将大块数据切割成 TCP 包 | 延迟路径常评估关闭 | 可能改变成包与排队行为，吞吐路径常受益 |
-| **GRO/LRO (Generic Receive Offload)** | 将多个包合并后交给上层 | 延迟路径常评估关闭 | 合并减少 CPU 开销，但会改变包到达粒度 |
-| **Checksum Offload** | NIC 计算或验证校验和 | 通常保留，再实测 | 可减少 CPU 工作；抓包时要理解“未完成校验和”的假象 |
-| **Interrupt Coalescing** | 累积一定包数/时间后触发中断 | 降低或关闭自适应后实测 | 设为 0 可降等待，也会制造中断风暴和更差长尾 |
-
-**总结**: Offload 是吞吐、CPU 和延迟之间的取舍。一次只改一个开关，并用相同流量比较 P50 到 P99.99、CPU 与丢包；不要照抄一张“全部关闭”的清单。
-
-## 6. HFT 面试核心考点与陷阱 (Advanced Interview Topics)
-
-面试官通常不只问术语，还会追问故障现象、测量方法和取舍。下面这些主题适合用“定义 → 风险 → 验证”三步回答。
-
-### 6.1 TCP 状态机的幽灵：TIME_WAIT 与 CLOSE_WAIT
-
-这是 TCP 状态机中最容易混淆的两个状态，也是线上事故的高发区。
-
-```mermaid
-stateDiagram-v2
-    [*] --> ESTABLISHED
-    
-    state "主动关闭方 (Active Close)" as Active {
-        ESTABLISHED --> FIN_WAIT_1: send FIN
-        FIN_WAIT_1 --> FIN_WAIT_2: recv ACK
-        FIN_WAIT_2 --> TIME_WAIT: recv FIN
-        TIME_WAIT --> [*]: Wait 2MSL (60s)
-    }
-
-    state "被动关闭方 (Passive Close)" as Passive {
-        ESTABLISHED --> CLOSE_WAIT: recv FIN
-        CLOSE_WAIT --> LAST_ACK: send FIN
-        LAST_ACK --> [*]: recv ACK
-    }
-```
-
-*   **TIME_WAIT (主动关闭方)**:
-    *   **现象**: 当你主动断开连接（如爬虫、短连接客户端），你会进入 TIME_WAIT 状态，并持续 2MSL (通常 60 秒)。
-    *   **危害**: 占用五元组（Source IP/Port, Dest IP/Port, Proto）。如果在高并发场景下频繁建立短连接，会导致 **端口耗尽 (Port Exhaustion)**，无法建立新连接。
-    *   **HFT 策略**:
-        *   首选 **Keep-Alive**，不主动断开。
-        *   先消除不必要的短连接、检查端口范围和连接目标分布。`tcp_tw_reuse` 的语义随内核版本与时间戳条件变化，不能作为通用“快速回收”按钮；`tcp_tw_recycle` 已从 Linux 删除。
-*   **CLOSE_WAIT (被动关闭方)**:
-    *   **现象**: 对方发了 FIN，你也回了 ACK（内核自动回的），但你的**应用程序没有调用 `close()`**。
-    *   **本质**: 这是一个 **Bug**。意味着代码逻辑卡住了（比如死锁、阻塞），没有正确处理 EOF。
-    *   **面试回答**: "如果发现大量 CLOSE_WAIT，我会直接去查代码里的 `read() == 0` 分支是否漏了 `close()`，或者是否被锁阻塞了。"
-
-> **Q: 那个 `close()` 到底是什么？**
-> 
-> *   **在代码层面**: 它是系统调用 `close(fd)`（在 Rust 中通常对应 `drop(TcpStream)`）。
-> *   **在内核层面**: 它告诉操作系统“我不再需要这个 Socket 了”。OS 会将该 Socket 的引用计数减一。如果计数归零，OS 就会发送 **FIN 包** 给对方，正式发起断开流程。
-> *   **为什么重要**: 如果你不调用它，文件描述符 (File Descriptor) 就不会释放，连接也不会真正关闭。对于被动关闭方（即收到了对方 FIN 的一方），如果不调用 `close()`，连接就会一直卡在 `CLOSE_WAIT` 状态，直到程序崩溃或重启。
->
-> **Q: 为什么操作系统不自动帮我 close？**
->
-> 这是一个非常好的直觉问题。答案在于 **TCP 是全双工协议**。
-> *   **半关闭 (Half-Close)**: 当对方发来 FIN，只代表**对方**不说了。但这不代表**你**也不说了。
-> *   **场景**: 比如客户端发来 FIN (表示请求发完了)，服务器收到了，但服务器还需要处理请求并把结果发回去。如果 OS 收到 FIN 就自动关闭整个连接，服务器就没法发回结果了！
-> *   **控制权**: 因此，OS 必须等待应用程序显式调用 `close()`，确认“我也没话说了”，才会发送属于你的那个 FIN，彻底结束连接。
-
-### 6.2 时间同步：PTP vs NTP
-
-在 HFT 中，需要知道行情到达和订单发出的可追溯时间。监管精度取决于市场、角色和适用法规，不能把单个数字当作所有系统的统一要求。
-
-*   **NTP (Network Time Protocol)**:
-    *   精度受网络、实现和硬件影响，不能简单等同于固定“毫秒级”。
-    *   适用于管理系统或要求较宽的场景；是否满足交易审计必须根据实际测量和规则判断。
-*   **PTP (Precision Time Protocol, IEEE 1588)**:
-    *   精度：微秒甚至亚微秒级 (µs)。
-    *   原理：硬件打戳 (Hardware Timestamping)。网卡在收到包的物理时刻直接记录时间戳，消除了操作系统中断和调度带来的抖动。
-    *   **常见选择**: 低延迟与审计链路常使用硬件时间戳 PTP，并以 GNSS 或其他受控时源作为 grandmaster 的参考。仍需监控 offset、path delay、holdover 和失锁状态。
-
-### 6.3 交换机模式：Cut-through vs Store-and-forward
-
-面试官可能会问：“你了解交换机的转发模式吗？”
-
-*   **Store-and-forward (存储转发)**:
-    *   机制：交换机收完**整个**数据包，校验 CRC (FCS)，确认无误后才转发。
-    *   延迟：与包长成正比。一个 1500 字节的包在 10GbE 上需要约 1.2µs 的序列化延迟。
-*   **Cut-through (直通转发)**:
-    *   机制：交换机只要读到 **目的 MAC 地址** (前 14 字节)，就开始向出口端口转发，不管后面数据是否完整或正确。
-    *   延迟：无需等待整个帧，通常更低；具体值受芯片、端口速率、拥塞和转发路径影响，而且可能转发后续才发现 FCS 错误的帧。
-    *   **HFT 选择**: 延迟敏感网络常评估 cut-through，但还要考虑可靠性、buffer、拥塞遥测、端口速率转换和整体拓扑，不是只看一个模式标签。
-
-### 6.4 进阶 Socket 选项
-
-除了 `TCP_NODELAY`，你还应该知道：
-
-*   **`SO_REUSEPORT`**: 允许多个 socket 绑定同一地址/端口，并按内核策略分流。它适合并行服务，但可能改变包的线程归属；有顺序要求的行情必须验证 flow steering 与单流有序性。
-*   **`SO_BUSY_POLL`**: Linux 内核提供的一种折衷方案。在 socket 层进行轮询，减少中断，延迟介于标准中断和 DPDK 之间，但无需重写代码。
+下一章用 [I/O 模型](./io_models.md) 解释线程怎样等待这些 socket。

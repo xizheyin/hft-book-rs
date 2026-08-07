@@ -1,5 +1,7 @@
 # Ring Buffer 实现 (Ring Buffer)
 
+> **面试优先级：P1。** 主线是固定容量、读写游标、槽位所有权、Release/Acquire 和背压。第 3 节的完整 `unsafe` 实现属于 P2：只有岗位要求手写或审查并发容器时再展开。
+
 Ring Buffer（环形缓冲区）是低延迟系统最常用的数据结构之一。它的价值不只是“首尾相接”，而是把三个目标放在一起：**启动时预分配、运行时复用固定槽位、用清晰的所有权协议完成跨线程传递**。
 
 本章先建立直觉，再实现一个真正由类型系统约束“单生产者、单消费者”的 SPSC 队列。代码中的 `unsafe` 不是为了炫技，而是为了把必须证明的安全不变量集中在一个很小的边界里。
@@ -53,6 +55,9 @@ SPSC 的快来自限制，而不是某条神奇指令：
 ## 3. 用双句柄编码 SPSC 约束
 
 下面先把同一个实现拆成 3.1–3.6 六段讲解。后五段依赖 3.1 中的类型与导入，不能作为独立 crate 编译，因此围栏标为 `rust,ignore`；3.7 会给出拼接后的**完整可编译版本**，由 `mdbook test` 实际校验。工业使用还应补充 Miri、Loom、析构计数和双线程压力测试。
+
+<details>
+<summary>展开 P2：完整类型设计、unsafe 安全证明与可编译实现</summary>
 
 ### 3.1 内部存储与缓存行隔离
 
@@ -352,6 +357,8 @@ assert_eq!(consumer.try_pop().as_deref(), Some("A"));
 assert_eq!(consumer.try_pop().as_deref(), Some("B"));
 assert_eq!(consumer.try_pop(), None);
 ```
+
+</details>
 
 ## 4. 从代码到 happens-before
 

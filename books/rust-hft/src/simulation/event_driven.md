@@ -1,8 +1,8 @@
 # 事件驱动回测引擎 (Event-Driven Backtesting)
 
-回测（Backtesting）是量化交易的基石。对于 HFT 而言，简单的向量化回测（Vectorized Backtesting，如 Pandas）是远远不够的，因为它们无法模拟延迟、订单队列位置以及市场微观结构（Microstructure）。
+回测（Backtesting）用于在历史或生成数据上检验策略。向量化回测（Vectorized Backtesting，如表格上的批量计算）很适合快速研究收益序列；但当问题涉及订单生命周期、延迟、队列位置和市场微观结构时，它通常无法单独回答这些问题。
 
-我们需要的是一个**事件驱动 (Event-Driven)** 的回测系统，它能够精确模拟真实交易环境中的每一个 tick。
+这时需要**事件驱动（Event-Driven）**回测：按时间顺序处理行情、订单和回报事件，并明确模拟精度的边界。它能表达更多交互，但不会自动变成“和真实交易所完全一样”。
 
 ## 1. 核心架构
 

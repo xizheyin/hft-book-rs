@@ -10,6 +10,8 @@
 
 > **先记住边界**：Rust 的“零成本抽象”不是“任何抽象都一定免费”，而是抽象通常不强迫你支付额外的运行时成本。最终结果仍取决于优化级别、代码形状、目标 CPU 和编译器版本，热路径要用基准测试确认。
 
+> **阅读优先级**：泛型单态化、`dyn Trait` 和静态/动态分发是 P0；const generics 与关联类型是 P1；GAT（Generic Associated Types，泛型关联类型）和 lending iterator 属于 P2。除非岗位写明库设计、编译器或高级 Rust，不必把 GAT 当作普通面试第一优先级。
+
 ## 1. 泛型与单态化
 
 下面的函数可以接受所有实现了 `Display` 的类型：
@@ -225,6 +227,11 @@ trait Add<Rhs = Self> {
 
 ## 5. `Iterator` 能借用外部缓冲区
 
+<details>
+<summary><strong>P2 选读：普通 Iterator 的借用边界与 GAT lending iterator</strong></summary>
+
+这两节回答一个库设计问题：迭代项什么时候能借用迭代器自己的临时缓冲区。若你当前只准备泛型、trait object 和 const generics，可以直接跳到“高频误区”。
+
 标准 `Iterator` 的 `Item` 并不要求拥有数据。下面的解析器持有一个**外部传入**的切片，因此完全可以返回借用该切片的 `Packet<'a>`：
 
 ```rust
@@ -328,6 +335,8 @@ fn main() {
 `type Item<'a>` 就是 GAT：关联类型本身还能接收生命周期参数。返回值借用了 `decoder`，所以 Rust 能在编译期阻止“旧切片仍在使用时覆盖内部缓冲区”。
 
 这类接口适合复用解码缓冲区，但也有约束：调用者不能长期保存所有 item，也不能在持有一个 item 时再次调用 `next`。有时回调式接口 `decode_one(|packet| ...)` 反而更简单。
+
+</details>
 
 ## 7. 高频误区
 

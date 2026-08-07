@@ -1,211 +1,161 @@
-# SPSC/MPSC 队列详解 (Queues)
+# 队列拓扑：SPSC、MPSC 与 MPMC 怎么选
 
-在上一章中，我们实现了一个基于数组的 SPSC Ring Buffer。然而，在真实的 HFT 系统中，我们面临的通信场景远比“一对一”复杂。最典型的场景是 **MPSC (Multiple Producer Single Consumer)**，例如多个工作线程将日志发送给唯一的日志线程，或多个网关将订单汇聚到撮合引擎。
+> **面试优先级：P0/P1。** P0 是先数清生产者和消费者、说明有界队列的背压；P1 是解释竞争、分片和每槽位序号。除非岗位要求手写无锁容器，不必背一整段 MPMC `unsafe` 实现。
 
-本章将深入探讨 MPSC 队列的设计权衡，并剖析业界顶级的无锁队列实现。
+队列用来把数据从一个执行单元交给另一个执行单元。这里最重要的不是名字，而是**谁可以写、谁可以读、队列满时怎么办**。
 
-## 1. 理论背景 (Theory & Context)
+生产者（producer）把元素放入队列，消费者（consumer）取出元素：
 
-### 1.1 为什么 MPSC 很难？
-SPSC 之所以常见，是因为每个游标只有一个写者，不需要用 CAS 争抢下一个序号；生产者和消费者之间仍有缓存一致性通信，并非“完全互不干扰”。
-但在常见 MPSC 设计中，**多个生产者需要协调谁获得下一个写入位置**。若它们争用同一个原子游标，负载升高后 CAS 失败和缓存行迁移可能明显增加。分片、批量预留或“每个生产者一条 SPSC”可以改变这个争用拓扑。
+| 缩写 | 完整名称 | 写者 / 读者 | 常见场景 |
+| --- | --- | --- | --- |
+| SPSC | Single Producer, Single Consumer | 1 / 1 | 行情线程 → 单个策略线程 |
+| MPSC | Multiple Producer, Single Consumer | 多 / 1 | 多个工作线程 → 日志线程 |
+| SPMC | Single Producer, Multiple Consumer | 1 / 多 | 一个分发源 → 工作线程池 |
+| MPMC | Multiple Producer, Multiple Consumer | 多 / 多 | 通用任务池 |
 
-### 1.2 数组 vs 链表 (Array vs Linked List)
-- **数组 (Bounded)**:
-    - *优点*: 创建时分配固定槽位，稳态操作可不分配，内存局部性通常较好。
-    - *缺点*: 必须定义“满”的语义；一次 `try_push` 可以立即返回 `Full`，上层也可选择有界自旋、park、拒绝或按业务规则丢弃/合并。
-- **链表 (Unbounded)**:
-    - *优点*: 不受固定槽位数限制，突发时可继续增长。
-    - *缺点*: “逻辑无界”不等于永远成功：仍可能 OOM，并把背压转化为内存增长与排队延迟；分配器、节点链接和回收协议也可能争用。它是否 lock-free/wait-free 必须看具体算法，不能从“无界”推出。
+约束越强，实现通常越简单、越容易证明，也越容易获得稳定性能。不要因为 MPMC “功能最多”就默认选它。
 
-**HFT 选择**: 
-对于核心交易路径（如订单流），常从**有界数组队列**开始，并依据可测的最大突发、消费者暂停窗口和内存预算确定容量。满时策略必须写进业务协议：订单不能静默丢弃；可恢复行情可以触发 snapshot；指标可能允许采样或合并。
-对于日志、监控等路径，可评估分段队列，但仍要设置内存上限、水位告警和降级策略。无界队列没有消灭背压，只是推迟了它出现的位置。
+## 1. 为什么先画通信拓扑
 
-## 2. 核心实现：基于数组的有界队列
+假设四个策略都把订单写入同一个 MPSC 队列。它们必须协调“谁获得下一个槽位”，共享游标所在的缓存行会在核心间迁移，CAS（compare-and-swap，比较并交换）也可能失败重试。
 
-下面是教学用的简化实现，保留生产者和消费者两侧的 CAS，因此形态上更接近有界 MPMC，而不是严格 MPSC。若系统确定只有一个消费者，可以去掉消费者间抢占，但仍要处理“生产者已预留、尚未发布”的槽位。不要直接把本节代码当成经过审计的生产容器。
+另一种结构是每个策略各有一条 SPSC 队列，网关按固定规则轮询四条队列：
 
-不同资料对 head/tail 的命名方向可能相反；这里 `tail` 是生产者预留位置，`head` 是消费者位置。判断算法时应看“谁写哪个游标”，不要只背名称。
-
-```rust
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::cell::UnsafeCell;
-
-// 假设 T: Copy + Default
-pub struct BoundedArrayQueue<T> {
-    buffer: Vec<UnsafeCell<T>>,
-    mask: usize,
-    head: AtomicUsize, // 消费者索引
-    tail: AtomicUsize, // 生产者索引
-    
-    // 每槽位 sequence 同时编码期望的全局序号与代次；不是简单的奇偶标记。
-    seqs: Vec<AtomicUsize>,
-}
-
-// SAFETY: 成功预留游标的线程独占对应 slot；slot 的 Release/Acquire sequence
-// 负责发布和回收。T: Send，因为值会在线程间转移。
-unsafe impl<T: Send> Sync for BoundedArrayQueue<T> {}
-
-impl<T: Default + Copy> BoundedArrayQueue<T> {
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "capacity must be positive");
-        let capacity = capacity
-            .checked_next_power_of_two()
-            .expect("capacity is too large");
-        assert!(capacity <= isize::MAX as usize, "capacity is too large");
-        let mut buffer = Vec::with_capacity(capacity);
-        let mut seqs = Vec::with_capacity(capacity);
-        
-        for i in 0..capacity {
-            buffer.push(UnsafeCell::new(T::default()));
-            // 初始化 seq 为索引值，代表第 0 轮
-            seqs.push(AtomicUsize::new(i));
-        }
-
-        Self {
-            buffer,
-            mask: capacity - 1,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
-            seqs,
-        }
-    }
-
-    pub fn try_push(&self, value: T) -> Result<(), T> {
-        let mut tail = self.tail.load(Ordering::Relaxed);
-        
-        loop {
-            let index = tail & self.mask;
-            let seq = self.seqs[index].load(Ordering::Acquire);
-            let diff = seq.wrapping_sub(tail) as isize;
-
-            if diff == 0 {
-                // 槽位空闲，且轮次匹配。尝试抢占 tail
-                match self.tail.compare_exchange(
-                    tail,
-                    tail.wrapping_add(1),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        // 抢占成功！写入数据
-                        unsafe { *self.buffer[index].get() = value; }
-                        // 将 seq + 1，标记为有数据
-                        self.seqs[index]
-                            .store(tail.wrapping_add(1), Ordering::Release);
-                        return Ok(());
-                    }
-                    Err(current_tail) => {
-                        // 抢占失败，tail 被人改了，重试
-                        tail = current_tail; 
-                    }
-                }
-            } else if diff < 0 {
-                // 槽位被占满（seq < tail），队列满了
-                // 或者这一轮已经被写入了
-                return Err(value); 
-            } else {
-                // diff > 0: tail 已经落后了，重新加载 tail
-                tail = self.tail.load(Ordering::Relaxed);
-            }
-        }
-    }
-
-    pub fn try_pop(&self) -> Option<T> {
-        let mut head = self.head.load(Ordering::Relaxed);
-        
-        loop {
-            let index = head & self.mask;
-            let seq = self.seqs[index].load(Ordering::Acquire);
-            let next_head = head.wrapping_add(1);
-            let diff = seq.wrapping_sub(next_head) as isize;
-
-            if diff == 0 {
-                // 槽位有数据 (seq == head + 1)
-                match self.head.compare_exchange(
-                    head,
-                    next_head,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        let value = unsafe { *self.buffer[index].get() };
-                        // 将 seq 设为 head + mask + 1，即下一轮的空闲状态
-                        self.seqs[index].store(
-                            head.wrapping_add(self.mask).wrapping_add(1),
-                            Ordering::Release,
-                        );
-                        return Some(value);
-                    }
-                    Err(current_head) => {
-                        head = current_head;
-                    }
-                }
-            } else if diff < 0 {
-                // 数据还没准备好 (seq < head + 1)
-                return None;
-            } else {
-                // diff > 0: head 落后了
-                head = self.head.load(Ordering::Relaxed);
-            }
-        }
-    }
-}
+```mermaid
+flowchart LR
+    S1["Strategy 1"] --> Q1["SPSC 1"]
+    S2["Strategy 2"] --> Q2["SPSC 2"]
+    S3["Strategy 3"] --> Q3["SPSC 3"]
+    S4["Strategy 4"] --> Q4["SPSC 4"]
+    Q1 --> G["Gateway / Arbiter"]
+    Q2 --> G
+    Q3 --> G
+    Q4 --> G
 ```
 
-> **代码解析**: 这是 Dmitry Vyukov 有界 MPMC 队列思路的教学化版本。每槽位 sequence 用来区分当前代次的可写/可读状态，并帮助判断空满。它减少了旧值混淆，但有限位宽仍会回绕，正确性依赖容量与 wrapping 距离不变量。原算法作者也特别提醒：使用原子 RMW 不自动等于满足正式的 lock-free 进展保证。
+这样减少了多写者争用，但消费者要做仲裁，并定义公平性和优先级。结构选择改变的是争用位置，不是凭空消灭工作。
 
-## 3. 性能分析 (Performance Analysis)
+## 2. 有界和无界解决不同问题
 
-### 3.1 竞争回退 (Contention Backoff)
-上述代码在生产者竞争较高时，`compare_exchange` 失败后立即重试可能放大缓存一致性流量。可评估有界 Backoff，但退避会同时改变公平性与尾延迟，必须按目标负载测量。
+### 2.1 有界数组队列
 
-下面是依赖 `crossbeam-utils` 的**教学骨架**，`fail` 与外层预留循环来自具体队列实现，所以不能独立运行。验证时在示例 crate 执行 `cargo add crossbeam-utils`，把 `Backoff` 接入完整 CAS 循环后运行 `cargo check`、Miri/Loom（适用部分）以及高争用分位延迟基准。
+创建时固定容量，元素槽位通常连续：
 
-```rust,ignore
-use crossbeam_utils::Backoff;
+- 稳态可以不分配；
+- 内存预算明确，局部性较好；
+- 满时立即暴露过载，迫使上层定义策略；
+- 容量估错时会更早出现 `Full`。
 
-// 伪代码：把 backoff 放在一次预留操作的重试循环外。
-let backoff = Backoff::new();
-// 在循环中
-if fail {
-    backoff.snooze(); // 自旋几次，然后 yield
-}
+### 2.2 逻辑无界队列
+
+常通过链表或分段数组继续增长：
+
+- 能吸收更长突发；
+- 可能产生分配、回收和指针追踪成本；
+- 最终仍受内存限制；
+- 消费跟不上时，排队延迟可能无限增长。
+
+无界队列没有消灭背压，只是把“队列满”改成“内存增长、数据变旧，最后 OOM（out of memory，内存耗尽）”。核心交易路径通常更偏向有界结构，因为故障边界可见。
+
+## 3. 容量从哪里来
+
+容量不应来自“取个好看的 65536”。先估计：
+
+```text
+最低容量 ≥ 峰值到达率 × 最长消费者暂停时间 × 安全余量
 ```
 
-### 3.2 伪共享 (False Sharing)
-在 `seqs` 数组中，相邻的 `AtomicUsize` 紧挨着。如果 Core 1 修改 `seqs[0]`，Core 2 修改 `seqs[1]`，它们可能在同一个 Cache Line 上。
-把每个 `seq` 都填充到缓存行可以减少相邻槽位的写写伪共享，却会显著增大元数据工作集并降低缓存密度，不是默认优化。应先测多个生产者是否经常同时触达相邻槽位，再比较 padding、分片和批量预留。
+若最坏突发为每秒 2,000,000 条，消费者可能因调度或批处理停顿 2 ms，安全余量取 2，则至少需要约 8,000 个槽位。还要检查单元素大小、总内存、缓存工作集以及恢复时间。
 
-## 4. 工业级实现对比
+容量越大，短突发越不容易溢出，但最坏排队时间也可能越长。队列需要同时监控水位、入队失败、元素年龄和消费速率。
 
-### 4.1 Crossbeam (`crossbeam-queue`)
-- **SegQueue**: 无界队列，由多个固定大小的数组（Segment）组成的链表。
-    - *优点*: 兼顾了数组的缓存局部性和链表的动态扩容。
-    - *缺点*: 增长、跨 block 与回收仍有成本；逻辑无界仍需要外部内存/过载策略。
-- **ArrayQueue**: 有界 MPMC 队列，使用每槽位 stamp 协调代次；具体进展保证与实现细节应查看当前版本文档。
+## 4. 队列满了才是业务问题
 
-### 4.2 Rigtorp (`rigtorp::MPMCQueue`)
-- 这是常被参考的 C++ 有界 MPMC 实现。不要把其他语言的移植版视为同一实现，也不要预设它必然快于 Crossbeam；应核对具体版本的类型要求、异常/析构语义，并在相同拓扑与负载下基准。
+`try_push` 返回 `Full` 只说明没有空槽，不告诉应用该怎样处理：
 
-## 5. 常见陷阱 (Pitfalls)
+| 数据 | 可考虑的策略 | 不能接受的行为 |
+| --- | --- | --- |
+| 订单请求 | 明确拒绝、有限重试、熔断并报警 | 静默丢弃后假装已发送 |
+| 行情增量 | 标记状态失效并触发恢复（recovery）/快照（snapshot） | 丢一条后继续信任订单簿 |
+| 指标 | 合并、采样或丢低优先级指标 | 阻塞关键交易线程很久 |
+| 审计日志 | 进入降级或同步路径，触发严重告警 | 无痕丢失 |
 
-1.  **饥饿与预留后暂停**:
-    无锁/原子队列不保证某个高优先级生产者一定先成功；某线程预留槽位后被抢占，还可能让消费者暂时观察到未发布的洞，影响取决于具体算法。
-    **解决**: 尽量减少生产者的数量，或使用每个生产者独立的 SPSC 队列（M x SPSC），然后在消费者端轮询聚合。
+这就是**背压**（backpressure）：下游变慢的信息必须沿系统向上游传播，促使上游减速、拒绝或降级。
 
-2.  **ABA 问题**:
-    每槽位 sequence 能区分相邻轮次，但不是“天然永不回头”：整数最终会 wrapping。需要证明在容量约束和最大在途距离下，活跃操作不会把新旧代次混淆。
+## 5. SPSC 为什么通常更简单
 
-## 6. 面试追问：有界队列满了，怎样回答才完整？
+SPSC 中，生产者是写入游标的唯一写者，消费者是读取游标的唯一写者，因此不需要多个线程用 CAS 争抢同一个新序号。
 
-先区分进展保证和业务策略：`try_push` 立即返回 `Full`，不代表订单已经处理；调用者必须选择拒绝、有限重试、park、降级或按数据类型丢弃/合并。随后说明容量依据（突发速率 × 最长消费者暂停窗口）、水位监控和恢复路径。只回答“把队列调大”会把背压推迟成更长排队。
+但仍需要两条方向相反的原子同步链来交接槽位：
 
-## 7. 延伸阅读
+```text
+生产者写完元素
+  → Release 发布写入进度
+  → 消费者用 Acquire 观察进度
+  → 消费者读取或移出元素
+  → 消费者用 Release 发布读取进度
+  → 生产者用 Acquire 观察进度
+  → 生产者才可安全复用该槽位
+```
 
-- [1024 Cores - MPMC Queue](http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue) - Dmitry Vyukov 的原始博客。
-- [Crossbeam 源码分析](https://github.com/crossbeam-rs/crossbeam) - 学习 Rust 并发编程的最佳教材。
+“不需要 CAS”不等于“可以全部用普通整数”，也不等于“没有缓存一致性通信”。完整 SPSC 所有权和 `unsafe` 证明见 [Ring Buffer](./ring_buffer.md)。
 
----
-下一章：[原子操作详解 (Atomics)](atomics.md)
+## 6. MPSC/MPMC 为什么更难
+
+多生产者至少要解决两件事：
+
+1. **预留**：多个线程怎样唯一取得不同槽位；
+2. **发布**：某生产者取得较早槽位后被暂停，后面的生产者完成了，消费者是否可以越过这个“洞”。
+
+常见有界 MPMC 算法会为每个槽位保存一个 **sequence/stamp**：它同时表示槽位属于哪一轮，以及当前可由生产者还是消费者使用。生产者和消费者用 CAS 预留全局位置，再以 Release/Acquire 交接槽位。
+
+这比只用一个 `head` 和一个 `tail` 复杂得多，还要证明：
+
+- 整数回绕不会把新旧代次混淆；
+- 一个线程预留后暂停不会破坏安全性；
+- `T` 的初始化、移动和析构恰好一次；
+- 进展保证究竟是 lock-free、blocking，还是只提供 `try_*`。
+
+这正是面试中应优先说“使用经过审计的库并验证语义”，而不是现场自信地写一百行 `unsafe` 的原因。
+
+## 7. 性能不是只看每秒操作数
+
+比较队列时必须固定：线程数、生产/消费比例、核心与 NUMA 位置、元素大小、批量大小和等待策略。至少报告：
+
+- P50、P99、P99.9 入队到出队延迟；
+- 吞吐量与 CPU 核时；
+- CAS 失败或重试；
+- 队列水位与 `Full` 次数；
+- 消费者暂停时的恢复曲线。
+
+单线程里连续 push/pop 的基准测不到跨核缓存行迁移；只报告平均吞吐也会掩盖生产者暂停造成的尾延迟。
+
+## 8. 工程选型顺序
+
+1. 先确认是否可以不跨线程，或按 key 分片后各自独占状态；
+2. 能用 SPSC 就先用 SPSC；
+3. 多生产者是否可以改成多条 SPSC 加仲裁；
+4. 确实需要共享 MPSC/MPMC 时，选择成熟库并核对有界性、顺序、阻塞和析构语义；
+5. 用真实拓扑测量，最后才考虑 padding、退避和批量预留。
+
+Rust 常见选择包括 `std::sync::mpsc`、Tokio channels 和 Crossbeam 的队列/通道。它们的 bounded、blocking、async、断开和公平性语义不同，不能只按 crate 名字互换。
+
+## 9. 一分钟面试回答
+
+> 我会先数生产者和消费者：SPSC 只有一个写者和一个读者，不需要 CAS 抢游标，通常最容易获得稳定延迟；MPSC/MPMC 要协调槽位预留和发布，会增加 CAS 竞争与缓存行迁移。核心路径优先用有界数组队列，容量按峰值速率乘最长消费暂停估算，并监控水位和元素年龄。队列满不是单纯调大容量，而要按数据类型定义拒绝、恢复、合并或降级。如果能把一个共享 MPSC 拆成每生产者一条 SPSC，也会评估仲裁公平性和总 CPU 成本。
+
+## 10. 高频追问
+
+### lock-free 是否表示不会等待？
+
+不是。lock-free 只描述系统整体能持续取得进展，不保证某个线程在固定步数内成功。上层遇到队列满时还可能自旋，或 park（让线程挂起等待唤醒）。
+
+### FIFO 是否保证多个生产者的“真实先后”？
+
+通常只保证成功线性化后的队列顺序。**线性化**是把一次并发操作看作在某个瞬间对外生效；两个核心几乎同时调用时，并不存在无需额外时钟就能观察的绝对现实顺序。业务若需要优先级或时间排序，应显式建模。
+
+### 为什么不用无界队列避免丢数据？
+
+无界只是逻辑概念。下游长期变慢时，内存和排队延迟持续增长，最后可能以更难恢复的方式失败。
+
+进一步阅读：[Ring Buffer](./ring_buffer.md)、[原子操作](./atomics.md)、[吞吐量与背压](./throughput.md)。

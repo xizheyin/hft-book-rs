@@ -4,6 +4,8 @@
 
 本章围绕一个核心目标展开：把“缓存友好”从经验口号变成可设计、可验证的工程方法。我们先建立缓存行、缓存一致性、伪共享这些基础模型，再落到 Rust 结构体布局、字段排序、AoS/SoA 选型与大页策略，最后通过基准测试解释为什么某些布局会在 P99 上明显胜出。
 
+> **面试主线**：缓存行、空间/时间局部性、padding、伪共享和 AoS/SoA 是 P0。TLB 与大页的作用属于 P1；手写 `mmap(MAP_HUGETLB)` 和 RAII 封装属于 P2，只有项目实际部署大页时才需要展开。
+
 ```mermaid
 flowchart LR
     A[寄存器 Register] -->|最快| B[L1 Cache]
@@ -306,6 +308,11 @@ CPU 使用虚拟地址，而内存使用物理地址。每次访问内存，CPU 
 
 ### 4.3 实战：在 Rust 中使用 `mmap` 分配大页
 
+<details>
+<summary><strong>P2 选读：显式 HugeTLB 的 Linux 配置与 Rust 封装</strong></summary>
+
+面试主线到这里应先能回答：“大页用更大的页覆盖工作集，可能减少 TLB miss；代价是内存碎片、容量规划和部署复杂度，收益要看 TLB 事件与尾延迟。”下面的系统配置和代码只面向真正要落地 HugeTLB 的读者。
+
 要使用大页，通常需要两个步骤：系统配置和代码实现。
 
 #### 步骤 1: 操作系统配置 (System Configuration)
@@ -413,6 +420,8 @@ impl Drop for HugePageBuffer {
 ```
 
 > **注意**: HugeTLB 匿名映射、HugeTLB 文件系统和透明大页 (THP) 的预留、失败与回收行为不同。延迟敏感路径常偏好可在启动期确认成功的显式 HugeTLB，但是否收益更好仍要用 TLB 事件、page fault 和尾延迟验证。
+
+</details>
 
 ## 5. 常见陷阱 (Pitfalls)
 
