@@ -1,12 +1,10 @@
 # 压测与容量规划：Agent 平台如何接住真实任务
 
-> 难度：必会。官方 JD 要求熟练使用压测与可观测工具，定位跨多个系统层级的复杂问题。
-
-本章不再重复通用的吞吐、分位数、压测和 Linux 性能工具。第一次接触这些概念，先读第一册的[吞吐量与背压](../../rust-hft/infrastructure/throughput.html)、[指标系统](../../rust-hft/infrastructure/metrics.html)和[性能分析](../../rust-hft/optimization/profiling.html)；再用[Agent 容量与跨层诊断](../systems/performance_diagnostics.md)理解资源向量、准入和重试放大。这里专门讨论它们怎样落到 Agent 平台的压测与容量规划。
+通用的吞吐、分位数、压测和 Linux 性能工具见系统子书的[吞吐量与背压](../../rust-hft/infrastructure/throughput.html)、[指标系统](../../rust-hft/infrastructure/metrics.html)和[性能分析](../../rust-hft/optimization/profiling.html)。Agent 平台还必须区分工作负载类别和资源向量，并把准入、沙箱启动与重试放大纳入容量账。
 
 可以把平台想成机场。CPU 和内存像跑道，镜像与仓库数据像行李，沙箱启动槽位像登机口，外部模型和 API 又像其他机场。只统计“有多少架飞机”远远不够；任何一处先塞住，都会让总队列增长。
 
-先认三个量：**workload class** 是资源行为相近的一组任务，**resource vector（资源向量）**是一个任务同时需要的 CPU、内存、GPU、磁盘、网络和外部配额，**capacity planning（容量规划）**是用到达率、占用时间和这些资源分布判断系统何时会排队或拒绝。`task` 是用户目标，`attempt` 是一次执行尝试，`sandbox` 是承载尝试的环境，runtime class 表示它采用哪类隔离或硬件环境，trace 则记录一次请求各阶段的时间线；下文会分别计数。P0 是分类、容量表、准入/队列、冷启动、长任务和过载恢复；gang scheduling（相关资源要成组同时获得，否则整组等待）、复杂故障注入矩阵等术语只需在相应追问时理解作用，不背产品参数。
+先认三个量：**workload class** 是资源行为相近的一组任务，**resource vector（资源向量）**是一个任务同时需要的 CPU、内存、GPU、磁盘、网络和外部配额，**capacity planning（容量规划）**是用到达率、占用时间和这些资源分布判断系统何时会排队或拒绝。`task` 是用户目标，`attempt` 是一次执行尝试，`sandbox` 是承载尝试的环境，runtime class 表示它采用哪类隔离或硬件环境，trace 则记录一次请求各阶段的时间线；下文会分别计数。
 
 ## 1. 先把任务分成 workload class
 
@@ -24,7 +22,7 @@
 
 - 到达方式与峰值：稳定、突发、定时批量还是事件触发；
 - 任务长度：step 数、Token、工具次数、沙箱运行时间；
-- 资源向量：CPU、内存、GPU、临时盘、IOPS、网络和外部 API 配额；
+- 资源向量：CPU、内存、GPU、临时盘、IOPS（Input/Output Operations Per Second，每秒输入输出操作数）、网络和外部 API 配额；
 - 启动数据：镜像大小、仓库大小、依赖下载量和缓存命中率；
 - 结果：成功、取消、超时、抢占和重试比例；
 - 隔离要求：租户、安全等级、网络策略和 runtime class。
@@ -95,7 +93,7 @@ accepted tasks -> queued attempts -> starting sandboxes -> running attempts
 4. 队列是否已达到长度或年龄上限；
 5. 任务的截止时间是否还可能满足。
 
-队列必须有界。超出安全水位时，应明确拒绝、降级或延后批量任务，而不是让所有请求排到超时。面试时不要只说“设置最大长度”，还要说明策略：
+队列必须有界。超出安全水位时，应明确拒绝、降级或延后批量任务，而不是让所有请求排到超时。最大长度还必须配合下面的策略：
 
 - 交互任务可获得较短队列和较高优先级；
 - 批量任务可等待更久，但要限制占用份额；
@@ -233,7 +231,7 @@ CPU、内存利用率通常在任务已运行后才升高，单独依赖它们�
 
 修复不只是“加机器”，而是把冷缓存加入压测矩阵，对启动槽位和镜像带宽做准入，用队列年龄和资源缺口触发扩容，限制重试预算，并验证取消与失败拉取能清理临时数据。
 
-## 13. DeepSeek Agent Infra 面试怎么答
+## 13. 章末面试问题
 
 **题目：你会怎样证明沙箱平台能承受目标规模？**
 

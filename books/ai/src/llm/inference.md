@@ -2,15 +2,7 @@
 
 把 LLM 服务想成机场。Prefill 像旅客一次性办理值机：要读完护照、行李和行程，单次工作较大但可以并行处理许多资料；Decode 像登机口逐个放行，每一轮每位旅客只向前走一步，却要反复读取已有记录。值机队伍和登机队伍若共用有限柜台，怎样排班就决定了首响应、持续速度和总吞吐。
 
-> 本章目标：讲清 Prefill、Decode、KV Cache、TTFT、TPOT、Continuous Batching 和 PagedAttention，并能用数字估算缓存、延迟与吞吐，设计过载时的有界行为。
-
-## 学习优先级
-
-| 优先级 | 先掌握什么 | 面试要求 |
-|---|---|---|
-| P0 | Prefill/Decode、KV Cache、TTFT/TPOT、连续批处理、Token/KV 准入 | 能画请求链路并定位高延迟/OOM |
-| P1 | PagedAttention、量化、Prefix Cache、Chunked Prefill、模型并行 | 能解释优化针对哪本账及其副作用 |
-| 暂不展开 | 某款 GPU 的手写 Kernel、特定引擎私有调度实现 | 除非面试官明确进入实现细节 |
+LLM 推理要分别计算 Prefill、Decode、KV Cache、TTFT、TPOT 和连续批处理。PagedAttention、量化、Prefix Cache 和模型并行则针对不同的显存、计算或调度成本。
 
 ## 1. 一次请求经历哪些阶段
 
@@ -148,7 +140,7 @@ Prefill 能在已知输入的多个位置上做较大的矩阵乘，Batch 足够
 | Tensor/Expert Parallel 增大 | 单卡计算减少，通信比例上升 |
 | 量化或融合 Kernel | 数据字节和算子路径改变 |
 
-面试中应说“我会用 Kernel 时间线、HBM 带宽、算术吞吐和通信等待验证”，而不是只凭 GPU 利用率猜测。
+判断时应使用 Kernel 时间线、HBM 带宽、算术吞吐和通信等待验证，而不是只凭 GPU 利用率猜测。
 
 ### 4.5 数值精度也是服务正确性
 
@@ -210,7 +202,7 @@ TTFT = 排队 + Tokenize/预处理 + Prefill（含首 Token 计算与采样）+ 
 单请求 TPOT 却从 40ms 变成约 60ms
 ```
 
-因此系统要在吞吐、TTFT、TPOT、公平性和显存间取舍。关于通用批处理与背压，可复用第一册的[吞吐量优化：批处理、流水线与背压](../../rust-hft/infrastructure/throughput.html)，本章只讨论 LLM 特有的 Token 迭代调度。
+因此系统要在吞吐、TTFT、TPOT、公平性和显存间取舍。通用批处理与背压机制见第一册的[吞吐量优化：批处理、流水线与背压](../../rust-hft/infrastructure/throughput.html)；LLM 服务在这些机制上增加了逐 Token 迭代、KV 容量和 Prefill/Decode 干扰。
 
 ## 7. 为什么静态批处理浪费资源
 
@@ -302,7 +294,7 @@ Continuous Batching（连续批处理，也称迭代级调度）每轮重新组�
 
 只增加 GPU 可能延后问题，却不会修复无限队列和错误重试语义。
 
-## 13. DeepSeek Agent Infra 面试怎么问
+## 13. 章末面试问题
 
 ### 30 秒答法
 

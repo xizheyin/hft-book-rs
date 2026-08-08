@@ -1,8 +1,6 @@
 # 沙箱生命周期与调度：把“一次运行”做成可恢复状态机
 
-> 难度：必会。官方职责包含大规模 VM 集群、应用层调度、节点自动上下线和稳定运行。
-
-> 先修桥梁：通用进程与调度先读第一册的[进程、线程与文件描述符](../../rust-hft/foundations/processes_fds.html)；本章还会使用[Agent 并发与取消](../systems/concurrency_async_io.md)以及[分布式部分失败](../systems/distributed_foundations.md)。
+通用的进程状态和 CPU 调度见系统子书的[进程与文件描述符](../../rust-hft/foundations/processes_fds.html)和[CPU 调度](../../rust-hft/foundations/cpu_scheduling.html)。Agent 平台在这些机制之上还要区分 Task 与 Attempt，并处理沙箱租约、取消传播和节点接管。
 
 调度器不是“找一台 CPU 还空着的机器”。它像机场塔台：要检查机型与跑道是否兼容，安排时隙，处理取消与迫降，还要防止某家航空公司占满所有资源。
 
@@ -48,7 +46,7 @@ stateDiagram-v2
 
 ## 3. 一个容量算例
 
-下面所有数字都是容量练习假设，不是 DSec 产品参数。有 100 台节点，每台可分配 64 vCPU 和 256 GiB。预留 10% 给系统后，总预算约为：
+下面用教学数字演示容量计算。假设有 100 台节点，每台可分配 64 vCPU 和 256 GiB。预留 10% 给系统后，总预算约为：
 
 ```text
 CPU = 100 × 64 × 0.9 = 5,760 vCPU
@@ -95,7 +93,7 @@ CPU = 100 × 64 × 0.9 = 5,760 vCPU
 
 改进包括：心跳与业务 I/O 隔离；基于多信号判定节点；带抖动的分批恢复；全局重排速率上限；租约与 fencing；镜像预热；先验证小比例节点再扩大动作。
 
-## 9. DeepSeek Agent Infra 面试怎么问
+## 9. 章末面试问题
 
 **题目：设计一个支持成千上万沙箱的调度器。**
 

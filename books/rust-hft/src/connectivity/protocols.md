@@ -12,7 +12,7 @@ flowchart TB
     D --> E[内部状态机<br/>订单簿 / 订单 / 仓位]
 ```
 
-面试时不要只说“TCP 可靠”或“UDP 快”：TCP 只保证一条连接内的有序字节流；重连后的业务序列、重复订单和成交恢复仍要由 session/application protocol 处理。
+不能只用“TCP 可靠”或“UDP 快”概括协议选择：传输控制协议（Transmission Control Protocol，TCP）只保证一条连接内的有序字节流；重连后的业务序列、重复订单和成交恢复仍要由会话层和应用层协议处理。用户数据报协议（User Datagram Protocol，UDP）保留报文边界，但不替应用保证送达、顺序或去重。
 
 ## 2. 文本与二进制不是简单的快慢排名
 

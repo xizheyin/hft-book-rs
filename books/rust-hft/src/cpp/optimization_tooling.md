@@ -4,10 +4,6 @@ C++ 给了开发者很多性能旋钮：`-O3`、LTO、PGO、SIMD、`perf`……�
 
 本章带你搭起一个最小 CMake 工程，写一个不会轻易被编译器“测没了”的基准程序，再学习 GCC/Clang 优化、LTO、PGO、SIMD、Linux `perf` 和 Sanitizer。你不需要预先熟悉构建系统。
 
-> 本章目标：能构建可分析的 C++20 Release 程序；能解释基准的计时边界；会用 `perf` 区分热点与等待；知道 LTO/PGO/SIMD 的收益条件；会用 ASan、UBSan、TSan 先排查正确性问题。
-
-> **面试优先级**：P0 必会“指标—基线—定位—单一改动—复验”的证据链、基准陷阱，以及 Sanitizer 分别检查什么；P1 理解优化级别、LTO/PGO/SIMD 与 `perf` 的适用条件；完整 CMake、PGO 命令和编译器向量化报告属于 P2 动手资料，不需要逐字背诵。
-
 先认识本章会反复出现的最小术语：
 
 | 术语 | 先这样理解 |
@@ -66,7 +62,7 @@ main.o
 假设目录中有本章稍后的 `benchmark.cpp`，旁边新建 `CMakeLists.txt`：
 
 <details>
-<summary>P2 动手资料：完整 CMake 配置与构建命令</summary>
+<summary>动手资料：完整 CMake 配置与构建命令</summary>
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)
@@ -309,7 +305,7 @@ g++ -std=c++20 -O3 -g -fno-omit-frame-pointer \
 - 线程亲和性、IRQ 干扰、缺页和温度/频率条件；
 - 运行间方差、异常值处理规则和原始样本。
 
-教学算例在你的电脑上显示 `0.5 ns/item`，不代表真实系统每笔订单只需 0.5 ns：批处理、向量化、缓存命中和计时摊销都会让“每项平均”看起来很小。
+即使教学算例显示“每项平均耗时很小”，也不能把它当成真实系统的单条处理时延：批处理、向量化、缓存命中和计时摊销都会让均值看起来更小。
 
 ## 5. LTO：让优化跨越翻译单元
 
@@ -351,7 +347,7 @@ PGO（Profile-Guided Optimization，基于剖面的优化）通常分三步：
 编译器可以利用这些信息调整分支布局、内联和代码布局。关键不是“跑得久”，而是训练流量是否代表生产关键路径。
 
 <details>
-<summary>P2 动手资料：GCC 与 Clang 的最小 PGO 命令</summary>
+<summary>动手资料：GCC 与 Clang 的最小 PGO 命令</summary>
 
 ### 6.1 GCC 最小流程
 
@@ -401,7 +397,7 @@ SIMD（Single Instruction, Multiple Data）让一条指令并行处理多个整�
 知道“先让编译器报告是否向量化、再看汇编和端到端指标”即可。不同编译器的精确参数属于查阅型知识：
 
 <details>
-<summary>P2 动手资料：GCC / Clang 向量化报告命令</summary>
+<summary>动手资料：GCC / Clang 向量化报告命令</summary>
 
 GCC：
 
@@ -570,7 +566,7 @@ Sanitizer、静态分析和代码评审互相补充；没有任何一个工具�
 
 ## 12. HFT 场景：优化一条行情到信号路径
 
-假设端到端 P99 从 20 微秒升到 80 微秒，推荐按下面顺序处理：
+假设端到端 P99 相比稳定基线明显上升，可以按下面顺序处理：
 
 1. 明确定时边界：网卡时间戳、用户态收包、解码、订单簿更新、信号完成分别在哪里；
 2. 保存慢事件的 trace ID、CPU、队列深度和阶段耗时；
@@ -622,7 +618,7 @@ Sanitizer、静态分析和代码评审互相补充；没有任何一个工具�
 
 ### 练习 1
 
-基准显示候选版本平均快 8%，但 P99.9 慢 40%，HFT 热路径应该直接上线吗？
+基准显示候选版本的平均值改善，但 P99.9 明显变差，关键路径应该直接上线吗？
 
 <details>
 <summary>参考答案</summary>

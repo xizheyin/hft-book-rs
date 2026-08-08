@@ -1,179 +1,242 @@
-# Unsafe Rust 实战 (SIMD, Intrinsics)
+# Unsafe Rust：安全边界与证明责任
 
-`unsafe` 在低延迟系统里不是“性能开关”，而是“证明责任转移”。在 Safe Rust 中，很多内存与并发不变量由编译器证明；进入 `unsafe` 后，这些证明责任由程序员接管。对 HFT 而言，这个能力确实重要，因为热路径常常需要直接处理裸指针（Raw Pointer）、SIMD 指令（Single Instruction Multiple Data, SIMD）和 FFI（Foreign Function Interface）。但同样重要的是：每一段 `unsafe` 必须能明确回答“依赖了哪些不变量，以及为什么这些不变量成立”。
+Safe Rust 会通过类型、所有权、借用和生命周期规则阻止许多内存错误。例如，引用不能悬空，普通可变引用不能同时指向同一个对象，切片访问不能越界。
 
-本章按“场景—约束—实现—验证”的顺序展开。我们不追求把所有代码改成 `unsafe`，而是建立一套可复查的决策方式：什么时候值得用 `unsafe`，如何把不安全边界压缩到最小，以及如何用工具验证这些边界没有被破坏。
+可是，操作系统接口和 C 库并不理解 Rust 的引用规则；有些底层数据结构也无法直接用借用检查器表达。Rust 因此提供 `unsafe`：程序员可以执行少数编译器无法验证的操作，同时亲自承担证明这些操作正确的责任。
 
-> **面试主线**：P0 是说清 `unsafe` 允许做什么、为什么它转移了证明责任，以及怎样写 `SAFETY` 不变量。`get_unchecked` 和安全协议解析是 P1；手写 AVX2 intrinsic 属于 P2，目标岗位未涉及 SIMD 时不要求默写。
+`unsafe` 不是“关闭 Rust 安全检查”，也不是性能开关。它更像一条边界：边界里面允许做特定的危险操作，边界外仍然应提供普通的安全接口。
 
-## 1. 理论背景 (Theory & Context)
+## 1. 什么是未定义行为
 
-### 1.1 为什么 HFT 需要 Unsafe？
-大多数业务逻辑不需要 `unsafe`。真正需要它的地方通常满足两个条件：第一，热点路径已经通过 profiling 确认瓶颈在内存访问或指令级并行；第二，Safe Rust 无法表达或无法稳定触发目标优化。例如复杂索引场景下的边界检查消除失败、需要直接调用架构内建指令、或必须与内核/驱动/遗留 C 接口互操作。
+**未定义行为**（Undefined Behavior，UB）表示程序做了语言规则明确不允许的事，编译器不再保证结果。越界解引用指针、使用悬空引用、制造不合法引用或发生未同步的数据竞争，都可能造成 UB。
 
-这意味着 `unsafe` 不是首选，而是最后手段。工程流程应该是：先写安全实现并建立基准，再局部引入 `unsafe`，最后验证收益与风险是否匹配。
+UB 不等于“这一次一定崩溃”。程序也可能看似正常、在换编译参数后才出错，甚至产生与源代码直觉完全不同的结果。正因为表现不稳定，`unsafe` 的正确性不能以“运行过没有报错”作为证明。
 
-### 1.2 Unsafe 的超能力
+## 2. Safe Rust 与 Unsafe Rust 的边界
 
-`unsafe` 允许你做四件 Safe Rust 不允许直接做的事：解引用裸指针、调用 `unsafe` 函数、实现 `unsafe trait`、访问 `union` 字段。它不等于“关闭 Rust 的全部规则”。类型系统、生命周期与借用关系仍然在发挥作用。真正变化的是：编译器不再为你证明某些关键内存不变量，你必须在代码与文档中把这些不变量说清楚。
+在 `unsafe` 块中，Rust 允许执行几类特殊操作：
 
-## 2. 核心实现：极速操作 (Implementation)
+- 解引用裸指针；
+- 调用 `unsafe fn`；
+- 访问 `union` 的字段；
+- 读写可变静态变量；
+- 实现 `unsafe trait`。
 
-### 2.1 绕过边界检查 (`get_unchecked`)
+`union` 是多个字段共用同一块内存的类型。写入一个字段后，Rust 无法判断当前应按哪个字段解释这些字节，所以读取字段需要调用者保证它确实是当前有效的表示。可变静态变量是所有调用者共享的一份全局可变状态；如果多个线程没有同步地访问它，就可能发生数据竞争。
 
-在订单簿和风险数组扫描中，`get_unchecked` 常见于“编译器难以自动消除检查”的复杂索引逻辑。更稳妥的写法不是让整个函数都 `unsafe`，而是把不安全片段封装在最小范围内。
+`unsafe trait` 表示每个实现者都必须遵守一组编译器无法检查、但其他安全代码会依赖的规则。例如，某个类型如果错误地声明自己能够在线程间安全移动，普通线程代码也可能被带入未定义行为。实现者因此必须证明 trait 文档列出的条件全部成立。
+
+除此之外，类型检查和大多数语言规则仍然存在。`unsafe` 不允许随意绕过私有字段，也不会自动延长局部变量的寿命。
+
+### 2.1 裸指针是什么
+
+裸指针写作 `*const T` 或 `*mut T`。它只是一个可能指向某个地址的值，不像 `&T` 和 `&mut T` 那样由编译器保证始终有效、对齐且遵守借用规则。
+
+创建裸指针通常不需要 `unsafe`，**解引用**它才需要，因为编译器无法确认该地址此刻能否安全读取或写入。
 
 ```rust
-fn sum_safe(arr: &[u64]) -> u64 {
-    let mut sum = 0;
-    for i in 0..arr.len() {
-        sum += arr[i];
-    }
-    sum
-}
+fn main() {
+    let value = 42_u32;
+    let pointer: *const u32 = &value;
 
-fn sum_unchecked(arr: &[u64]) -> u64 {
-    let mut sum = 0;
-    for i in 0..arr.len() {
-        let v = unsafe {
-            // SAFETY: i 来自 0..arr.len()，因此 i 始终在有效索引范围内。
-            *arr.get_unchecked(i)
-        };
-        sum += v;
-    }
-    sum
+    let copied = unsafe {
+        // SAFETY: pointer 来自仍然存活的 value，地址非空、对齐且可读。
+        *pointer
+    };
+
+    assert_eq!(copied, 42);
 }
 ```
 
-如果 `arr.iter().copied().sum()` 已经达到同等性能，就没有必要保留 `get_unchecked`。是否使用这类优化必须由基准测试结果决定，而不是凭经验默认启用。
+这段示例只是说明语法，实际代码直接写 `value` 更简单。只有与外部接口或特殊数据结构交互时，裸指针才真正有必要。
 
-### 2.2 协议解析：避免滥用 `transmute`
+## 3. `unsafe fn` 是一份调用契约
 
-网络包解析是 `unsafe` 高发区。常见错误是直接把字节 `transmute` 成结构体引用，这会把长度、填充、对齐、字节序、合法位模式和生命周期问题绑在一起。更好的第一选择往往是不使用 `unsafe`：按协议给出的字节偏移切片，再显式转换字节序。
+`unsafe fn` 表示调用者必须满足某些编译器无法检查的前提。函数作者要清楚写出前提，调用者要在调用处说明为什么前提成立。
+
+```rust
+/// 读取切片中指定位置的值。
+///
+/// # Safety
+/// 调用者必须保证 `index < values.len()`。
+unsafe fn read_unchecked(values: &[u64], index: usize) -> u64 {
+    unsafe {
+        // SAFETY: 由本函数的调用契约保证 index 在范围内。
+        *values.get_unchecked(index)
+    }
+}
+
+fn read(values: &[u64], index: usize) -> Option<u64> {
+    if index >= values.len() {
+        return None;
+    }
+
+    let value = unsafe {
+        // SAFETY: 上面的条件已经证明 index < values.len()。
+        read_unchecked(values, index)
+    };
+    Some(value)
+}
+
+fn main() {
+    assert_eq!(read(&[10, 20, 30], 1), Some(20));
+    assert_eq!(read(&[10, 20, 30], 9), None);
+}
+```
+
+公开给普通调用者的是安全函数 `read`。它先检查输入，再把已经成立的条件交给很小的 `unsafe` 区域。这个模式叫作**安全封装**：危险能力被限制在容易审查的位置。
+
+这个例子并不建议用 `get_unchecked` 替代 `get`。两者是否有可测差异要看具体程序，编译器也可能消除重复检查。它展示的是如何表达和维护安全契约。
+
+## 4. 每个 `SAFETY` 注释应该回答什么
+
+一句“这里没问题”不是证明。根据操作不同，注释通常需要回答：
+
+- 指针是否非空、正确对齐并指向足够大的有效内存？
+- 这块内存在整个访问期间是否仍然存活？
+- 读取前内容是否已经初始化，位模式对目标类型是否合法？
+- 是否存在违反共享/独占规则的其他引用？
+- 长度、偏移和整数计算为什么不会越界或溢出？
+- 多线程访问是否使用了正确的同步？
+- 外部函数对所有权、线程和释放方式有什么约定？
+
+最好的注释会引用紧邻的检查、类型不变量或构造流程。这样修改代码的人才能发现某个前提是否已经失效。
+
+## 5. 协议和二进制数据：安全解析优先
+
+网络、文件和模型权重都可能以字节序列进入程序。不能直接假设这些字节已经是一个合法 Rust 结构体：输入可能太短，数字可能使用不同字节序，结构体还可能含有对齐填充。
+
+安全做法是按格式逐个读取字段：
 
 ```rust
 use std::convert::TryInto;
 
-#[derive(Clone, Copy, Debug)]
-struct PacketHeader {
-    seq_num: u64,
-    timestamp: u64,
-    msg_type: u8,
+#[derive(Debug, PartialEq, Eq)]
+struct Header {
+    request_id: u64,
+    payload_len: u32,
+    kind: u8,
 }
 
-fn parse_header(data: &[u8]) -> Option<PacketHeader> {
-    // 假设协议明确规定：0..8 是小端序号，8..16 是小端时间戳，16 是类型。
-    let seq_num = u64::from_le_bytes(data.get(0..8)?.try_into().ok()?);
-    let timestamp = u64::from_le_bytes(data.get(8..16)?.try_into().ok()?);
-    let msg_type = *data.get(16)?;
+fn parse_header(data: &[u8]) -> Option<Header> {
+    let request_id = u64::from_le_bytes(data.get(0..8)?.try_into().ok()?);
+    let payload_len = u32::from_le_bytes(data.get(8..12)?.try_into().ok()?);
+    let kind = *data.get(12)?;
 
-    Some(PacketHeader {
-        seq_num,
-        timestamp,
-        msg_type,
+    Some(Header {
+        request_id,
+        payload_len,
+        kind,
     })
 }
-```
 
-`get` 让每段长度检查靠近对应字段，`from_le_bytes` 明确了线上的小端序；结构体自身有没有填充不再影响协议长度。这段代码也给出一个重要面试结论：**先证明安全版本确实是瓶颈，再考虑局部非对齐读取；进入 `unsafe` 不是协议解析的必经步骤。**
+fn main() {
+    let bytes = [
+        7, 0, 0, 0, 0, 0, 0, 0, // request_id = 7
+        3, 0, 0, 0,             // payload_len = 3
+        2,                       // kind = 2
+    ];
 
-### 2.3 SIMD (Single Instruction, Multiple Data)
-
-<details>
-<summary><strong>P2 选读：带运行时特性检测的 AVX2 示例</strong></summary>
-
-SIMD（Single Instruction, Multiple Data，单指令多数据）让一条指令同时处理多个同类元素。只有批量数据足够、布局连续、标量版本已经测出瓶颈时，才值得进入下面的平台相关实现。
-
-手写 SIMD 的前提是两层保护同时到位：编译期架构约束与运行期特性检测。下面给出一个 AVX2 计数示例，并保留标量回退路径。
-
-```rust
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-
-fn count_greater_scalar(prices: &[f64], threshold: f64) -> usize {
-    prices.iter().filter(|&&x| x > threshold).count()
-}
-
-#[cfg(target_arch = "x86_64")]
-fn count_greater(prices: &[f64], threshold: f64) -> usize {
-    if is_x86_feature_detected!("avx2") {
-        unsafe {
-            // SAFETY: 已通过运行时检测确认 AVX2 可用。
-            return count_greater_avx2(prices, threshold);
-        }
-    }
-    count_greater_scalar(prices, threshold)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn count_greater_avx2(prices: &[f64], threshold: f64) -> usize {
-    let mut count = 0;
-    let mut i = 0;
-    let v_thresh = _mm256_set1_pd(threshold);
-
-    while i + 4 <= prices.len() {
-        let v_prices = unsafe {
-            // SAFETY: i + 4 <= prices.len()，读取 4 个 f64 不越界；
-            // loadu 允许非对齐地址。
-            _mm256_loadu_pd(prices.as_ptr().add(i))
-        };
-        let v_mask = _mm256_cmp_pd(v_prices, v_thresh, _CMP_GT_OQ);
-        let mask_bits = _mm256_movemask_pd(v_mask);
-        count += mask_bits.count_ones() as usize;
-        i += 4;
-    }
-
-    for j in i..prices.len() {
-        if prices[j] > threshold {
-            count += 1;
-        }
-    }
-    
-    count
+    assert_eq!(
+        parse_header(&bytes),
+        Some(Header {
+            request_id: 7,
+            payload_len: 3,
+            kind: 2,
+        })
+    );
+    assert_eq!(parse_header(&bytes[..5]), None);
 }
 ```
 
-这段代码的关键不是“使用了 intrinsics”，而是保持了可回退性与可验证性：支持 AVX2 的机器走向量路径，其他机器仍有一致语义的标量路径。
+`get` 处理长度，`from_le_bytes` 明确小端字节序。不要直接用 `transmute` 把任意字节变成结构体引用，因为它会同时引入长度、对齐、填充、合法位模式和生命周期问题。
 
-## 3. 性能分析 (Performance Analysis)
+## 6. FFI：Rust 与外部代码怎样约定边界
 
-Unsafe 优化是否成立，必须通过可复现实验来验证。建议使用固定数据分布与固定 CPU 频率策略，分别评估三类实现：纯 Safe 基线、局部 `get_unchecked`、手写 SIMD。评估时不要只看平均值，应同时记录 P99 和硬件事件计数（如分支失误、L1/L2 miss）。下面代码依赖 `criterion` 开发依赖、Cargo benchmark harness，并复用本章前面的函数；它应放入 `benches/` 运行，因此 mdBook 不把它当作独立标准库示例执行。
+FFI（Foreign Function Interface）让 Rust 调用 C 等其他语言提供的函数。编译器通常只能看见函数声明，看不见外部实现是否真的遵守约定，所以调用外部函数通常是不安全操作。
 
-```rust,ignore
-use criterion::{criterion_group, criterion_main, Criterion, black_box};
+一个 FFI 边界至少要明确：
 
-fn bench_count(c: &mut Criterion) {
-    let prices: Vec<f64> = (0..1_000_000).map(|i| (i % 1000) as f64).collect();
-    let threshold = 500.0;
+- 参数和返回值的二进制布局是否一致；
+- 指针是否允许为空，指向多少个元素；
+- 谁申请内存，谁负责释放，使用哪一种释放函数；
+- 外部函数会不会保存传入指针，保存多久；
+- 是否能从多个线程调用；
+- 错误怎样返回，外部异常能否跨过边界。
 
-    c.bench_function("scalar", |b| {
-        b.iter(|| black_box(count_greater_scalar(black_box(&prices), black_box(threshold))))
-    });
-}
+常见结构是把原始声明放在很小的模块里，再提供安全 Rust 包装器。包装器检查长度和空指针，用 Rust 类型表达所有权，并在 `Drop` 中调用配套释放函数。只有这些约定确实成立，安全包装器才是真的安全。
 
-criterion_group!(benches, bench_count);
-criterion_main!(benches);
-```
+`#[repr(C)]` 可以让 Rust 结构体按 C 兼容规则布局，但它不会自动解决指针寿命、字节序、线程安全或输入合法性。
 
-如果 SIMD 实现收益不稳定，优先检查数据布局和访存模式，而不是继续增加 `unsafe` 代码面积。
+## 7. SIMD 与平台指令为何需要额外谨慎
 
-</details>
+SIMD 表示“一条指令同时处理多个同类数据”。连续数组的批量计算可能适合这种方式。编译器有时能自动向量化安全循环，因此第一步通常是写清楚的标量或迭代器实现并测量。
 
-## 4. 常见陷阱 (Pitfalls)
+手写平台指令时，除了普通的指针和长度不变量，还必须确认当前 CPU 支持该指令集。可靠结构包括：
 
-最危险的错误是把 `unsafe` 当作“局部性能 patch”，却没有同步维护不变量文档。没有不变量说明的 `unsafe` 会随着调用方和数据结构演进迅速变得难以审计。第二个高发问题是架构与特性假设不完整，例如只写了 AVX2 路径却没有运行时检测与回退。第三个问题是生命周期欺骗，尤其是通过 `transmute` 延长引用生命周期，这类写法短期可能“能跑”，长期几乎不可维护。
+1. 始终存在语义一致的普通实现；
+2. 在运行时检测 CPU 特性；
+3. 只在检测通过后调用标记了相应目标特性的函数；
+4. 用测试比较普通路径和向量路径的输出；
+5. 单独处理不能组成完整向量的尾部元素。
 
-建议把以下检查加入常规流程：单元测试覆盖边界输入，`cargo miri test` 做 UB 检测，必要时增加模糊测试（fuzzing）验证协议解析路径。
+这属于平台相关的进阶优化，不是学习 `unsafe` 的起点。很多程序永远不需要手写 SIMD。
 
-## 5. 本章小结
+## 8. 怎样缩小和验证不安全边界
 
-`unsafe` 的工程价值不在于“更底层”，而在于在可控边界内换取可证明收益。正确做法不是扩大 `unsafe` 面积，而是最小化边界、显式记录不变量、持续验证语义一致性。对低延迟 Rust 项目而言，真正高质量的 `unsafe` 代码应同时满足三点：性能收益可测、风险边界可审、演进成本可控。
+推荐按以下顺序处理：
 
-## 6. 延伸阅读
+1. 先尝试安全接口，并用测试明确行为。
+2. 确认是功能需求无法表达，或有可靠测量证明现有实现不能满足要求。
+3. 把 `unsafe` 放入最小函数或最小代码块，不把它扩散到业务逻辑。
+4. 在接口文档中写调用前提，在每个操作旁写 `SAFETY` 证明。
+5. 对空输入、最大长度、错误格式、并发访问和资源释放编写测试。
+6. 使用额外工具检查普通测试不容易覆盖的问题。
 
-- [The Rustonomicon](https://doc.rust-lang.org/nomicon/) - Rust 官方的高级 Unsafe 编程参考。
-- [portable-simd](https://github.com/rust-lang/portable-simd) - 实验性的便携 SIMD 项目；接口和稳定性以使用时的官方文档为准。
+常用工具包括：
+
+- **Miri**：解释执行 Rust 程序，可发现多类未定义行为；
+- **模糊测试**（fuzzing）：生成大量输入，适合解析器和状态机；
+- **内存/线程检查器**：在支持的平台上发现越界、释放错误或数据竞争；
+- **代码审查**：逐条检查安全契约与实现是否一致。
+
+工具能发现问题，但不能替代证明。它们只能检查实际探索到的执行路径。
+
+## 9. 在三类系统中的用法
+
+- **传统后端**：调用系统库或遗留 C SDK 时需要 FFI；普通路由、数据库和业务逻辑通常应保持在 Safe Rust 中。
+- **AI Infra**：张量运行时、GPU 驱动和模型文件映射常经过裸指针或 FFI；安全包装器必须明确设备、形状、长度、所有权和同步约定。
+- **HFT**：网络接口、共享内存或平台指令可能需要局部 `unsafe`；协议解析和订单逻辑仍应优先使用安全类型与显式检查。
+
+领域不同，判断标准相同：只有边界处需要额外能力，证明责任应集中并可复查。
+
+## 10. 常见错误
+
+- 因为代码位于 `unsafe` 块，就以为任何指针操作都会变得合法。
+- 用“测试跑过了”证明没有 UB。
+- 用 `transmute` 同时绕过布局、位模式和生命周期问题。
+- 创建安全包装器，却没有检查调用者能够传入的所有值。
+- 让外部库保存指向临时 Rust 数据的指针。
+- 为了猜测中的性能收益扩大 `unsafe` 范围，却没有安全基线和基准。
+
+## 11. 本章小结
+
+`unsafe` 允许执行少数 Safe Rust 无法验证的操作，并把证明责任交给程序员。高质量的不安全代码会把范围压到最小，准确记录指针、长度、生命周期、别名、线程和资源释放等不变量，再向外提供容易正确使用的安全接口。
+
+`unsafe` 的价值来自连接系统边界和表达特殊底层结构，而不是“更快”两个字。是否引入它，应由功能需要或可复现证据决定。
+
+## 12. 思考题与面试表达
+
+1. 为什么“程序没有崩溃”不能证明它不存在未定义行为？
+2. 创建裸指针为什么可以是安全操作，而解引用它需要 `unsafe`？
+3. `unsafe fn` 的调用者和实现者分别承担什么责任？
+4. 一个安全包装器内部含有 `unsafe`，为什么外部调用仍然可以是安全的？
+5. 解析网络字节时，直接 `transmute` 需要同时证明哪些条件？
+6. `#[repr(C)]` 解决了哪些问题，又没有解决哪些问题？
+7. 如果要调用一个接收指针和长度的 C 函数，你会在包装器里检查和记录什么？
+
+核心定义是：**`unsafe` 允许进行编译器无法验证的操作，但不取消 Rust 的其他规则；程序员必须证明相关不变量，并把边界封装在安全接口后面。** 裸指针、FFI 和 `get_unchecked` 都遵守这一原则；测试、Miri 和模糊测试是辅助验证手段，而不是证明本身。
 
 ---
-下一章：[并发模型选择 (Async vs Thread vs Actor)](concurrency.md)
+
+上一章：[编译器怎样理解并优化 Rust 程序](compiler_optimizations.md) · 下一章：[并发模型](concurrency.md)

@@ -155,7 +155,7 @@ Infra 通常不决定“什么值得记”，但要提供可靠底座：
 
 不要把推理侧 KV Cache、任务记忆数据库和沙箱磁盘快照混成一个“缓存系统”。它们的语义、风险和生命周期不同。
 
-## 9. DeepSeek Agent Infra 面试怎么问
+## 9. 章末面试问题
 
 ### 典型问题
 
@@ -184,7 +184,6 @@ Infra 通常不决定“什么值得记”，但要提供可靠底座：
 
 ## 11. 一手资料
 
-- [DeepSeek：Agent Harness 团队招聘](https://app.mokahr.com/social-recruitment/high-flyer/140576#/job/8d40c764-d2b2-49b1-826c-e3f2adb75c01)
 - [MemGPT：Towards LLMs as Operating Systems](https://arxiv.org/abs/2310.08560)
 - [Lost in the Middle: How Language Models Use Long Contexts](https://aclanthology.org/2024.tacl-1.9/)
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)

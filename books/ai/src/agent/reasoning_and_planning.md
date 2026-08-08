@@ -136,7 +136,7 @@ Agent 连续三次执行语义相同的搜索。可用动作指纹、状态差�
 
 Infra 不判断模型推理内容是否聪明，但要保证步骤不会因为重复调度产生失控副作用。
 
-## 9. DeepSeek Agent Infra 面试怎么问
+## 9. 章末面试问题
 
 ### 典型问题
 
@@ -165,7 +165,6 @@ Infra 不判断模型推理内容是否聪明，但要保证步骤不会因为�
 
 ## 11. 一手资料
 
-- [DeepSeek：Agent Harness 团队招聘](https://app.mokahr.com/social-recruitment/high-flyer/140576#/job/8d40c764-d2b2-49b1-826c-e3f2adb75c01)
 - [ReAct：Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)
 - [Plan-and-Solve Prompting](https://aclanthology.org/2023.acl-long.147/)
 - [Tree of Thoughts](https://arxiv.org/abs/2305.10601)

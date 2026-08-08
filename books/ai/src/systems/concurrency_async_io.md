@@ -4,7 +4,7 @@
 
 本章回答三个 Agent 平台高频问题：**如何只让一个有效 owner 推进任务，如何让取消有明确边界，以及如何在处理不过来时停止继续堆积。**
 
-如果并发、锁、原子操作或异步 I/O 还不熟悉，先读第一册的[并发基础](../../rust-hft/foundations/concurrency.html)、[异步 Rust](../../rust-hft/foundations/async_rust.html)和[网络 I/O 模型](../../rust-hft/network/io_models.html)。原子内存序、futex、epoll、io_uring 和 Tokio 的底层机制都放在那些通用章节；这里不要求背实现细节。
+锁、原子操作、异步 I/O、futex、epoll、io_uring 和 Tokio 的通用机制见系统子书的[并发基础](../../rust-hft/foundations/concurrency.html)、[异步 Rust](../../rust-hft/foundations/async_rust.html)和[网络 I/O 模型](../../rust-hft/network/io_models.html)。本章只增加任务所有权、取消与平台背压协议。
 
 ## 1. 先定义业务对象
 

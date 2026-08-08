@@ -41,7 +41,7 @@ jobs:
           mdbook test books/ai
 
       - name: Compile standalone C++20 examples
-        run: python3 scripts/check_cpp_examples.py --compiler g++
+        run: python3 scripts/check_cpp_examples.py --compiler g++ --run
 
       - name: Assemble portal and both books
         run: |

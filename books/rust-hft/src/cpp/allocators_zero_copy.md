@@ -4,10 +4,6 @@
 
 “不调用 `new`”和“零拷贝”都不是最终目标。真正目标是：让所有权、容量上限和缓冲区可复用时刻清楚，并用测量确认延迟分布改善。
 
-> **本章目标**：读完后，你能解释分配与对象生命周期的区别，正确使用 `reserve` 和 `std::pmr`，写出有容量上限的对象池，并识别 `std::span` 零拷贝视图的生命周期风险。
-
-> **面试优先级**：P0 必会分配与对象生命周期的区别、`reserve`/`resize`、视图不拥有数据以及缓冲区何时可复用；P1 理解 Arena、对象池和容量耗尽策略；`std::pmr` 的完整 API、Scatter/Gather 系统调用形状属于 P2 岗位选读。面试重点是所有权与失败边界，不是背接口名字。
-
 ## 1. 动态分配到底做了什么
 
 对下面的表达式：
@@ -94,7 +90,7 @@ flowchart LR
 `std::pmr` 是标准库的多态内存资源接口。`std::pmr::monotonic_buffer_resource` 提供接近 Arena 的“只向前分配、整体释放”行为：
 
 <details>
-<summary>P2 岗位选读：`std::pmr` 的完整示例</summary>
+<summary>进阶：`std::pmr` 的完整示例</summary>
 
 ```cpp
 #include <array>
@@ -327,7 +323,7 @@ stateDiagram-v2
 某些 I/O API 能一次提交多个不连续缓冲区，例如一个头部和一个 payload，从而避免先拼成连续大包。下面只是接口形状示意，具体函数、头文件和完成语义依平台而定：
 
 <details>
-<summary>P2 岗位选读：Scatter/Gather 的接口形状</summary>
+<summary>进阶：Scatter/Gather 的接口形状</summary>
 
 ```cpp,ignore
 std::array<iovec, 2> parts{

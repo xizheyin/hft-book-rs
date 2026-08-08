@@ -1,12 +1,10 @@
 # Agent 控制面分布式专题：让重复与中断变成可恢复状态
 
-> 难度：必会。官方 JD 明确要求理解大规模分布式系统的组织方式、瓶颈来源与 trade-off。
-
-这一章不再重复解释 CAP、quorum、线性一致性或 Raft。第一次接触这些概念时，请先读[分布式系统地基](../systems/distributed_foundations.md)。本章只回答一个更贴近岗位的问题：**当 Agent 任务持续很久、工具会产生副作用、worker 随时可能消失时，平台怎样把不确定结果收进可恢复的协议？**
+部分失败、线性一致性和 CAP 见共享册的[分布式系统起点](../../rust-hft/distributed/distributed_systems_intro.html)，复制、法定人数（quorum）和 Raft 见[复制与共识](../../rust-hft/distributed/replication_consensus.html)。Agent 平台新增的问题是：**当任务持续很久、工具会产生副作用、worker 随时可能消失时，怎样把不确定结果收进可恢复的协议？**
 
 可以把控制面想成机场塔台。塔台不亲自开飞机，却要知道每架飞机属于哪个航班、谁获准使用跑道、通信中断后怎样重新确认，旧指令为什么不能在恢复后继续生效。
 
-本章的 P0 是第 1～7、10～12 节：分清 Task/Attempt/Operation/Resource，把副作用超时表示成 `UNKNOWN`，再用幂等、状态机、lease 和资源端 fencing 收口。**Outbox** 是把“业务更新”和“待发事件”写进同一数据库事务，**Saga** 是把长事务拆成步骤与可能失败的补偿动作，**reconciliation** 是根据事实源周期性对账；“exactly-once”若没有下游协议配合，并不自动表示一个业务效果只发生一次。第 8～9 节的分片再平衡和跨存储容灾 token 属于 P1：它们对大规模平台重要，但 freshman 不必在掌握恢复主线前背实现细节。
+首先分清 Task、Attempt、Operation 和 Resource，把副作用超时表示成 `UNKNOWN`，再用幂等、状态机、lease 和资源端 fencing 收口。**Outbox** 是把“业务更新”和“待发事件”写进同一数据库事务，**Saga** 是把长事务拆成步骤与可能失败的补偿动作，**reconciliation** 是根据事实源周期性对账；“exactly-once”若没有下游协议配合，并不自动表示一个业务效果只发生一次。
 
 ## 1. 先把四类身份分开
 
@@ -150,7 +148,7 @@ Agent 控制面通常允许队列至少一次投递，因此消费者要预期�
 处理时可使用 `event_id` 去重、状态版本条件更新、每租户公平队列、有限重试和 dead-letter 流程。Dead-letter 不是垃圾桶：需要记录失败原因、重放条件和人工处置责任。
 
 <details>
-<summary><strong>P1 连续深挖：分片再平衡与跨存储容灾对账</strong></summary>
+<summary><strong>深入：分片再平衡与跨存储容灾对账</strong></summary>
 
 ## 8. 分片从访问模式出发
 
@@ -190,7 +188,7 @@ fencing 不能跟着一份旧数据库备份一起回退。可以使用不可回
 
 修复链路是：同一逻辑意图使用稳定 `operation_id`；资源服务保存去重结果；超时进入 `UNKNOWN` 并查询；挂载和清理携带 generation/fencing；孤儿扫描器负责最终对账，而不是充当主要正确性协议。
 
-## 11. DeepSeek Agent Infra 面试怎么问
+## 11. 章末面试问题
 
 **题目：怎样保证一个有副作用的 Agent 工具不会因为重试而重复生效？**
 
@@ -215,7 +213,8 @@ fencing 不能跟着一份旧数据库备份一起回退。可以使用不可回
 
 ## 一手资料
 
-- [分布式系统地基：时间、一致性、复制、共识与分区](../systems/distributed_foundations.md)
+- [共享基础：时间、一致性与 CAP](../../rust-hft/distributed/distributed_systems_intro.html)
+- [共享基础：复制、Quorum 与共识](../../rust-hft/distributed/replication_consensus.html)
 - [Raft 原始论文](https://raft.github.io/raft.pdf)
 - [The Chubby Lock Service：lease、锁服务与故障处理](https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/)
 - [Dynamo 原始论文：分片、复制与故障取舍](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf)

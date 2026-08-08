@@ -1,8 +1,8 @@
 # FIX 协议解析：先做对 framing 与 session
 
-FIX（Financial Information eXchange）使用 `tag=value<SOH>` 字段，广泛用于订单、drop copy、会话与盘后流程。文本编码通常比定长二进制消息更大，也需要十进制扫描，但是否构成瓶颈取决于消息率、字段数量、实现与硬件。
+FIX（Financial Information eXchange，金融信息交换）使用 `tag=value<SOH>` 字段；`SOH` 是 ASCII 控制字符 Start of Heading（字节值 `0x01`），在 FIX 中充当字段分隔符。FIX 广泛用于订单、独立成交回报（drop copy）、会话与盘后流程。文本编码通常比定长二进制消息更大，也需要十进制扫描，但是否构成瓶颈取决于消息率、字段数量、实现与硬件。
 
-高质量 FIX 实现首先保证 BodyLength、Checksum、字段重复、session sequence 和重连恢复正确，再根据 profiling 优化 allocation 与数值转换。
+可靠的 FIX 实现首先保证消息体长度（BodyLength）、校验和（Checksum）、字段重复、会话序列号和重连恢复正确，再根据性能剖析结果优化内存分配与数值转换。
 
 ## 1. FIX 消息不是一个普通字符串 Map
 
@@ -228,6 +228,11 @@ stateDiagram-v2
 ### Q3：FIX 使用文本价格，为什么不一律存成 `f64`？
 
 撮合/风控/账务通常需要十进制精确和确定性编码，适合 mantissa+scale/ticks；`f64` 可用于允许近似的分析，但类型选择应由业务语义决定。
+
+## 权威依据
+
+- [FIX Trading Community：FIX TagValue Encoding](https://www.fixtrading.org/standards/tagvalue-online/)：规定标准头尾、BodyLength 的字节范围与 CheckSum 位置。
+- [FIX Trading Community：FIX Transport 1.1](https://www.fixtrading.org/wp-content/uploads/download-manager-files/FIX_Transport_1.1.pdf)：说明会话序列、重传、GapFill、登录与登出语义。
 
 ---
 

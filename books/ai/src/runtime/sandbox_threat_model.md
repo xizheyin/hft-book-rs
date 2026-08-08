@@ -1,12 +1,10 @@
 # Agent 沙箱威胁模型：先问“防谁”，再谈“用什么”
 
-> 难度：必会。官方 JD 明确提到容器隔离、缩小逃逸面，以及无人监管 Agent 带来的新安全挑战。
-
-> 先修桥梁：通用机制先读第一册的[进程与文件描述符](../../rust-hft/foundations/processes_fds.html)和[虚拟内存](../../rust-hft/foundations/virtual_memory.html)；Agent 特有边界再读[沙箱执行生命周期](../systems/process_threads_syscalls.md)和[工具网络](../systems/network_rpc.md)。威胁模型必须建立在真实执行、内存和网络边界上。
+Agent 会执行模型生成的动作和仓库中的不可信代码，因此威胁模型必须覆盖进程、文件、网络、身份、秘密和资源。通用隔离机制见系统子书的[进程与文件描述符](../../rust-hft/foundations/processes_fds.html)和[虚拟内存](../../rust-hft/foundations/virtual_memory.html)；Agent 场景进一步增加了提示注入、临时生成命令、外部工具和跨租户数据流等攻击面。
 
 沙箱不是一个产品名，而是一份安全承诺。把它想成化学实验室：通风柜、门禁、护目镜、试剂柜和事故记录各挡一种风险；只有一扇上锁的门，不能叫完整的实验安全。
 
-先把本章会反复出现的词翻成人话：**威胁模型**是先写清要保护什么、攻击者能做什么以及仍挡不住什么；**Prompt injection** 是不可信文本诱导模型越权；**供应链风险**来自依赖包或安装脚本本身；**fork bomb** 是快速复制进程以耗尽资源的程序。`schema` 约束工具参数的形状，namespace/cgroup/seccomp 分别限制“看见什么”“能用多少”“能调用哪些系统调用”。岗位会考这些词，是因为 Agent 即使没有恶意，也可能把不可信输入变成真实命令。
+先把本章会反复出现的词翻成人话：**威胁模型**是先写清要保护什么、攻击者能做什么以及仍挡不住什么；**Prompt injection** 是不可信文本诱导模型越权；**供应链风险**来自依赖包或安装脚本本身；**fork bomb** 是快速复制进程以耗尽资源的程序。`schema` 约束工具参数的形状；namespace（命名空间）隔离进程看见的系统视图，cgroup（控制组）计量并限制一组进程的资源，seccomp（安全计算模式）过滤进程可发起的系统调用。这些边界很重要，因为 Agent 即使没有恶意，也可能把不可信输入变成真实命令。
 
 ## 1. Agent 为什么应按不可信代码处理
 
@@ -90,11 +88,11 @@ flowchart LR
 
 ## 6. 典型失败路径
 
-为提高依赖下载速度，团队临时允许所有沙箱访问内网镜像站，后来规则被扩大为整个 RFC1918 网段。一个被仓库内容诱导的 Agent 探测到控制面管理接口。虽然没有容器逃逸，它仍通过“合法网络”越过了真正的资产边界。
+为提高依赖下载速度，团队临时允许所有沙箱访问内网镜像站，后来规则被扩大为 RFC 1918 规定的全部 IPv4 私有地址范围。一个被仓库内容诱导的 Agent 探测到控制面管理接口。虽然没有容器逃逸，它仍通过“合法网络”越过了真正的资产边界。
 
 事故修复应包括：精确目的地 allowlist、出口代理按身份授权、控制面使用独立网络、无长期凭证、策略回归测试，以及把网络决策写入审计 trace。
 
-## 7. DeepSeek Agent Infra 面试怎么问
+## 7. 章末面试问题
 
 **题目：你会怎样运行一个完全不可信的 Coding Agent？**
 
@@ -117,7 +115,6 @@ flowchart LR
 
 ## 一手资料
 
-- [DeepSeek Agent Infra 官方招聘页](https://talent.deepseek.com/)
 - [gVisor Security Model](https://gvisor.dev/docs/architecture_guide/security/)
 - [Firecracker 官方仓库与设计文档](https://github.com/firecracker-microvm/firecracker)
 - [Linux seccomp 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)

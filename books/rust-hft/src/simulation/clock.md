@@ -1,20 +1,16 @@
-# 高精度时钟模拟 (High-Precision Clock Simulation)
+# 时间语义与模拟时钟
 
-> **面试优先级：P1。** 必须会区分单调时间、墙上时间和可控模拟时钟。第 3 节 RDTSC 校准属于 P2：岗位没有低延迟计时要求时，理解风险即可，不必背实现。
+时间既是业务输入，也是测量工具。生产环境需要语义明确、开销可测且可追溯的时间戳；仿真环境需要由事件循环控制时间推进，保证相同输入产生相同结果。二者可以共用接口，但不能混用时间域。
 
-在构建高频交易系统时，时间既是输入，也是测量工具。生产环境需要低开销且可追溯的时间戳；回测环境需要完全控制时间推进，保证相同输入产生相同结果。
+## 1. 为什么需要区分时钟？
 
-本章将探讨如何设计一个零成本抽象的时钟系统，使其既能在生产环境中利用 CPU 指令集提供极低延迟的时间戳，又能在仿真环境中支持“时间旅行”，实现确定性（Deterministic）回测。
-
-## 1. 为什么不能直接用 `std::time::SystemTime`？
-
-在 Rust 中，`std::time::SystemTime::now()` 或 `Instant::now()` 是获取时间的标准方式。但在 HFT 场景下，它们存在以下问题：
+在 Rust 中，`std::time::SystemTime::now()` 和 `Instant::now()` 都能读取时间，但语义不同，而且真实时间无法直接控制：
 
 1.  **开销需要测量**：现代 Linux 常通过 vDSO 实现 `clock_gettime`，不一定进入内核。具体成本依赖时钟类型、CPU 和内核，不能把某个固定纳秒数字当作所有机器的事实。
 2.  **不可控性**：在回测时，我们需要“伪造”时间。如果策略代码直接调用系统时间，回测将变得不可能，因为回测运行的速度远快于真实时间。
 3.  **“单位”不等于“精度”**：接口返回纳秒单位，不代表每纳秒都会更新，也不代表与 UTC 的误差只有 1ns。resolution、读取开销、同步误差是三个不同概念。
 
-因此，我们需要一个抽象层。
+因此，业务代码需要明确自己读取的是墙上时间、单调时间还是模拟时间。
 
 ## 2. 时钟抽象 (The Clock Trait)
 
@@ -51,9 +47,9 @@ pub struct TradingEngine<C: Clock> {
 }
 ```
 
-## 3. 生产环境：基于 RDTSC 的超低延迟时钟
+## 3. x86 的时间戳计数器
 
-在 x86_64 架构上，CPU 提供 TSC（Time-Stamp Counter）。读取它通常很快，但 TSC 是 tick 计数，不天然等于 UTC 纳秒。
+在 x86-64 架构上，CPU 提供 TSC（Time-Stamp Counter，时间戳计数器）。`RDTSC`（Read Time-Stamp Counter）读取该计数器，`RDTSCP` 是带额外排序语义并返回辅助处理器标识的变体。读取 TSC 通常很快，但它得到的是 tick 计数，不天然等于协调世界时（Coordinated Universal Time，UTC）纳秒。
 
 ### 3.1 挑战与解决方案
 
@@ -218,7 +214,7 @@ impl StrategyContext for BacktestContext {
 | :--- | :--- | :--- | :--- |
 | **开销** | 依实现与平台，通常走 vDSO | 通常很低，需序列化/换算 | 普通字段读取 |
 | **来源** | OS 暴露的时钟 | CPU counter | 仿真状态变量 |
-| **用途** | 日志、非关键路径 | 生产环境核心路径 | 回测、单元测试 |
+| **用途** | UTC 关联、日志与审计 | 经过校准的短时长测量 | 回测、单元测试 |
 | **可控性** | 不可控 | 不可控 | 完全可控 |
 
 通过 `Clock` trait 和泛型，同一套策略可以在实盘与回测中切换。更重要的是，它让“时间的语义”变得可审查：duration 不受 UTC 校时影响，回测不读取真实时间，审计时间戳也不会与 TSC tick 混为一谈。
@@ -236,3 +232,9 @@ impl StrategyContext for BacktestContext {
 ### Q3：模拟时钟如何避免 look-ahead bias？
 
 只有事件循环可以推进时钟；策略只看到当前事件及此前状态；输入读取与策略可见性隔离；相同 timestamp 使用稳定 tie-break；测试断言时间不倒退并对相同输入比较结果 hash。
+
+## 8. 权威依据
+
+- [Rust 标准库：`Instant`](https://doc.rust-lang.org/stable/std/time/struct.Instant.html)：说明单调但不保证匀速、平台相关的挂起语义及底层时钟来源。
+- [Rust 标准库：`SystemTime`](https://doc.rust-lang.org/stable/std/time/struct.SystemTime.html)：说明墙上时间不是单调时钟。
+- [Intel 64 与 IA-32 架构软件开发手册](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)：`RDTSC`、`RDTSCP`、`LFENCE` 和 TSC 的架构语义以指令手册为准。

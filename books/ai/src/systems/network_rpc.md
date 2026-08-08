@@ -4,7 +4,7 @@ Agent 调用一个“查询订单”工具时，代码看起来像一次函数�
 
 本章回答：**怎样为 Agent 工具调用设计协议、deadline、重试和出口安全，并在失败时说明结果是否确定。**
 
-如果 IP、路由、TCP、socket 或网络 I/O 还不熟悉，先读第一册的[网络基础](../../rust-hft/network/basics.html)与[网络 I/O 模型](../../rust-hft/network/io_models.html)。链路层到传输层的通用原理统一放在那里；这里从 RPC 开始。
+IP、路由、TCP、socket 与网络 I/O 的通用原理由第一册的[网络基础](../../rust-hft/network/basics.html)与[网络 I/O 模型](../../rust-hft/network/io_models.html)主讲。本章从 RPC 开始，只增加工具调用的身份、超时、重试与出口策略。
 
 ## 1. 先认识一条工具调用链
 

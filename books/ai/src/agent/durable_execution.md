@@ -174,7 +174,7 @@ Checkpoint（检查点）应保存恢复所需的最小确定状态，例如：
 
 终止本地进程不能撤销已经发出的请求。必须查询外部状态，并进入补偿或人工对账流程。
 
-## 10. DeepSeek Agent Infra 面试怎么问
+## 10. 章末面试问题
 
 ### 典型问题
 
@@ -204,7 +204,6 @@ Checkpoint（检查点）应保存恢复所需的最小确定状态，例如：
 
 ## 12. 一手资料
 
-- [DeepSeek：Agent 后端方向招聘](https://app.mokahr.com/social-recruitment/high-flyer/140576#/job/2eb2e75d-29f3-47b5-bb10-39f12547d398)
 - [RFC 9110：HTTP 的幂等方法语义](https://www.rfc-editor.org/rfc/rfc9110)
 - [Amazon Builders' Library：Timeouts, Retries and Backoff with Jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)
 - [Stripe：Idempotent Requests](https://docs.stripe.com/api/idempotent_requests)

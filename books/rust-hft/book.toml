@@ -1,9 +1,9 @@
 [book]
-authors = ["Rust · C++ · HFT 学习团队"]
+authors = ["系统 · Rust · C++ · HFT 学习团队"]
 language = "zh-CN"
 src = "src"
 title = "系统、Rust、C++ 与 HFT 基础宝典"
-description = "面向零基础求职者的计算机系统、Rust、C++、HFT 与低延迟工程面试宝典"
+description = "面向零基础求职者的计算机基础、Rust、C++、传统后端、AI Infra 与 HFT 面试宝典"
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"

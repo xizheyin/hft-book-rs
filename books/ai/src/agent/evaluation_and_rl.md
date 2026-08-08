@@ -4,14 +4,6 @@
 
 Evaluation（评测）回答“能力和失败在哪里”；Reinforcement Learning（强化学习，RL）尝试利用奖励信号改变模型行为。两者通过 rollout 环境相连：Agent 在环境里行动，环境给观察和奖励，轨迹再用于分析或训练。
 
-## 学习优先级
-
-| 优先级 | 先掌握什么 | 面试要求 |
-|---|---|---|
-| P1 | 模型级/Agent 级边界、Golden Set、Verifier、分层指标、轨迹归因、受控自进化闭环 | 能设计可信上线门禁 |
-| P2 | 校准、配对评测、消融、重复 Rollout；具体 RL 算法见训练章 | 能说明结论的不确定性和训练负载 |
-| 暂不展开 | 强化学习完整公式证明、通用统计学全部检验 | 能选对方法并解释假设即可 |
-
 ## 1. Benchmark、Golden Set 与真实流量
 
 ### 1.1 Benchmark
@@ -109,7 +101,7 @@ Verifier（验证器）可以分为：
 优先使用最接近真实成功条件、且最难被投机的 verifier。代码 Agent 只奖励“生成了补丁”会鼓励随便改；奖励隐藏测试通过更接近目标，但还要防修改测试或读取答案。
 
 <details>
-<summary><strong>P2 选读：配对评测、校准、消融与置信区间</strong></summary>
+<summary><strong>拓展：配对评测、校准、消融与置信区间</strong></summary>
 
 ## 6. Paired Evaluation：同题比较比两堆平均分更敏感
 
@@ -224,9 +216,9 @@ Rollout 是 Agent 从初始任务开始，与环境多轮交互直到终止的�
 
 这正是 Agent Infra 与训练团队的接口：Infra 不设计奖励算法，却决定 rollout 是否隔离、可复现、可扩展和可审计。
 
-## 11. RL 在本章只看三本 Infra 账
+## 11. RL 基础设施必须维护的三本账
 
-RLHF、PPO 和 GRPO 的算法直觉与 DeepSeek 公开方案已经在[预训练、SFT、偏好对齐与强化学习](../llm/training_and_alignment.md)中解释，本章不再重复定义。RLVR 指 Reinforcement Learning with Verifiable Rewards，即使用测试、规则或答案检查器等可验证奖励做强化学习。Agent Infra 面试更应讲清三件事。
+RLHF、PPO 和 GRPO 的算法直觉与 DeepSeek 公开方案已经在[预训练、SFT、偏好对齐与强化学习](../llm/training_and_alignment.md)中解释，本章不再重复定义。RLVR 指 Reinforcement Learning with Verifiable Rewards，即使用测试、规则或答案检查器等可验证奖励做强化学习。基础设施需要为它维护下面三本账。
 
 ### 11.1 Rollout 账：样本从哪里来
 
@@ -328,7 +320,7 @@ flowchart LR
 | 总分略升但安全类下降 | 只优化平均分 | 设置安全硬门槛并按任务分层 |
 | 小测试集上“最佳版本”频繁更换 | 反复试验后的选择偏差 | 预先确定主指标，保留盲测并给出不确定范围 |
 
-## 14. DeepSeek Agent Infra 面试怎么问
+## 14. 章末面试问题
 
 ### 典型问题
 
@@ -364,10 +356,10 @@ flowchart LR
 
 1. 模型级、Harness 级和 Agent 端到端评测分别回答什么？
 2. 平均 Token Loss 为 `ln(4)` 时，Perplexity 是多少？它能否直接解释任务成功率？
-3. **P2**：为什么 A/B 应在同一任务和环境上配对？
-4. **P2**：100 个“80% 可信”的判断只对了 55 个，说明什么？
-5. **P2**：Baseline 与 Ablation 分别回答什么问题？
-6. **P2**：500 个任务成功 400 个，请估算成功率标准误差；还要检查哪些独立性假设？
+3. **拓展**：为什么 A/B 应在同一任务和环境上配对？
+4. **拓展**：100 个“80% 可信”的判断只对了 55 个，说明什么？
+5. **拓展**：Baseline 与 Ablation 分别回答什么问题？
+6. **拓展**：500 个任务成功 400 个，请估算成功率标准误差；还要检查哪些独立性假设？
 7. Agent 最终失败时，为什么不能直接把责任归给模型？
 8. 一个自进化候选从失败轨迹到正式放量，应经过哪些门？
 9. 怎样防止优化器通过改考卷、扩权限或钻奖励漏洞获得“进步”？
@@ -377,20 +369,18 @@ flowchart LR
 - Benchmark 可比较，Golden Set 防回归，真实任务补分布差异。
 - Agent 要同时评最终结果、过程、工具、效率、安全和恢复。
 - Verifier 越接近真实成功条件，越不容易被投机。
-- **P2**：配对评测要同题同环境，并控制顺序与评审偏差。
+- **拓展**：配对评测要同题同环境，并控制顺序与评审偏差。
 - Trace attribution 把失败定位到可行动层，而非笼统怪模型。
 - Rollout 环境必须可复位、隔离、版本化、限资源、可回放。
 - RL 算法定义见训练章；本章重点是 rollout、奖励可信性和生成/沙箱/存储/训练成本。
 - 自进化闭环是轨迹、失败聚类、候选改动、离线配对、灰度和回滚，不是在线直接改生产 Prompt。
 - 优化器不能修改盲测、权限、审计、费用和停止开关。
 - 模型级分数、Harness 正确率和 Agent 任务成功率是三层不同账。
-- **P2**：校准要求置信与长期频率相符；模型自己说“有把握”不是校准证明。
-- **P2**：Baseline 证明复杂方案值得，Ablation 定位收益来源，置信区间表达抽样不确定性；小差异必须结合配对结果、重复 Rollout、区间和失败分层解读。
+- **拓展**：校准要求置信与长期频率相符；模型自己说“有把握”不是校准证明。
+- **拓展**：Baseline 证明复杂方案值得，Ablation 定位收益来源，置信区间表达抽样不确定性；小差异必须结合配对结果、重复 Rollout、区间和失败分层解读。
 
 ## 一手资料
 
-- [DeepSeek：Code Agent 数据工程师招聘](https://app.mokahr.com/social-recruitment/high-flyer/140576#/job/a4ad8628-286e-4395-ac3e-b8117ac695c6)
-- [DeepSeek：后训练研究员招聘](https://app.mokahr.com/social-recruitment/high-flyer/140576#/job/5d75f4cd-f626-4f73-80c1-e53b2073de76)
 - [本书：预训练、SFT、偏好对齐与强化学习](../llm/training_and_alignment.md)
 - [DeepSeek-R1](https://arxiv.org/abs/2501.12948)
 - [AgentBench](https://arxiv.org/abs/2308.03688)

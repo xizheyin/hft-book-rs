@@ -1,23 +1,10 @@
 # 容器、用户态内核与微型虚拟机（microVM）：隔离边界之下发生了什么
 
-> 难度：必会。JD 明确要求大规模 VM、容器隔离与多样操作系统环境；具体产品名属于备考方案，不是官方内部选型事实。
+容器、用户态内核和虚拟机提供不同的内核与硬件边界。本章使用 Linux KVM（Kernel-based Virtual Machine，内核虚拟机接口）、QEMU、virtio、gVisor 与 Firecracker 等公开实现说明共同机制；它们是案例，不是唯一选型。
 
-> 事实边界：本章只解释 Linux KVM（Kernel-based Virtual Machine，内核虚拟机接口）、QEMU、virtio、gVisor 与 Firecracker 等公开机制。DeepSeek/DSec 是否使用这些组件、如何定制、性能数据和线上参数均未知；面试时应把它们说成“通用机制或可选方案”，不能包装成对内部实现的了解。
-
-> 先修桥梁：先用第一册的[程序执行](../../rust-hft/foundations/computer_execution.html)、[进程与文件描述符](../../rust-hft/foundations/processes_fds.html)和[虚拟内存](../../rust-hft/foundations/virtual_memory.html)理解“共享内核”和“独立地址空间”，再读本章。
-
-## 本章 P0/P1 地图
-
-先学 P0，再学 P1。P0 决定你能不能做出正确的架构选择；P1 决定面试官向下追问硬件与数据路径时，你能不能把原因讲透。
-
-| 优先级 | 必须掌握 | 通过标准 |
-|---|---|---|
-| **P0：不能答错** | 容器、用户态内核与 VM 的隔离边界；快照需要覆盖 CPU、内存、设备和磁盘一致性并刷新克隆身份；按威胁模型、兼容性、启动、密度和运维选型 | 能在 30 秒内比较三类边界；能解释“dirty bitmap 不等于一致快照”；不会声称某一种运行时永远最安全 |
-| **P1：连续深挖** | 虚拟 CPU（vCPU）与 VM 进入/退出；guest 地址到宿主物理地址的两阶段翻译；设备模拟、virtio、虚拟中断及块/网路径；超卖、内存位置、绑核、共享资源竞争与证据链 | 能画出 CPU、地址翻译和 I/O 三条路径；能从 guest、VMM/KVM、宿主三层提出指标与可证伪实验 |
+通用的进程、文件描述符与虚拟地址空间见[进程与文件描述符](../../rust-hft/foundations/processes_fds.html)和[虚拟内存](../../rust-hft/foundations/virtual_memory.html)。容器和 VM 的区别建立在这些基础上，关键新增对象是共享或独立的内核、虚拟设备以及快照一致性。
 
 把宿主机想成一栋公寓。普通容器像共用楼体和物业系统的独立房间；虚拟机像在楼内再建一套有自己物业的小楼；用户态内核则像在房门内增加一层翻译与门卫。三者都能隔开住户，但成本、兼容性和攻击面不同。
-
-第一次阅读先掌握三类隔离边界、选型维度和快照一致性。下面折叠的 VM entry/exit、两阶段页表、virtio 队列与脏页迁移属于 P1：面试官沿硬件或数据路径继续追问时再展开。
 
 ## 1. 容器隔离了什么，没有隔离什么
 
@@ -27,8 +14,8 @@
 - cgroup 规定进程“能用多少”，例如 CPU、内存、I/O 和进程数。
 - capability 把 root 权限拆小。
 - seccomp 过滤系统调用。
-- LSM（如 SELinux、AppArmor）限制对象访问。
-- OCI runtime 按规范创建进程、挂载与 namespace。
+- LSM（Linux Security Modules，Linux 安全模块，例如 SELinux、AppArmor）限制对象访问。
+- OCI（Open Container Initiative，开放容器倡议）runtime 按运行时规范创建进程、挂载与 namespace。
 
 最关键的一句是：**容器里的进程仍直接调用宿主机内核。**镜像是文件集合，不是安全边界；Kubernetes namespace 主要组织 API 对象，也不能替代 Linux 运行时隔离。
 
@@ -42,9 +29,9 @@ VM 内的应用先调用自己的 guest kernel，再通过虚拟 CPU 和虚拟�
 |---|---|---|
 | guest | 租客的小楼 | 运行应用和 guest kernel |
 | KVM | 内核里的虚拟化执行设施 | 创建 VM/vCPU，借助 CPU 虚拟化扩展运行 guest，处理一部分退出与中断 |
-| VMM | 宿主用户态的管理员 | 配置内存和设备、启动 vCPU、处理需要用户态参与的退出；QEMU、Firecracker 都可承担这一角色 |
+| VMM（Virtual Machine Monitor，虚拟机监控器） | 宿主用户态的管理员 | 配置内存和设备、启动 vCPU、处理需要用户态参与的退出；QEMU、Firecracker 都可承担这一角色 |
 
-microVM 仍然是 VM。“micro”通常表示它刻意减少传统 PC 设备、固件和通用功能，以缩小启动成本及攻击面，并不表示它退化成容器。Firecracker 是公开案例：它使用 KVM，面向 serverless 多租户负载。这里用它帮助理解，不代表 DeepSeek 的实现。
+microVM 仍然是 VM。“micro”通常表示它刻意减少传统 PC 设备、固件和通用功能，以缩小启动成本及攻击面，并不表示它退化成容器。Firecracker 是使用 KVM、面向 serverless 多租户负载的公开案例。
 
 ### 2.1 vCPU 不是一块缩小的实体 CPU
 
@@ -57,7 +44,7 @@ vCPU 是 VM 看到的逻辑处理器。VMM 通过 `/dev/kvm` 创建 VM，再创�
 不要把 vCPU 解释成纯软件模拟。启用硬件辅助虚拟化时，大量普通 guest 指令直接在物理 CPU 上执行，只是处于受控的 guest 模式。
 
 <details>
-<summary><strong>P1 深挖：VM entry/exit 与两阶段地址翻译</strong></summary>
+<summary><strong>深入：VM entry/exit 与两阶段地址翻译</strong></summary>
 
 ### 2.2 一次 VM entry/exit 如何发生
 
@@ -78,14 +65,14 @@ VM exit
     └─ 需 VMM 处理 ─────────► KVM_RUN 返回用户态 ─► VMM 模拟/处理 ─► 再调用 KVM_RUN
 ```
 
-`VM entry` 是 CPU 从宿主执行环境进入 guest；`VM exit` 是 CPU 因某个受配置控制的事件返回虚拟化层。例如 guest 执行需要虚拟化层处理的敏感操作、访问模拟设备、停机，或遇到异常与中断时，都可能触发退出。具体哪些事件退出、由哪一层处理，取决于架构和配置；基础面试不需要背事件编号。
+`VM entry` 是 CPU 从宿主执行环境进入 guest；`VM exit` 是 CPU 因某个受配置控制的事件返回虚拟化层。例如 guest 执行需要虚拟化层处理的敏感操作、访问模拟设备、停机，或遇到异常与中断时，都可能触发退出。具体哪些事件退出、由哪一层处理，取决于架构和配置；事件编号本身不能替代对路径的理解。
 
 有两个高频陷阱：
 
 1. **VM exit 不等于 `KVM_RUN` 每次都返回 VMM。**KVM 可在内核中处理一些退出并重新进入 guest，只有需要用户态参与等情形才把退出原因交给 VMM。
 2. **宿主抢占 vCPU 线程不等于 guest 主动做了一次设备 VM exit。**两者都会让 guest 暂停，但证据和优化方向不同。
 
-一次 exit 的开销也没有可背诵的固定纳秒数。状态切换、TLB/缓存影响、退出原因和用户态设备模拟都会改变成本。面试中应说“减少不必要的高频退出并实测”，不要声称“VM 每条指令都要陷入 hypervisor”。
+一次 exit 的开销也没有可背诵的固定纳秒数。状态切换、TLB（Translation Lookaside Buffer，地址翻译缓存）影响、退出原因和用户态设备模拟都会改变成本。正确做法是减少不必要的高频退出并实测，不能声称“VM 每条指令都要陷入 hypervisor”。
 
 ## 3. 两阶段地址翻译：guest 地址怎样落到宿主内存
 
@@ -101,7 +88,7 @@ guest 应用产生 GVA（guest virtual address）
         HPA（host physical address）
 ```
 
-在 x86 上，第二阶段硬件机制常称 Intel EPT 或 AMD NPT；其他架构也有对应的 stage-2 翻译。CPU 可以在硬件中组合两阶段页表遍历，并把结果缓存进 TLB，所以正常内存访问不需要每次都退出到 VMM。
+在 x86 上，第二阶段硬件机制常称 Intel EPT（Extended Page Tables，扩展页表）或 AMD NPT（Nested Page Tables，嵌套页表）；其他架构也有对应的 stage-2 翻译。CPU 可以在硬件中组合两阶段页表遍历，并把结果缓存进 TLB，所以正常内存访问不需要每次都退出到 VMM。
 
 VMM 还会把一段自己的宿主虚拟地址空间注册为 guest memory backing。它是软件管理内存时的重要视角，但解释 CPU 最终访问路径时，核心仍是 `GVA → GPA → HPA`，不要把三个概念混在一起。
 
@@ -120,18 +107,18 @@ VMM 还会把一段自己的宿主虚拟地址空间注册为 guest memory backi
 
 ## 4. 虚拟设备：模拟、virtio 与直通
 
-guest 不能直接假设自己独占宿主的网卡和 NVMe。VMM 必须给它呈现某种设备接口，常见有三种思路：
+guest 不能直接假设自己独占宿主的网卡和 NVMe（Non-Volatile Memory Express，一种常见的高速存储设备接口）。VMM 必须给它呈现某种设备接口，常见有三种思路：
 
 | 方案 | guest 看到什么 | 优点 | 代价与风险 |
 |---|---|---|---|
 | 设备模拟 | 一块已知的真实/传统设备 | 旧 OS 可用原生驱动，兼容性强 | 寄存器访问和设备行为模拟较重，可能产生较多退出 |
 | virtio 半虚拟化 | 标准化的虚拟设备 | guest 与 VMM 都知道是虚拟环境，可批量交换请求，通常更高效 | guest 需要 virtio 驱动；性能仍取决于 backend、拷贝、批处理和通知 |
-| 设备直通 | guest 直接管理物理功能或虚拟功能 | 可减少设备模型参与，性能潜力高 | 需要 IOMMU（限制设备 DMA 可访问哪些内存的地址翻译与隔离单元）等隔离，迁移、共享、重置和运维更复杂 |
+| 设备直通 | guest 直接管理物理功能或虚拟功能 | 可减少设备模型参与，性能潜力高 | 需要 IOMMU（Input-Output Memory Management Unit，输入输出内存管理单元）限制设备通过 DMA（Direct Memory Access，直接内存访问）可读写的内存；迁移、共享、重置和运维也更复杂 |
 
 “半虚拟化”不是“半台虚拟机”，而是 guest 驱动主动遵守为虚拟环境设计的接口。virtio 是 OASIS 标准；QEMU 可以在用户态提供 backend，也可配合内核 vhost 或外部 vhost-user backend。
 
 <details>
-<summary><strong>P1 深挖：virtqueue、虚拟中断以及块/网络数据路径</strong></summary>
+<summary><strong>深入：virtqueue、虚拟中断以及块/网络数据路径</strong></summary>
 
 ### 4.1 virtqueue 如何工作
 
@@ -164,7 +151,7 @@ guest 不能直接假设自己独占宿主的网卡和 NVMe。VMM 必须给它�
 
 ```text
 guest 应用 write/read
-  → guest VFS、文件系统、页缓存
+  → guest VFS（Virtual File System，虚拟文件系统）、具体文件系统、页缓存
   → guest virtio-blk/virtio-scsi 驱动提交描述符
   → virtio backend（QEMU、vhost-user 等）
   → 宿主文件、块设备或远端存储
@@ -219,7 +206,7 @@ gVisor 通过 Sentry 在用户态实现 Linux 风格的系统接口，让大量�
 - 与该时刻匹配的块设备内容，或一套明确的块设备快照协议。
 - 运行时、CPU 特性、设备模型和快照格式的兼容性元数据。
 
-Firecracker 的公开文档提供了一个具体例子：创建快照前 microVM 必须处于 `Paused`；microVM 状态和 guest memory 分开保存；块设备 backing file 不包含在 microVM 快照里，需要调用方另行管理。它说明了通用难点，但不能外推为其他 VMM 或 DeepSeek 的内部行为。
+Firecracker 的公开文档提供了一个具体例子：创建快照前 microVM 必须处于 `Paused`；microVM 状态和 guest memory 分开保存；块设备 backing file 不包含在 microVM 快照里，需要调用方另行管理。其他 VMM 的接口和快照格式必须查各自文档。
 
 ### 7.1 一致快照要先定义“一致”
 
@@ -235,7 +222,7 @@ Firecracker 的公开文档提供了一个具体例子：创建快照前 microVM
 暂停 vCPU 只阻止 guest CPU 继续执行，不自动让数据库完成业务级 flush；保存内存也不自动保存外部对象存储、远端数据库和网络对端状态。
 
 <details>
-<summary><strong>P1 深挖：dirty-page tracking 与增量迁移为什么不等于一致快照</strong></summary>
+<summary><strong>深入：dirty-page tracking 与增量迁移为什么不等于一致快照</strong></summary>
 
 ### 7.2 dirty-page tracking 只回答“哪些页写过”
 
@@ -266,9 +253,9 @@ KVM 的 dirty log 可为 guest memory slot 返回 bitmap，通常每个 guest pa
 若快照被当作新实例模板，而不是同一实例的暂停/继续，至少要检查并刷新：
 
 - 实例 ID、machine ID、主机名等身份。
-- MAC、IP、DHCP lease、连接状态等网络身份与旧会话。
+- MAC（Media Access Control，介质访问控制）地址、IP 地址、DHCP（Dynamic Host Configuration Protocol，动态主机配置协议）租约、连接状态等网络身份与旧会话。
 - 随机数/熵状态，避免多个克隆产生相同随机序列。
-- 短期凭证、令牌、SSH host key 和租户秘密。
+- 短期凭证、令牌、SSH（Secure Shell，安全外壳协议）主机密钥和租户秘密。
 - 前一租户的缓存、日志、临时文件和内存残留。
 
 基础镜像、guest kernel、VMM、CPU 特性或设备模型升级时，还需检查兼容矩阵并使不兼容快照失效。恢复失败要有界回退冷启动，避免批量重试形成恢复风暴。
@@ -401,7 +388,7 @@ dirty bitmap 只告诉我某段时间哪些内存页被写过，便于增量复�
 - virtio 用 virtqueue、kick 和完成通知降低传统设备模拟成本，但不承诺零拷贝、零退出。
 - 一致快照要保存 CPU、内存和设备状态，并协调磁盘；dirty bitmap 只回答哪些页写过。
 - 超卖改善平均利用率，却可能伤害 p99；pinning、NUMA 和共享 I/O 要一起考虑。
-- 本章均为公开通用机制，不能冒充 DeepSeek 内部架构。
+- KVM、Firecracker、gVisor 等实现细节不能无条件外推到其他运行时。
 
 ## 一手资料
 

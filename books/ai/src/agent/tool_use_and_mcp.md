@@ -83,7 +83,9 @@ MCP（Model Context Protocol，模型上下文协议）为 AI 应用连接外部
 
 具体消息和能力会随规范版本演进，工程实现应锁定并记录所支持的协议版本，不能根据一篇旧博客猜字段。
 
-MCP 统一“怎样连接”，却不会自动解决权限和正确性。一个 Server 声明自己有 `delete_all` 工具，不代表 Host 应把它开放给每个 Agent。
+MCP 统一“怎样连接”，并为 HTTP 传输定义了可选的授权机制；当前规范把受保护的 MCP Server 作为 OAuth 资源服务器，让 Client 取得只面向该 Server 的访问令牌。标准输入输出（stdio）传输通常由启动它的 Host 通过进程环境和本地边界提供凭证，而不是照搬 HTTP 授权流程。
+
+这类授权回答“这个 Client 能否访问这个 Server”，仍不会自动完成每个工具、资源和参数的业务授权，也不会证明调用正确。一个 Server 声明自己有 `delete_all` 工具，不代表 Host 应把它开放给每个 Agent；Host 与 Server 仍要校验令牌受众、请求范围和实际资源权限，并遵守最小权限。
 
 ## 4. Skills 与 MCP 不一样
 
@@ -152,7 +154,7 @@ Tool Use 的执行层往往落到沙箱，因此 Infra 需要提供：
 
 网络策略尤其重要：Agent 能访问一个 MCP Server，不等于它可以访问该 Server 所在网络中的所有地址。
 
-## 8. DeepSeek Agent Infra 面试怎么问
+## 8. 章末面试问题
 
 ### 典型问题
 
@@ -174,15 +176,15 @@ Tool Use 的执行层往往落到沙箱，因此 Infra 需要提供：
 
 - 模型只提出动作，Harness 校验并授权，Tool 才真正执行。
 - Tool Use 闭环是描述、选择、验证授权、执行、观察。
-- MCP 是连接协议，不是自动安全认证，也不是 Agent 框架的同义词。
+- MCP 是连接协议，包含可选的传输层授权能力，但不是自动的逐工具业务授权，也不是 Agent 框架的同义词。
 - Skill 是按需加载的任务手册，Tool 是动作，MCP 是连接方式。
 - 副作用工具必须考虑幂等、超时、重试、审批和审计。
 - 不可信工具结果只能当数据，不能提升为高优先级指令。
 
 ## 10. 一手资料
 
-- [DeepSeek：Agent Harness 团队招聘](https://app.mokahr.com/social-recruitment/high-flyer/140576#/job/8d40c764-d2b2-49b1-826c-e3f2adb75c01)
 - [Model Context Protocol 官方规范](https://modelcontextprotocol.io/specification/)
+- [Model Context Protocol 2026-07-28 官方授权规范](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization)
 - [Model Context Protocol 官方文档](https://modelcontextprotocol.io/docs/)
 - [JSON Schema 规范](https://json-schema.org/specification)
 - [Toolformer: Language Models Can Teach Themselves to Use Tools](https://arxiv.org/abs/2302.04761)

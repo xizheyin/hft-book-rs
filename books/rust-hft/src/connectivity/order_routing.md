@@ -1,11 +1,11 @@
 # 订单路由系统
 
-订单路由（Order Routing）把策略的交易意图变成交易所能理解的消息，并把交易所回报还原成可靠的订单状态。它追求低延迟，但优先级应当是：
+订单路由（Order Routing）把策略的交易意图变成交易所能理解的消息，并把交易所回报还原成可靠的订单状态。路由系统必须一直守住以下不变量：
 
 1. **不绕过风控**；
 2. **不把未知状态伪装成成功或失败**；
 3. **不静默丢失已经接受的请求和回报**；
-4. 在这些条件下，再优化延迟与抖动。
+4. 性能优化不能破坏前三条。
 
 ## 1. 一笔订单经过什么路径
 
@@ -33,18 +33,20 @@ stateDiagram-v2
     Intent --> RejectedLocally: 参数/风控失败
     Intent --> AcceptedLocally: 网关接受并分配 ID
     AcceptedLocally --> PendingNew: 已排队或正在发送
-    PendingNew --> Live: 交易所 Ack
+    PendingNew --> Working: 交易所 Ack
     PendingNew --> RejectedByVenue: 交易所 Reject
+    PendingNew --> PartiallyFilled: 成交回报先于或替代独立 Ack
+    PendingNew --> Filled: 全部成交回报先于或替代独立 Ack
     PendingNew --> Unknown: 断线且结果不确定
-    Live --> PartiallyFilled: 部分成交
-    Live --> PendingCancel: 发出撤单
+    Working --> PartiallyFilled: 部分成交
+    Working --> PendingCancel: 发出撤单
     PartiallyFilled --> PendingCancel: 发出撤单
     PendingCancel --> Cancelled: 撤单确认
     PendingCancel --> Filled: 撤单前已全部成交
     PendingCancel --> Unknown: 断线且结果不确定
-    Live --> Filled: 全部成交
+    Working --> Filled: 全部成交
     PartiallyFilled --> Filled: 剩余量成交
-    Unknown --> Live: 查询/回放后确认仍挂单
+    Unknown --> Working: 查询/回放后确认仍挂单
     Unknown --> Filled: 查询/回放后确认已成交
     Unknown --> Cancelled: 查询/回放后确认已撤
 ```
@@ -158,7 +160,7 @@ fn encode_new(order: &NewOrder, out: &mut [u8]) -> Result<usize, EncodeError> {
 - 重启、主备切换后不与旧订单冲突；
 - 能在回报、日志和对账中稳定关联。
 
-UUID 并非天然不可用。如果协议接受其长度，且生成/编码成本经过测量符合预算，它可以提供清晰的唯一性。低延迟路径也常用紧凑整数或预生成 ID，但要补齐“重启之后”的故事。
+通用唯一标识符（Universally Unique Identifier，UUID）并非天然不可用。如果协议接受其长度，且生成/编码成本经过测量符合预算，它可以提供清晰的唯一性。高消息率路径也常用紧凑整数或预生成 ID，但必须说明重启之后怎样避免复用旧 ID。
 
 下面是单线程整数生成器的思路：
 
@@ -290,9 +292,9 @@ fn flush_one(stream: &mut impl Write, frame: &mut PendingFrame) -> io::Result<bo
 
 ## 10. 高频面试题
 
-### Q1：`write()` 返回成功，订单就是 Live 吗？
+### Q1：`write()` 返回成功，订单就是 Working 吗？
 
-不是。它通常只说明字节进入了本机或网络栈。订单要在收到交易所业务 Ack 后才进入 `Live`；如果 Ack 前断线，可能是 `Unknown`，需要重放或查询确认。
+不是。它通常只说明字节进入了本机或网络栈。订单要在收到交易所业务 Ack 后才进入 `Working`；如果 Ack 前断线，可能是 `Unknown`，需要重放或查询确认。
 
 ### Q2：队列满时为什么有时可以拒绝订单，却又说不能丢订单？
 

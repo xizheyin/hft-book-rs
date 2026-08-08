@@ -2,15 +2,7 @@
 
 想象一座自动化工厂。Linear 层像按配方混合原料，激活函数像只允许某些半成品通过的闸门，Normalization 像把每批原料调回稳定刻度，残差连接则像给深加工流水线保留一条直达通道。Transformer 看起来庞大，本质上仍是这些小积木按固定形状反复堆叠。
 
-> 本章目标：看懂 Linear、激活函数、FFN、Normalization 和残差连接；能计算一个小网络的参数量，并把这些积木与 Attention、MoE 和模型显存联系起来。
-
-## 学习优先级
-
-| 优先级 | 先掌握什么 | 面试要求 |
-|---|---|---|
-| P1 | Linear、激活函数、FFN、残差、Normalization、参数量 | 能画结构、跟踪形状、解释为什么需要它 |
-| P2 | SwiGLU、Pre-Norm/Post-Norm、Dropout、初始化 | 能说明取舍，不必背完整推导 |
-| 暂不展开 | 通用逼近定理、矩阵微积分证明 | Agent Infra 面试收益很低 |
+Linear、激活函数、FFN、Normalization 和残差连接是理解 Transformer 的基础积木。每个机制都要同时看张量形状、参数量、为什么需要以及它给训练和推理增加的成本。
 
 ## 1. Linear：把一组特征重新混合
 
@@ -209,7 +201,7 @@ Transformer 是积木搭法，不是只有一种网络：
 
 常见遗漏是偏置、门控的额外投影、Embedding、输出头和 MoE 的未激活专家。总参数、每 Token 激活参数和实际驻留权重不能混为一谈。
 
-## 10. DeepSeek Agent Infra 面试怎么问
+## 10. 章末面试问题
 
 ### 30 秒答法
 

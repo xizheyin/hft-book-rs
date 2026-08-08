@@ -1,21 +1,18 @@
 # Summary
 
 - [首页：AI 与 Agent Infra 面试宝典](README.md)
-- [官方岗位要求与知识边界](orientation/role_map.md)
-- [候选人能力矩阵与面试定位](orientation/candidate_strategy.md)
+- [AI 与 Agent Infra 岗位能力地图](orientation/role_map.md)
 
-# 第一部分：共享系统先修与 Agent Infra 增量
+# 第一部分：Agent Infra 的系统机制
 
-- [先修导航：系统基础在哪里学](systems/README.md)
 - [Agent 沙箱怎样安全执行命令](systems/process_threads_syscalls.md)
 - [Agent 内存隔离与容量](systems/virtual_memory.md)
 - [Agent 并发协议：领取、取消与背压](systems/concurrency_async_io.md)
 - [Agent RPC 与工具网络](systems/network_rpc.md)
 - [数据库、Checkpoint 与可恢复状态](systems/filesystem_database.md)
-- [分布式控制面的基础取舍](systems/distributed_foundations.md)
 - [Agent 容量规划与跨层诊断](systems/performance_diagnostics.md)
 
-# 第二部分：AI 与学习基础
+# 第二部分：AI 与机器学习基础
 
 - [AI、机器学习、深度学习与 LLM](foundations/ai_ml_llm.md)
 - [最小数学直觉：向量、概率、梯度与损失](foundations/math_and_learning.md)
@@ -42,7 +39,7 @@
 - [Agent 评测、轨迹归因与 RL 闭环](agent/evaluation_and_rl.md)
 - [检索、RAG、排序与失败归因](agent/retrieval.md)
 
-# 第五部分：DSec 类沙箱运行时
+# 第五部分：Agent 沙箱运行时
 
 - [Agent 沙箱威胁模型](runtime/sandbox_threat_model.md)
 - [容器、用户态内核与 microVM](runtime/containers_and_vms.md)
@@ -61,10 +58,8 @@
 
 # 第七部分：面试实战
 
-- [个性化简历追问与 STAR 故事](interview/resume_drill.md)
-- [DSec/Coding Agent 沙箱系统设计](interview/system_design.md)
-- [高频问题库：120 题与 P0/P1/P2 追问路线](interview/question_bank.md)
-- [28 天零基础、14 天/7 天与最后 24 小时冲刺计划](interview/study_plan.md)
+- [Coding Agent 沙箱系统设计](interview/system_design.md)
+- [AI 与 Agent Infra 高频问题库](interview/question_bank.md)
 
 # 附录
 

@@ -1,258 +1,245 @@
-# 并发模型选择 (Async vs Thread vs Actor)
+# 并发基础：线程、锁、消息与 Actor
 
-在很多 Web 项目中，Rust 并发首先让人想到 `async/await`。但在高频交易 (HFT) 中，我们有不同的优先级：**确定性 (Determinism)** 和 **低延迟 (Low Latency)**。吞吐量 (Throughput) 也很重要，但它必须建立在不牺牲尾部延迟 (P99) 的基础上。
+程序经常要同时处理多件事：服务器要服务多个请求，训练平台要一边读取数据一边驱动计算设备，桌面程序要在执行后台任务时保持界面响应。**并发**就是组织这些同时进行的任务，以及规定它们怎样共享资源和交换结果。
 
-本章将深入操作系统的调度原理，剖析不同并发模型的底层开销，并解释为什么 HFT 系统往往选择看似原始的 "Thread per Core" 模型。
+设计并发程序要先回答三个问题：
 
-> **面试主线**：必须先按任务性质选择模型——等待型 I/O、固定低延迟流水线、单写者状态和 CPU 密集计算并不是同一个问题。`async`、线程和 Actor 的概念与权衡是 P0；具体 `isolcpus`/cgroup 参数、NUMA 工具 API 和实时调度配置属于 P2，知道为什么需要并能验证即可。
+1. 找出可以独立进行的工作；
+2. 识别会被多个执行单元访问的状态；
+3. 为速度不一致和失败设计等待、拒绝或恢复策略。
 
-## 1. 理论背景：操作系统调度的代价
+这些问题分别对应任务拆分、共享状态同步和任务间通信。线程、锁、原子操作、消息传递和 Actor 提供不同的表达方式；它们都建立在“谁拥有状态、谁可以同时访问、完成或失败怎样通知”这组规则上。
 
-要理解并发模型的选择，首先必须理解操作系统内核在做什么。
+## 1. 并发不等于并行
 
-### 1.1 上下文切换 (Context Switch) 的解剖
-上下文切换没有一个放之四海而皆准的“固定微秒数”。同进程线程切换、跨进程切换、是否命中缓存、是否启用 PCID、机器是否过载，结果都不同。HFT 更在意的往往不是保存寄存器本身，而是**线程排队多久才重新获得 CPU，以及回来后工作集是否还在缓存中**。
+**并发**（concurrency）表示多个任务在同一段时间内都有进展。**并行**（parallelism）表示多个任务在同一个时刻真正运行。
 
-一次切换可能涉及：
+单核 CPU 可以通过在任务之间切换实现并发，但同一时刻通常只执行一个任务。多核 CPU 才能让多个计算在硬件上并行。
 
-1. **进入内核并保存执行现场**：保存必要寄存器与线程状态；
-2. **调度决策**：调度器从可运行任务中选择下一个；具体数据结构会随内核版本变化，不应把某个实现细节当成永久事实；
-3. **地址空间处理**：跨进程时可能切换页表。现代 CPU 的 PCID 等机制可保留部分 TLB 项；**TLB shootdown 是页表映射变更时通知其他核心失效，并非每次上下文切换都发生**；
-4. **微架构状态受扰**：新任务会竞争前端、执行单元、分支预测器和缓存，原任务恢复时可能遭遇更多 miss。
-
-> **工程原则**：尽量减少关键线程的非自愿切换，并用 `perf sched`、调度 trace 和延迟直方图验证。Core pinning 降低迁移概率，但它本身不等于“操作系统再也不会打断”。
-
-### 1.2 忙轮询 (Busy Polling) vs 系统通知 (Epoll/Kqueue)
-
-| 策略 | 优点 | 代价 | 适合场景 |
-| :--- | :--- | :--- | :--- |
-| `epoll`/park 等通知 | 空闲时让出 CPU，连接数扩展性好 | 唤醒和重新调度增加尾延迟 | 网关、控制面、低消息率连接 |
-| 忙轮询 | 数据一旦可见即可继续处理，避免 park/wakeup | 占满核心、功耗与热量高，还可能挤压同机任务 | 有独占核心、等待很短的关键数据面 |
-| 自适应等待 | 先短暂自旋，超时后 park | 参数需要按负载调优 | 消息率会明显变化的系统 |
-
-唤醒或轮询的实际延迟取决于内核、网卡路径、CPU 电源状态与负载，不能写死为某个纳秒/微秒数字。忙轮询也只消除了“睡眠再唤醒”这一段，并没有消除网络栈、缓存 miss 或排队。
-
-## 2. 核心实现：HFT 的并发架构
-
-### 2.1 为什么核心路径常不用 Async/Await?
-Rust 的 `async/await` 基于状态机 (State Machine) 和协作式调度 (Cooperative Scheduling)。虽然它比 OS 线程轻量，但在 HFT 中仍有隐患：
-
-1. **调度可控性较弱**：多线程 runtime 可以在两次 `poll` 之间迁移任务；单次 `poll` 不会被 Tokio 从任意指令处强行抢占，但长时间不 `.await` 会阻塞同一 worker 的其他任务；
-2. **状态机大小需关注**：跨越 `.await` 的局部变量会进入 Future。大缓冲区或层层组合会增大 task 工作集；
-3. **生态层开销**：语言并不强制每个 Future 分配，但 `spawn` 的 task、装箱、共享所有权和调度队列可能引入分配、原子操作与队列流量；
-4. **公平性与尾延迟**：通用 runtime 要服务许多任务，其公平性目标不一定等于某条订单路径的截止时间目标。
-
-**结论**：Async 常适合网关、控制面和大量并发 I/O；thread-per-core 常适合有专用核心、状态单写者且尾延迟优先的数据面。这是延迟预算下的工程选择，不是“Async 天生慢”。单线程 runtime 能避免 task 跨 worker 迁移，却仍有协作式调度和任务互相拖延的问题。
-
-### 2.2 线程绑定 (Core Pinning / Affinity)
-
-一种常见模型是 **Thread per Core**：把每个关键线程限制在指定 CPU 上，使其状态长期由同一个核心处理。注意 affinity 只是限制“允许在哪些 CPU 运行”，不会自动独占核心；SMT sibling、IRQ、内核线程和定时器仍可能造成干扰。
-
-#### 实现代码 (使用 `core_affinity` 库)
-
-下面是 thread-per-core 的 **架构骨架**：它依赖第三方 `core_affinity` crate，并把 `receive_packet`、`process` 留给具体行情接入实现。由于还涉及核心数量和持续运行的忙轮询，mdBook 不执行该片段。
-
-<details>
-<summary><strong>P2 动手资料：用第三方库绑定当前线程</strong></summary>
-
-```rust,ignore
-use std::thread;
-use core_affinity;
-
-fn main() {
-    let core_ids = core_affinity::get_core_ids().unwrap();
-
-    // 假设核心 2 用于接收行情
-    let market_data_core = core_ids[2];
-    
-    let handle = thread::spawn(move || {
-        // 1. 绑定当前线程到指定核心
-        if !core_affinity::set_for_current(market_data_core) {
-            eprintln!("Failed to pin thread to core!");
-        }
-        
-        // 2. 若业务确实需要，再单独评估实时调度策略。
-        // SCHED_FIFO 需要相应权限，并可能饿死系统线程，不能只凭“更快”就开启。
-        
-        // 3. 忙轮询循环
-        loop {
-            if let Some(packet) = receive_packet() {
-                process(packet);
-            } else {
-                // 给处理器“正在自旋”的提示；它不是内存屏障，也不会让出线程。
-                std::hint::spin_loop();
-            }
-        }
-    });
-
-    handle.join().unwrap();
-}
+```mermaid
+flowchart TB
+    subgraph C["并发：一个核心交替推进"]
+        C1["任务 A"] --> C2["任务 B"] --> C3["任务 A"] --> C4["任务 B"]
+    end
+    subgraph P["并行：两个核心同时执行"]
+        P1["核心 1：任务 A"]
+        P2["核心 2：任务 B"]
+    end
 ```
 
-</details>
+这个区别很重要，因为并发可以提高等待型任务的资源利用率，却不会自动加速计算。一个程序若主要进行 CPU 计算，通常需要多核心并行；若主要等待网络或磁盘，并发可以让线程在等待期间处理别的任务。
 
-### 2.3 隔离核心 (Isolcpus)
+## 2. 为什么需要线程
 
-仅仅在代码里绑定是不够的：亲和性限制业务线程可以在哪些 CPU 上运行，却不会自动赶走中断、内核线程和其他任务。面试主线先讲清这一区别；具体部署开关按岗位选读。
+**线程**是操作系统调度 CPU 时间的基本执行单元。一个进程可以包含多个线程，它们共享进程的大部分地址空间，但各自有指令执行位置、寄存器现场和栈。
 
-<details>
-<summary><strong>P2 部署资料：Linux CPU 隔离要一起检查什么</strong></summary>
-
-操作系统仍然可能在这个核心上调度一些杂务（如 SSH 守护进程、cron 任务、RCU 回调）。
-
-`isolcpus=2-5` 只能解决隔离问题的一部分，不能让内核“完全忽略”这些 CPU。完整方案通常还要规划：
-
-- 用 cgroup v2 的 isolated cpuset 或相应 scheduler-domain 隔离放置任务；
-- 用 `nohz_full` 尽可能停止调度 tick，并把 RCU 回调交给 housekeeping CPU；
-- 设置 IRQ/managed IRQ affinity，避免中断落在关键核心；
-- 检查 watchdog、workqueue、内核线程与 SMT sibling；
-- 至少保留 housekeeping CPU 处理系统杂务。
-
-这些选项依赖内核版本与部署环境，不能复制一串启动参数就宣称完成。应以 [Linux CPU Isolation 官方文档](https://docs.kernel.org/admin-guide/cpu-isolation.html) 为准，并用 trace 验证关键 CPU 上实际发生了什么。
-
-</details>
-
-### 2.4 NUMA 架构感知 (NUMA Awareness)
-
-现代高性能服务器通常是双路（Dual Socket）甚至四路的。这就引入了 **NUMA (Non-Uniform Memory Access)** 问题。
-
-- **Local Access**：访问当前 NUMA 节点连接的内存，通常更快；
-- **Remote Access**：经 socket 间互连访问另一个节点，通常延迟更高且会消耗互连带宽。
-
-具体差异取决于 CPU 拓扑、内存频率和负载，不应背固定数字。目标是让关键线程、热内存与 NIC 的 PCIe locality 尽量处在同一 NUMA 节点。
-
-在 Rust 中，这通常意味着：
-1. **线程绑定**：确保线程固定在某个 NUMA 节点的核心上；
-2. **内存放置**：Linux 常按 first-touch 放置物理页；关键是哪个 CPU 第一次触碰并造成缺页，单纯在哪个线程调用 `malloc` 并不总能决定物理页位置；
-3. **预触页与验证**：在线程绑定后初始化大块内存，并通过 NUMA 工具/计数器确认 local 与 remote 访问；必要时使用显式 NUMA policy。
-
-下面是用于表达“先查拓扑、再决定放置”的 **伪代码骨架**。它依赖具体版本的 `hwloc` 绑定，类型名和返回值还会随 crate API 变化，不能作为独立 Rust 程序执行。
-
-<details>
-<summary><strong>P2 选读：NUMA 拓扑库的伪代码形状</strong></summary>
-
-```rust,ignore
-// 伪代码骨架：检查 NUMA 拓扑
-let topology = hwloc::Topology::new();
-let core = topology.objects_with_type(ObjectType::Core)[0];
-// 确保网卡、CPU 核心、内存都在同一个 NUMA 节点！
-```
-
-</details>
-
-### 2.5 Actor 不是第四种线程，而是一种所有权模型
-
-Actor 的核心是：每份可变状态只由一个 actor 拥有，其他组件通过消息请求它做事。它与执行方式是两个维度：
-
-- actor 可以运行在 Tokio task 上，得到 async actor；
-- actor 也可以固定在独占线程上，得到 thread-per-core actor；
-- 一个核心还可按 symbol/account 分片持有多个逻辑 actor，但要避免不可控 mailbox 排队。
-
-HFT 常用的“行情线程 → 策略线程 → 下单线程”其实已经具有 actor 风格：单写者状态、SPSC 消息传递、明确交接所有权。Actor 的好处是减少共享锁；代价是消息排队、序列化/拷贝、邮箱满时的背压策略，以及跨 actor 事务更难表达。
-
-| 问题特征 | 更自然的起点 |
-| :--- | :--- |
-| 海量连接、等待 I/O 为主 | Async runtime |
-| 固定流水线、专用核心、极低尾延迟 | Thread-per-core + SPSC |
-| 状态需要单写者隔离、命令式交互 | Actor 所有权模型（再选择 async 或线程承载） |
-| 大块 CPU 计算、可拆分任务 | 有界 worker pool / 数据并行 |
-
-## 3. 性能分析：跨核通信 (Cross-Core Communication)
-
-即便每个线程独占核心，它们之间仍需通信（如行情线程 -> 策略线程 -> 下单线程）。跨核通信的延迟由 CPU 的互连架构（如 Intel Mesh 或 AMD Infinity Fabric）决定。
-
-### 3.1 缓存一致性协议 (MESI) 的影响
-当核心 A 写入一条缓存行、核心 B 随后读取它时，一致性协议必须转移或共享该缓存行的有效副本。具体路径可能经过目录、共享缓存或 cache-to-cache transfer，取决于微架构，不能把某个 MESI 教科书步骤当作所有 CPU 的实际数据通路。
-
-端到端消息延迟还包含生产者发布、消费者多久轮询到、屏障、队列代码和缓存命中情况。因此不存在一个统一的“40–100ns 物理极限”；应在目标 CPU、目标核距和目标负载上测量。更重要的设计原则是**每条缓存行尽量只有一个高频写者**。
-
-### 3.2 内存屏障 (Memory Barriers)
-为了给跨线程发布建立可证明的 happens-before，需要原子操作与合适的 `Ordering`。Ordering 同时约束编译器和目标硬件，并不总是一条单独的“屏障指令”。
-
-- `Relaxed`: 只保证当前原子操作的原子性，不发布旁边的数据。
-- `Release` / `Acquire`: 典型的生产者-消费者同步。
-- `SeqCst`: 在 Acq/Rel 基础上，为所有 SeqCst 操作增加全局一致顺序；具体额外成本取决于操作和架构。
+线程共享内存，所以交换数据很方便；也正因为共享，错误的并发访问可能破坏数据。
 
 ```rust
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-fn main() {
-    // 用两个原子变量模拟一个槽位和“槽位已发布”的 head 游标。
-    let slot = Arc::new(AtomicU64::new(0));
-    let head = Arc::new(AtomicU64::new(0));
+fn parallel_sum(values: Vec<u64>) -> u64 {
+    let middle = values.len() / 2;
+    let right = values[middle..].to_vec();
+    let left = values[..middle].to_vec();
 
-    let producer_slot = Arc::clone(&slot);
-    let producer_head = Arc::clone(&head);
-    let producer = thread::spawn(move || {
-        producer_slot.store(42, Ordering::Relaxed); // 先写 payload
-        producer_head.store(1, Ordering::Release);  // 再发布游标
-    });
+    let left_worker = thread::spawn(move || left.iter().sum::<u64>());
+    let right_worker = thread::spawn(move || right.iter().sum::<u64>());
 
-    let consumer_slot = Arc::clone(&slot);
-    let consumer_head = Arc::clone(&head);
-    let consumer = thread::spawn(move || {
-        while consumer_head.load(Ordering::Acquire) == 0 {
-            std::hint::spin_loop();
-        }
-        // Acquire 读到了 Release 发布的 1，因此能看到此前写入的 payload。
-        consumer_slot.load(Ordering::Relaxed)
-    });
-
-    producer.join().unwrap();
-    assert_eq!(consumer.join().unwrap(), 42);
+    left_worker.join().expect("left worker panicked")
+        + right_worker.join().expect("right worker panicked")
 }
 ```
 
-只有当 Acquire load 实际读到相应 Release 发布的值时，两边才“接上”。x86 上原子 load/store 的 Acquire/Release 常与 Relaxed 生成相同指令，但源码语义仍不可省；原子 RMW、SeqCst store、ARM 以及争用场景的代价又不同。完整推导见 [原子操作与内存顺序](../infrastructure/atomics.md)。
+`spawn` 创建线程，闭包中的 `move` 把数据所有权交给新线程，`join` 等待线程结束并取得结果。这个例子为了讲清所有权而复制了两个切片，真实程序会根据数据规模选择作用域线程、共享只读数据或并行库。
 
-## 4. 常见陷阱 (Pitfalls)
+创建线程和在线程之间切换都需要成本，因此“每个很小任务创建一个线程”通常不合适。常见做法是建立固定数量的工作线程，让任务进入队列，这叫作**线程池**。
 
-1.  **超线程 (Hyper-Threading)**:
-    Intel 的超线程技术让一个物理核心模拟两个逻辑核心。它们共享 L1/L2 Cache 和执行单元。
-    关键线程通常不与繁忙任务共用 SMT sibling；是否全局关闭 SMT 要依据容量需求、安全策略和实测结果，而不是绝对口号。
+## 3. 共享状态为什么需要同步
 
-2.  **中断风暴 (IRQ Storm)**:
-    网卡中断如果打在你的关键核心上，会强制打断你的线程。
-    **解决**: 配置 `/proc/irq/N/smp_affinity`，将网卡中断绑定到专门的 IO 核心，或者使用 DPDK 的轮询模式驱动 (PMD) 完全接管网卡，屏蔽中断。
+如果多个线程同时访问同一数据，而且至少一个线程会写入，就必须规定访问顺序。否则可能发生**数据竞争**（data race）：并发读写没有正确同步，程序结果不再可靠。
 
-3.  **False Sharing (伪共享)**:
-    并发队列的头尾指针若位于同一缓存行，两个写者会让整行来回迁移。用带对齐的包装类型隔离热字段，并在目标机器验证布局；`align(128)` 不是所有硬件上的魔法常量。
+下面的“读取、加一、写回”不是不可分割的一步：
 
-4. **实时优先级失控**：
-    `SCHED_FIFO` 线程若不阻塞且没有预算，可能饿死监控、网络或系统维护线程。实时策略需要明确优先级层次、housekeeping CPU、watchdog 与故障降级。
+```text
+线程 A 读取 count = 10
+线程 B 读取 count = 10
+线程 A 写入 count = 11
+线程 B 写入 count = 11
+```
 
-## 5. 面试快问快答
+两个线程都执行了一次加一，结果却只增加了一次。解决问题的关键，是让这段操作形成受保护的**临界区**：同一时刻只允许符合规则的线程进入。
 
-### Q1：线程绑定后，为什么还会出现延迟尖刺？
+### 3.1 互斥锁
 
-Affinity 不会驱逐 SMT sibling，也不会自动迁走 IRQ、RCU、内核线程和定时器；此外还有 page fault、缓存/TLB miss、NUMA 远端访问和电源状态变化。要用 trace 找出尖刺时 CPU 实际执行了什么。
+**互斥锁**（mutex）保证同一时刻只有一个线程持有锁。线程修改共享数据前先加锁，修改完成后释放锁。
 
-### Q2：Actor、线程和 Async 的关系是什么？
+```rust
+use std::sync::{Arc, Mutex};
+use std::thread;
 
-Actor 描述状态所有权与消息交互；线程/Async 描述 actor 如何被执行。一个 actor 可以独占线程，也可以是 runtime 上的 task。面试中应先讲所有权拓扑，再讲调度载体。
+fn count_with_two_threads() -> u64 {
+    let count = Arc::new(Mutex::new(0_u64));
+    let mut workers = Vec::new();
 
-### Q3：忙轮询一定比 `epoll` 快吗？
+    for _ in 0..2 {
+        let count = Arc::clone(&count);
+        workers.push(thread::spawn(move || {
+            for _ in 0..1_000 {
+                *count.lock().expect("mutex poisoned") += 1;
+            }
+        }));
+    }
 
-在有独占核心且事件即将到来时，它通常省去 park/wakeup；长期空闲、CPU 降频、同机争用或完整 I/O 路径不同，都可能改变结果。更完整的答案还要包含 CPU 预算和自适应退避。
+    for worker in workers {
+        worker.join().expect("worker panicked");
+    }
 
-### Q4：为什么 thread-per-core 常与 SPSC 一起出现？
+    let result = *count.lock().expect("mutex poisoned");
+    result
+}
+```
 
-每个阶段单写自己的状态，相邻阶段用一对一队列交接消息，可以避免共享锁和多生产者 CAS 热点，也让缓存行的写者关系更清晰。
+`Arc` 提供跨线程共享所有权，`Mutex` 保护内部可变数据。锁解决正确性问题，但也带来等待：一个线程持锁时，其他需要同一把锁的线程只能等待。
 
-## 6. 本章小结
+好的临界区通常满足两个条件：
 
-- 优化目标应是尾延迟分布和可控调度，而不是“线程数量越少越好”；
-- affinity、CPU isolation、IRQ、SMT、NUMA 和内存预触页需要作为一个整体设计；
-- Actor 是所有权模型，可由 thread-per-core 或 async runtime 承载；
-- 所有硬件纳秒数都应在目标拓扑实测，避免把经验值包装成定律。
+- 范围清晰，只保护确实需要共同保持一致的数据；
+- 持锁期间不执行不确定时长的网络请求、磁盘操作或用户回调。
 
-## 7. 延伸阅读
+### 3.2 原子操作
 
-- [The Linux Scheduler: a Decade of Wasted Cores](https://www.ece.ubc.ca/~sasha/papers/eurosys16-final29.pdf) - 深入了解调度器的问题。
-- [Intel 64 and IA-32 Architectures Optimization Reference Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html) - 权威的硬件优化指南。
-- [rigtorp/MPMCQueue](https://github.com/rigtorp/MPMCQueue) - C++ 实现的极致性能队列，Rust 实现可参考其原理。
+**原子操作**保证一个简单操作不会被其他线程观察为“只完成了一半”。计数器、状态位和指针更新常用原子类型实现。
 
----
-延伸阅读：进入基础设施部分，继续学习 HFT 系统的事件通道 —— [无锁数据结构与 Ring Buffer](../infrastructure/ring_buffer.md)。
+原子操作不是“小型锁”的无脑替代品。单个原子变量很容易理解，但多个字段之间的一致关系仍需要协议。原子的**内存顺序**还规定一个线程在什么条件下能看到另一个线程此前写入的普通数据。完整推导见[原子操作与内存顺序](../infrastructure/atomics.md)。
+
+初学时先记住：锁把一组操作组织成临界区；原子操作适合有明确并发协议的单值状态。先保证正确，再讨论减少锁竞争。
+
+## 4. 消息传递：共享结果，而不是共享每一步修改
+
+另一种组织方式是让任务通过**消息**交换数据。发送者把值放入通道，接收者从通道取出并处理。这样可以把某份可变状态集中在一个拥有者手中，其他任务通过请求影响它。
+
+```rust
+use std::sync::mpsc;
+use std::thread;
+
+fn sum_worker(values: Vec<u64>) -> u64 {
+    let (sender, receiver) = mpsc::channel();
+
+    thread::spawn(move || {
+        let sum = values.iter().sum::<u64>();
+        sender.send(sum).expect("receiver disappeared");
+    });
+
+    receiver.recv().expect("worker disappeared")
+}
+```
+
+通道不能自动消除所有并发问题。设计消息系统还要回答：
+
+- 队列是否有容量上限？
+- 队列满时，发送者等待、丢弃还是返回错误？
+- 接收者失败后，未处理消息怎么办？
+- 消息是否需要保持顺序？
+
+### 4.1 背压
+
+如果生产者持续比消费者快，队列会不断增长，最终耗尽内存或让消息等待很久。系统把“下游处理不过来”反馈给上游的机制叫作**背压**（backpressure）。
+
+有界队列是常见基础：容量满后，发送端必须等待、降级或拒绝新工作。无界队列看起来不会阻塞发送者，却只是把压力转换成内存占用和更长的排队时间。
+
+```mermaid
+flowchart LR
+    A["生产者"] --> B["有界队列"] --> C["消费者"]
+    B -->|"队列已满"| D["等待 / 拒绝 / 降级"]
+    D --> A
+```
+
+## 5. Actor：用消息保护状态所有权
+
+**Actor** 是一种并发模型。每个 Actor 拥有自己的状态，只通过接收消息处理外部请求。其他组件不能直接修改它的内部状态。
+
+例如，账户 Actor 可以独占账户余额：
+
+```text
+调用者 --Debit(100)--> 账户 Actor --结果--> 调用者
+调用者 --GetBalance--> 账户 Actor --余额--> 调用者
+```
+
+因为余额只有一个写入者，许多共享锁问题会自然消失。但 Actor 仍然有代价：
+
+- 消息需要排队，邮箱必须有容量策略；
+- 跨多个 Actor 的一致更新更难表达；
+- 一个 Actor 处理很慢时，它后面的消息都会等待；
+- Actor 失败后，状态和未处理消息需要恢复策略。
+
+Actor 描述的是**状态所有权和通信方式**，不是某一种线程实现。一个 Actor 可以独占系统线程，也可以作为异步运行时中的任务。不要把 Actor、线程和 async 当作同一层级的三个互斥选项。
+
+## 6. 死锁：每个人都在等别人
+
+**死锁**指一组任务互相等待，导致谁都无法继续。经典情况是两个线程以不同顺序获取两把锁：
+
+```mermaid
+sequenceDiagram
+    participant A as 线程 A
+    participant X as 锁 X
+    participant Y as 锁 Y
+    participant B as 线程 B
+    A->>X: 已持有
+    B->>Y: 已持有
+    A->>Y: 等待
+    B->>X: 等待
+    Note over A,B: 两边都不会主动释放当前锁
+```
+
+常见预防方法包括：
+
+- 所有代码按照同一顺序获取多把锁；
+- 缩小临界区，避免持锁等待外部事件；
+- 把相关状态放入同一把锁或同一个 Actor；
+- 在业务允许时使用超时和失败返回，但不要把超时当作正确性证明。
+
+除了死锁，还要区分**饥饿**：任务理论上能继续，却长期得不到锁或调度机会；以及**活锁**：任务一直在响应对方、不断重试，却没有完成有效工作。
+
+## 7. 怎样选择并发模型
+
+先判断任务在等待什么，再选择工具：
+
+| 问题特征 | 常见起点 | 原因 |
+| :--- | :--- | :--- |
+| 少量长期运行、CPU 密集的任务 | 固定线程或有界线程池 | 能利用多核，并控制同时计算的数量 |
+| 大量任务主要等待网络 I/O | 异步运行时 | 等待期间线程可以推进其他任务 |
+| 共享状态需要一次完成多字段更新 | Mutex 或单拥有者 | 容易表达一致的临界区 |
+| 状态适合由一个组件独占 | Actor 或消息循环 | 用消息明确所有权边界 |
+| 流水线阶段速度不同 | 有界通道 | 通过背压限制排队规模 |
+
+这些模型可以组合。Web 服务可能用异步任务处理连接，再把 CPU 密集的图片处理交给线程池；AI 服务可能用 Actor 管理模型实例，再用异步 I/O 接收请求；数据处理流水线可能用线程和有界通道连接不同阶段。
+
+## 8. 三类系统怎样使用并发机制
+
+- **传统互联网服务**重点关注请求并发、连接等待、线程池上限、数据库连接池和背压；
+- **AI Infra** 重点关注批处理队列、模型实例所有权、CPU 与加速器任务重叠，以及过载时如何拒绝请求；
+- **HFT** 会进一步使用单写者状态、固定线程和一对一队列减少共享写入。只有明确需要专用 CPU 时，才继续研究线程亲和性、中断放置和 NUMA 拓扑。
+
+线程绑核、操作系统隔离参数和忙轮询属于岗位专项配置。它们不能替代本章的正确性模型，也不应该穿插在锁、消息和 Actor 的基础定义中。
+
+## 9. 本章小结
+
+- 并发表示多个任务都有进展，并行表示多个任务在同一时刻执行；
+- 线程共享进程内存，通信直接，但共享写入需要同步；
+- Mutex 保护一组临界区操作，原子操作适合明确协议下的简单状态；
+- 消息传递能集中可变状态的所有权，但队列仍需要容量、失败和顺序策略；
+- Actor 是状态所有权模型，可以运行在线程或异步任务之上；
+- 背压限制生产速度，死锁则来自无法解除的循环等待。
+
+## 10. 思考题与面试追问
+
+1. 并发与并行有什么区别？单核 CPU 能实现哪一个？
+2. 为什么 `count += 1` 在多线程中不能被默认看作一个不可分割的操作？
+3. Mutex 和原子操作分别适合解决什么问题？
+4. 无界消息队列为什么不能真正解决消费者过慢的问题？
+5. Actor 与线程是什么关系？一个 Actor 能否运行在 async task 中？
+6. 两把锁怎样形成死锁？统一加锁顺序为什么能避免这一类死锁？
+7. 一个 CPU 密集任务和一个网络等待任务，为什么通常不应使用完全相同的调度方式？
+
+下一章：[Async Rust 原理与 Tokio](async_rust.md)

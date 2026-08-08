@@ -3,7 +3,7 @@ authors = ["AI 学习团队"]
 language = "zh-CN"
 src = "src"
 title = "AI 与 Agent Infra 面试宝典"
-description = "从 AI/LLM 地基，到 Agent Harness、沙箱平台、可靠性与 DeepSeek 岗位实战的中文面试宝典"
+description = "从 AI 与 LLM 基础，到 Agent Harness、沙箱运行时、可靠性与系统设计的中文面试宝典"
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"

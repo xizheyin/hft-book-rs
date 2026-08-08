@@ -1,7 +1,5 @@
 # DPDK 集成：把 NIC 数据面交给用户态
 
-> **面试优先级：P2 / 岗位专项。** 通用 HFT 面试先会讲“为什么轮询、批处理和用户态缓冲可能降抖动”即可；只有岗位或简历明确涉及 DPDK，才需要掌握 EAL、mbuf 所有权和设备部署细节。
-
 DPDK（Data Plane Development Kit）提供 Poll Mode Driver、mbuf/mempool、ring 与设备抽象，让应用批量管理 NIC Rx/Tx queue。它可能降低每包开销和调度抖动，但并非所有 Rust HFT 系统都需要，也不存在脱离硬件与负载的固定延迟/吞吐保证。
 
 选择 DPDK 意味着同时接管更多责任：设备绑定、DMA 内存、协议处理、CPU、观测、升级和故障恢复。

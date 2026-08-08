@@ -24,6 +24,16 @@ DRAFT_MARKER = re.compile(
     re.IGNORECASE,
 )
 FENCE_LINE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
+META_HEADING = re.compile(
+    r"(?:^#{1,6}\s+.*(?:学习目标|学习约定|内容边界|知识边界|"
+    r"学习路线|阅读路线|备考计划|冲刺计划|面试优先级|P0/P1/P2).*$)"
+    r"|(?:学完本章|完成本章后|>\s*(?:\*\*)?本章目标)",
+    re.MULTILINE | re.IGNORECASE,
+)
+PRIORITY_HEADING = re.compile(
+    r"^#{1,6}\s+.*(?:\bP0\b|\bP1\b|\bP2\b).*$",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 @dataclass
@@ -181,6 +191,10 @@ def check_book(book_root: Path) -> BookResult:
             result.errors.append(f"章节首个非空行应为一级标题: {display_path(chapter)}")
         if DRAFT_MARKER.search(visible_text):
             result.warnings.append(f"发现草稿标记，请人工确认: {display_path(chapter)}")
+        if META_HEADING.search(visible_text) or PRIORITY_HEADING.search(visible_text):
+            result.errors.append(
+                f"章节包含学习计划、内容边界或优先级式元话术: {display_path(chapter)}"
+            )
         if unclosed:
             result.errors.append(
                 f"存在未闭合的 {unclosed} 代码围栏: {display_path(chapter)}"
@@ -202,7 +216,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "检查 mdBook 的 SUMMARY、孤立章节、内部 Markdown 链接、H1、"
-            "代码围栏和草稿标记。默认检查 books/rust-hft 与 books/ai。"
+            "代码围栏、草稿标记和元话术。默认检查 books/rust-hft 与 books/ai。"
         )
     )
     parser.add_argument(

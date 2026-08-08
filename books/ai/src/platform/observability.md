@@ -1,10 +1,8 @@
 # Agent 可观测性：从“答案错了”追到具体一步
 
-> 难度：必会。官方 JD 明确要求可观测平台、日志系统，以及跨多个层级定位复杂系统问题。
-
 可观测性像飞机黑匣子：不是把所有声音无限录下来，而是让调查者能还原“哪一步发生了什么、当时系统处于什么版本、为何采取这个动作”。Agent 最终答案只是最后一帧。
 
-先认四个词：**span** 是 trace 中一段有起止时间的工作，多个父子 span 串成一次请求；**SLI** 是实际测量的服务指标；**label** 是指标的分类维度，取值几乎无限就叫高基数；**sampling（采样）**是在成本有限时只保留部分 trace。P0 是第 1～5、8～10 节，目标是能从一次失败沿 run 追到模型、工具、沙箱和主机；采样器与 OpenTelemetry 字段语义属于 P1 查阅，不需要把标准属性名背下来。
+先认五个词：**span** 是 trace 中一段有起止时间的工作，多个父子 span 串成一次请求；**SLI（Service Level Indicator，服务水平指标）**是实际测量的服务指标；**p99（第 99 百分位数）**表示约 99% 的样本不超过该值，常用来观察少数慢请求；**label** 是指标的分类维度，取值几乎无限就叫高基数；**sampling（采样）**是在成本有限时只保留部分 trace。
 
 ## 1. 四类信号各做什么
 
@@ -49,7 +47,7 @@ span 至少记录开始/结束、父子关系、状态、组件版本和资源�
 
 ### 模型与推理层
 
-- TTFT（首 Token 延迟）、TPOT（后续每 Token 时间）、吞吐、KV Cache 命中。
+- TTFT（Time to First Token，首 Token 时间）、TPOT（Time per Output Token，后续每个输出 Token 的平均时间）、吞吐、KV Cache（键值缓存）命中。
 - 输入/输出 Token、排队、prefill/decode 时间、模型错误码。
 
 ### 平台层
@@ -72,7 +70,7 @@ span 至少记录开始/结束、父子关系、状态、组件版本和资源�
 动态错误文本也不应作为 label。先映射稳定 error code，再把详细信息放日志，并限制大小。
 
 <details>
-<summary><strong>P1 查阅：采样策略与 OpenTelemetry 字段边界</strong></summary>
+<summary><strong>深入：采样策略与 OpenTelemetry 字段边界</strong></summary>
 
 ## 6. 采样不能只留成功快请求
 
@@ -96,7 +94,7 @@ OpenTelemetry 提供 trace、metric、log 的通用模型，并已维护生成�
 
 修复包括：默认元数据优先；内容字段显式 opt-in；源端脱敏；秘密模式与大小限制；独立权限和密钥；短保留期；访问审计；事故后能按 trace 和数据主体删除。
 
-## 9. DeepSeek Agent Infra 面试怎么问
+## 9. 章末面试问题
 
 **题目：Agent 成功率下降 5%，你如何定位？**
 

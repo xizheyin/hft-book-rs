@@ -1,12 +1,10 @@
 # FPGA 交互 (Rust Bindings)
 
-> **面试优先级：P2 / 硬件岗位专项。** 通用软件面试理解 FPGA 为什么可能降低抖动、MMIO 与 DMA 的区别、completion 的边界即可；寄存器、BAR 和用户态驱动代码不要求首轮背诵。
-
 通用 CPU 即使经过优化，也会受到 PCIe、调度和缓存未命中的影响。对延迟价值足够高、逻辑足够稳定的路径，团队可能评估 FPGA；这不是软件达到某个固定微秒数后的自动“下一步”。
 
-现场可编程门阵列 (FPGA) 可以把协议解析、预交易风控和部分执行逻辑实现为确定的数据通路。延迟可能达到亚微秒级，但数字取决于测量边界：wire-to-wire、MAC-to-MAC、PCIe 往返和完整 tick-to-trade 不能混着比较。
+现场可编程门阵列（Field-Programmable Gate Array，FPGA）可以把协议解析、预交易风控和部分执行逻辑实现为确定的数据通路。延迟可能达到亚微秒级，但数字取决于测量边界：线缆到线缆、媒体访问控制层到媒体访问控制层（Media Access Control，MAC）、PCIe 往返和完整行情到发单不能混着比较。
 
-本章不讨论 Verilog/VHDL 编写，而是聚焦于 **Rust 如何高效地与 FPGA 交互**。
+FPGA 内部逻辑通常由硬件描述语言实现；本章从主机软件视角解释 Rust 进程怎样配置设备、提交直接内存访问任务并接收完成通知。
 
 ## 理论架构：混合系统 (Hybrid Architecture)
 
@@ -23,13 +21,13 @@
     - 异常处理。
     - 配置更新。
 
-Rust 与 FPGA 的通信通常通过 **PCIe** 总线，涉及两种主要机制：
+Rust 与 FPGA 的通信通常通过 **PCIe（PCI Express）** 总线，涉及两种主要机制：
 - **MMIO (Memory Mapped I/O)**: 用于控制寄存器（配置、状态读取）。
 - **DMA (Direct Memory Access)**: 用于大批量数据传输（行情流、订单流）。
 
 ## 核心实现：用户态驱动 (Userspace Driver)
 
-为了避免内核系统调用的开销，我们通常使用 UIO (Userspace I/O) 或 VFIO 技术，将 FPGA 的 PCIe BAR 空间直接映射到用户态进程的虚拟内存中。
+需要让用户态直接访问设备时，可以使用 UIO（Userspace I/O，用户态 I/O）或 VFIO（Virtual Function I/O）等 Linux 接口，将 FPGA 的 PCIe BAR（Base Address Register，基址寄存器）空间映射到进程虚拟地址。VFIO 通常还能配合输入输出内存管理单元（Input-Output Memory Management Unit，IOMMU）提供隔离；是否绕过普通内核驱动取决于安全、权限和运维要求，而不只是系统调用成本。
 
 ### 1. MMIO：像访问内存一样访问硬件
 
@@ -97,7 +95,7 @@ impl FpgaDevice {
 }
 ```
 
-`volatile` 只阻止编译器删除或合并这次访问，不自动提供跨线程同步、DMA 可见性或平台所需的 device-memory barrier。寄存器宽度、端序、读写副作用和 barrier 顺序必须来自 FPGA/驱动 ABI。
+`volatile` 只阻止编译器删除或合并这次访问，不自动提供跨线程同步、DMA 可见性或平台所需的设备内存屏障。寄存器宽度、端序、读写副作用和屏障顺序必须来自 FPGA/驱动 ABI（Application Binary Interface，应用二进制接口）。
 
 ### 2. 零拷贝 DMA 环形缓冲区
 
@@ -163,7 +161,7 @@ impl FpgaDevice {
 1.  **内存序 (Memory Ordering)**: Rust atomic fence 不一定等同于驱动 ABI 要求的 DMA/MMIO barrier；必须按平台与驱动文档实现 descriptor → barrier → doorbell 顺序。
 2.  **缓存一致性 (Cache Coherency)**: 一些服务器平台的 DMA coherent，另一些设备/映射模式需要显式 sync。不能把“通常”当契约。
 3.  **对齐与边界**: descriptor、DMA buffer、BAR 寄存器都有各自要求，不是统一的 64B 或 4KB。
-4.  **错误与超时**: completion 丢失、设备 reset、PCIe AER、ring wrap 和错误 descriptor 都需要状态机与降级路径。
+4.  **错误与超时**: completion 丢失、设备 reset、PCIe AER（Advanced Error Reporting，高级错误报告）、ring wrap 和错误 descriptor 都需要状态机与降级路径。
 5.  **风控一致性**: FPGA 与 CPU 两边的限制版本必须原子切换并可审计，不能出现一边已更新、一边仍用旧值。
 
 ## 现有生态
@@ -186,3 +184,8 @@ MMIO 让 CPU 读写设备寄存器，适合配置、状态和 doorbell；DMA 让
 Rust 能封装资源生命周期、边界、状态机和 FFI，减少 use-after-free 等错误；但 `unsafe` MMIO/DMA、硬件 coherency、IOMMU 配置和 RTL 协议仍需人工证明与硬件测试。
 
 FPGA 开发周期、验证和运维成本很高。是否采用应由完整 wire-to-action 延迟、策略价值、变更频率与失效风险共同决定，而不是只追求一个漂亮的纳秒数字。
+
+## 权威依据
+
+- [Linux 内核：VFIO—Virtual Function I/O](https://docs.kernel.org/driver-api/vfio.html)：说明用户态设备访问、IOMMU 隔离、设备区域映射、中断和 DMA 映射。
+- [Linux 内核：IOMMUFD](https://docs.kernel.org/userspace-api/iommufd.html)：说明用户态 I/O 地址空间（IOAS）、I/O 虚拟地址（IOVA）映射与设备绑定。

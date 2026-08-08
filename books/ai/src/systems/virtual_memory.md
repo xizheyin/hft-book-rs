@@ -4,7 +4,7 @@
 
 本章回答：**平台怎样限制一个沙箱的内存，又怎样估算一台机器能安全承载多少任务？**
 
-如果虚拟地址、物理页、缺页或 Copy-on-Write 还不熟悉，先读第一册的[虚拟内存](../../rust-hft/foundations/virtual_memory.html)。这里不重复页表结构，只讨论 Agent 平台需要做的资源决策。
+虚拟地址、物理页、缺页与 Copy-on-Write 的通用机制由第一册的[虚拟内存](../../rust-hft/foundations/virtual_memory.html)主讲。本章只讨论 Agent 平台在隔离、容量与恢复上的增量问题。
 
 ## 1. 先分清五个量
 

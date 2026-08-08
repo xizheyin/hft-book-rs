@@ -1,63 +1,85 @@
-# Async Rust 原理与 Tokio (Async Rust & Tokio)
+# Async Rust：Future、Executor 与 Waker
 
-在上一章中，我们对比了 Thread-per-Core 和 Async 模型。现代交易系统不会只用一种并发方式：有专用核心、状态单写者且追求极低尾延迟的数据面常从固定线程开始；大量连接、主要时间花在等待 I/O 的网关连接、控制面和归档服务，则常从异步运行时开始评估。关键不是给组件贴上“关键/非关键”标签，而是看它在等什么、由谁调度、延迟预算是多少。
+许多程序的大部分时间不是在计算，而是在等待：等待网络返回数据、等待定时器到期、等待数据库响应。若每个等待中的任务都长期占用一个系统线程，线程数量、内存和调度成本会随着并发量增长。
 
-本章将深入剖析 Rust 的异步原理及 Tokio 运行时，帮助你在系统中做出正确的架构决策。
+**异步编程**（asynchronous programming）提供另一种组织方式：任务遇到暂时无法完成的操作时，保存当前进度并让出执行线程；条件满足后，调度器再继续推进它。
 
-> **面试优先级**
->
-> - **P0 必会**：异步解决等待问题，不等于并行；Future 是可暂停和恢复的计算；executor 负责推进，I/O 驱动在就绪时唤醒。
-> - **P1 理解**：`.await` 两侧保存哪些状态、协作式调度为何会被阻塞任务拖慢、什么时候选固定线程或 Tokio。
-> - **P2 选读**：`Pin` 的自引用背景、嵌套 Future 布局、Tokio 工作窃取的具体队列路径。普通面试先讲清模型，不必背运行时内部函数名。
+Rust 用 `Future` 表示这类“现在可能不能完成、以后可以继续”的计算，用 `async/.await` 提供接近顺序代码的写法。它们要共同解决三个机制问题：Future 怎样保存并恢复进度，运行时怎样得知某个等待条件已经就绪，以及一个阻塞调用为什么会占住本可推进其他任务的执行线程。
 
-## 1. 异步原理：零成本抽象的真相
+## 1. 阻塞与异步有什么区别
 
-Rust 所说的“零成本抽象”更准确的含义是：`async/await` 会被编译成状态机，不要求语言自带 GC（Garbage Collector，运行时自动回收不可达对象的机制）或为每个任务维护可增长线程栈；你不用的抽象原则上不应付费。它**不等于零内存、零分配、零调度开销**。
+**阻塞调用**在结果出现前不会返回。线程执行阻塞网络读取时，如果当前没有数据，这个线程就不能继续处理后面的代码。
 
-Future 的大小通常在编译期确定，但它可能很大；Future 值放在栈、父 Future 内部还是堆上，取决于调用方式。`tokio::spawn` 还需要为可调度 task 保存头部、状态与 Future，通常会有运行时分配。
+```text
+线程 A：发送请求 ───── 等待响应 ───── 解析响应
+线程 B：                处理其他工作
+```
 
-先用一个最小流程建立画面：调用 `async fn` 得到 Future；executor 第一次 `poll` 它；遇到尚未就绪的 I/O 时返回 `Pending` 并登记唤醒方式；线程转去推进其他任务；I/O 就绪后任务重新入队，下一次 `poll` 从保存的状态继续。异步的价值就在于等待期间不必让一个线程只服务这一个任务。
+阻塞并不是错误。少量连接、简单工具和每个任务都需要独立线程的程序，使用阻塞代码通常更容易理解。问题出现在大量任务都长期等待同类事件时：为每个任务准备一个线程可能消耗很多线程栈，也会增加调度管理成本。
 
-### 1.1 Future 与状态机 (State Machines)
+异步任务在等待时把线程还给运行时：
 
-<details>
-<summary><strong>P2 选读：Future 状态布局、Pin 与嵌套状态机</strong></summary>
+```text
+任务 A：发送请求 ── 挂起 ───────────────── 恢复并解析
+执行线程：运行 A ── 运行 B ── 运行 C ───── 再次运行 A
+```
 
-当你编写一个 `async fn` 时，编译器会把它降低为一个实现 `Future` 的匿名状态机。把它想成枚举很有帮助，但**真实布局是编译器实现细节，不保证就是你能手写出来的某个 enum**。
+这里的“挂起”只暂停当前任务，不要求暂停承载它的系统线程。线程可以继续推进其他已经就绪的任务。
 
-#### 为什么是状态机？
+### 1.1 异步不等于并行
 
-编译器会在每个可能返回 `Poll::Pending` 的 `.await` 处记录“下次从哪里继续”。只有**在挂起后仍然活着**的局部变量和正在等待的子 Future 才需要成为状态机字段；在 `.await` 前已经不再使用并被销毁的临时值，无需一直保留。
+异步主要解决**等待期间怎样复用线程**。它不表示多个 CPU 计算一定同时发生。单线程异步运行时可以并发处理大量等待型任务，却仍然只能在同一时刻执行一个任务的普通代码。
 
-下面是一个跨组件示例：它依赖 Tokio 的 `net`/`io-util` feature，以及项目自己的 `Order` 和 `parse_order`。这些依赖无法由 mdBook 的单文件测试补齐，因此代码块只展示状态机来源，不作为独立程序执行。
+要让 CPU 密集计算并行，仍需要多个系统线程或其他计算设备。并发、并行与线程的基础概念见上一章[并发基础](concurrency.md)。
 
-```rust,ignore
-use std::io;
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+## 2. `async fn` 返回 Future
 
-// Order 与 parse_order 是业务类型/函数，此处省略定义。
-async fn fetch_order() -> io::Result<Order> {
-    let mut socket = TcpStream::connect("127.0.0.1:8080").await?;
-    let mut buf = [0u8; 1024];
-    let n = socket.read(&mut buf).await?;
-    parse_order(&buf[..n])
+普通函数调用时会立即开始执行函数体，并在返回前占用当前调用栈。`async fn` 的调用主要创建一个 **Future**；Future 被 `.await`、交给运行时或手动轮询后，函数体才开始取得进展。
+
+```rust,edition2021
+async fn answer() -> u32 {
+    42
+}
+
+fn create_future() {
+    let future = answer();
+    // 这里只创建了 Future。没有 await 或执行器，它不会自行完成。
+    drop(future);
 }
 ```
 
-直觉上，它大致经历这些状态：
+Future 可以理解为一个保存以下信息的对象：
 
-| 状态 | 必须保存的内容 | 下一步 |
-| :--- | :--- | :--- |
-| Connecting | 连接子 Future | Pending，或得到 socket |
-| Reading | socket、buf、读取子 Future 所需状态 | Pending，或得到字节数 |
-| Done | 完成标记 | 返回结果；完成后不应再 poll |
+- 当前执行到了哪个步骤；
+- 挂起后还要继续使用哪些局部变量；
+- 当前正在等待哪个子 Future。
 
-读取子 Future 逻辑上会借用 `socket` 与 `buf`，而它们又在同一个外层 Future 中。这类“移动后内部引用可能失效”的状态，正是 `Pin` 出现的原因之一。手写一个同时存 `socket`、`buf` 和借用它们的 `ReadFuture` 的普通 enum 往往无法通过借用检查；不要把教学伪代码误当成真实可编译布局。
+编译器会把 `async fn` 转换成类似**状态机**的结构。状态机是“根据当前状态决定下一步”的对象。例如，一个请求任务可能依次处于连接中、读取中和已完成状态。
 
-`Future` 的核心接口是：
+```mermaid
+stateDiagram-v2
+    [*] --> Connecting: 第一次推进
+    Connecting --> Connecting: 连接尚未就绪
+    Connecting --> Reading: 连接完成
+    Reading --> Reading: 数据尚未到达
+    Reading --> Done: 得到完整响应
+    Done --> [*]
+```
 
-```rust
+`.await` 的作用是推进子 Future：如果子 Future 已完成，就取得结果并继续；如果尚未完成，当前 Future 保存进度并把控制权还给执行器。
+
+只有跨越 `.await` 后仍然需要的局部变量，才必须保存在状态机中。因此，大缓冲区、锁 guard 或其他资源是否跨越 `.await`，会影响 Future 的大小和行为。
+
+## 3. `poll`：执行器怎样推进 Future
+
+Future 不会自己运行。执行器通过 `poll` 方法询问它：“现在能继续到什么程度？”结果只有两类：
+
+- `Poll::Ready(value)`：计算已经完成，并给出结果；
+- `Poll::Pending`：现在无法继续，需要以后再次 `poll`。
+
+标准库接口的核心形状如下：
+
+```rust,ignore
 trait Future {
     type Output;
 
@@ -68,274 +90,153 @@ trait Future {
 }
 ```
 
-- `Poll::Ready(value)`：本次已经完成；
-- `Poll::Pending`：暂时不能继续，并且负责让某个事件源在进展可能发生时调用当前 `Waker`；
-- executor 不应该无缘无故反复 poll 一个 Pending Future，否则会变成空转。
+初学阶段不需要手写 Future，但需要理解两个参数为什么存在：
 
-**为什么 `poll` 里面要有个 `loop`？**
+- `Context` 提供当前任务的 Waker，让 Future 能登记“以后怎样通知我”；
+- `Pin` 限制某些 Future 在开始执行后被随意搬到新地址，因为编译器生成的状态可能依赖地址稳定性。
 
-概念实现常用循环：如果连接子 Future 立即 `Ready`，外层可以在同一次 poll 继续推进读取，直到遇到真正的 `Pending` 或最终 `Ready`。这避免的是一次额外的 task 入队/再次 poll，**不一定是一次操作系统线程上下文切换**。
+`Pin` 不是线程绑定，也不会阻止运行时把同一个任务安排到另一条工作线程。它约束的是 Future 值在内存中的移动。
 
-**关键推论**:
-1. **大小可知，不代表大小很小**：状态机大小近似由各挂起状态的活跃字段、子 Future、判别状态和对齐共同决定，不能简单说“等于最大子 Future”；
-2. **值放在哪里由使用方式决定**：直接 `.await` 常把子 Future 内联进父 Future，装箱或 `spawn` 则会放到堆上/任务分配中；
-3. **缩短跨 await 生命周期很重要**：大缓冲区、不需要跨 await 的 guard 或 `Rc` 应尽早结束作用域，可同时减小 Future、避免 `!Send`。
+一个 Future 返回 `Pending` 前，必须安排某种唤醒方式。否则执行器不知道何时再来轮询，它可能永远没有进展。执行器也不应该不断轮询一个没有新事件的 Pending Future，否则会浪费 CPU。
 
-### 1.2 `Pin`：保证被 poll 的 Future 不再随意搬家
+## 4. Executor、I/O Driver 与 Waker
 
-`Pin<&mut F>` 可以理解为：“你仍能在规则允许的范围内修改 F，但若 F 是 `!Unpin`，不能把 F 整体 move 到新地址。”编译器生成的 async Future 通常不能假定是 `Unpin`。
+Rust 标准库定义了 Future 的接口，但没有规定完整的异步运行时。Tokio 等运行时通常包含下面几个角色：
 
-常见两种固定方式：
+- **Task（任务）**：被运行时管理的 Future，以及调度所需的状态；
+- **Executor（执行器）**：从就绪队列中取任务并调用 `poll`；
+- **I/O Driver（I/O 驱动器）**：借助操作系统接口观察套接字、定时器等事件；
+- **Waker（唤醒器）**：事件就绪时通知执行器“这个任务值得再次 poll”。
 
-- `Box::pin(future)`：把 Future 放到堆上，并固定其地址；
-- `std::pin::pin!(future)`：把局部 Future 固定在当前栈帧的作用域内。
+有些资料把 I/O driver 称为 **reactor**。名字可以不同，职责相同：它负责观察外部事件，executor 负责执行任务代码。
 
-`Pin` 只提供地址稳定性约束，不会延长生命周期、不会让裸指针自动安全，也不会阻止 executor 在两次 poll 之间把**拥有这个已固定分配的 task**安排到不同 worker；跨核迁移和“移动 Future 自身的内存地址”是两件事。
-
-### 1.3 组合状态机：洋葱模型
-
-你可能会问：**“子 Future 也有自己的状态机吗？”**
-
-是的。`TcpStream::connect` 返回的 `ConnectFuture` 内部也是一个状态机。
-`FetchOrderFuture` 就像一个**洋葱**，它包裹着 `ConnectFuture`，而 `ConnectFuture` 可能包裹着更底层的 `IOFuture`。
-
-当我们调用最外层的 `poll` 时，实际上发生了一次**递归调用链**：
-
-1.  Executor 调用 `FetchOrderFuture::poll()`。
-2.  `FetchOrderFuture` 发现自己正处于 `WaitingConnect` 状态，于是调用内部 `ConnectFuture::poll()`。
-3. 连接 Future 若尚未就绪，会让 I/O 驱动记录 interest 与 Waker，然后返回 `Pending`。
-
-在没有 `Box<dyn Future>` 等类型擦除时，组合出来的具体 Future 类型通常会把子 Future 状态内联为字段，编译器也可能内联 poll 调用。这省去了每个 await 点单独分配栈帧的需要，但外层 Future 仍需同时容纳该挂起点活着的外层局部变量和子 Future，组合过深或跨 await 保存大对象会明显增大 task。
-
-#### HFT 视角分析
-
-* **内存布局**：Future 是固定大小的值，但“固定”不等于“紧凑”。可以用 `size_of_val(&future)` 观察具体构建，布局本身不是稳定 ABI；
-* **状态分支**：poll 需要判断当前状态，实际分支成本应通过 profile 判断；
-* **调用方式**：具体类型之间的 poll 可以静态分发并被内联；executor 为统一调度 task 可能使用类型擦除。`Waker` 有自己的 vtable，但这不代表每次 Future::poll 都“通过 Waker 虚调用”。
-
-</details>
-
-### 1.4 Waker、Executor 与 Reactor
-
-Rust 的异步模型是 **Reactor-Executor** 模式的典型实现，但初学者往往会混淆各个组件的角色。让我们用 HFT 的术语来重新解释：
-
-*   **Future（可推进的计算）**：保存“执行到哪里”和跨挂起点仍需保留的数据；它被放进 runtime 后才通常称为 task。
-*   **Executor (调度器)**: 相当于一个 `while loop`。它不断地从队列里取出 Future，调用它们的 `poll` 方法。
-*   **Reactor / I/O Driver（I/O 驱动器）**：对 Linux `epoll`、BSD `kqueue`、Windows IOCP 等系统机制进行抽象，跟踪“现在可尝试操作”或“操作已经完成”的事件。
-*   **Waker (唤醒器)**: 这是一个至关重要的**桥梁**。当 I/O 未就绪时，Future 会把 Waker 扔给 Reactor 说：“等有数据了，用这个叫醒我”。
-
-**完整流程图解**:
+下面是一条网络读取的完整因果链：
 
 ```mermaid
 sequenceDiagram
-    participant E as Executor (Thread)
-    participant F as Future (State Machine)
-    participant R as Reactor (Epoll)
-    
-    E->>F: 1. poll()
-    F->>R: 2. Register Interest (I/O not ready)
-    F-->>E: 3. return Poll::Pending
-    E->>E: (Park / Switch to other tasks)
-    
-    Note over R: ... Time Passes ...
-    Note over R: Data Arrives on Socket!
-    
-    R->>E: 4. Waker::wake()
-    E->>F: 5. poll() (Again)
-    F->>F: 6. Read Data
-    F-->>E: 7. return Poll::Ready(Data)
+    participant E as Executor
+    participant F as Future
+    participant D as I/O Driver
+    participant O as 操作系统
+    E->>F: poll
+    F->>D: 登记套接字兴趣和 Waker
+    F-->>E: Pending
+    E->>E: 推进其他就绪任务
+    O-->>D: 套接字现在可读
+    D->>E: 调用 Waker，使任务重新就绪
+    E->>F: 再次 poll
+    F-->>E: Ready(读取结果)
 ```
 
-**关键点**:
-Rust 的 Future 是 **惰性 (Lazy)** 的。如果你只创建 Future，却没有 `.await`、交给 executor 或手动 poll，它通常不会取得进展。`async fn` 被调用时主要是在构造状态机，函数体从第一次 poll 才开始执行。
+`wake` 通常不会在调用点直接执行 Future。它表示任务可能取得新进展，运行时会把任务标记为就绪并安排后续 `poll`。这样可以合并重复通知，并让执行器统一决定运行顺序。
 
-### 1.5 `Waker` 的成本来自哪里？
+## 5. Task 怎样复用系统线程
 
-标准库的 `Waker` 由数据指针和 `RawWakerVTable` 描述，具体成本由 executor 实现决定，并不要求内部一定是 `Arc`。常见成本包括：
-
-1. **间接调用**：wake/clone/drop 通过 vtable 到达具体 runtime；
-2. **任务状态同步**：跨线程唤醒可能修改原子任务状态；
-3. **重新入队**：若任务尚未在队列中，可能需要推入本地或远端调度队列；
-4. **唤醒 worker**：空闲 worker 可能需要从 park 状态恢复。
-
-runtime 通常会合并重复 wake，且同线程 fast path 可能很便宜，所以不能写成“每次 wake 必然一次 Arc clone + 全局锁”。忙轮询是否更合适，要看等待是否短且有专用核心；对不确定等待无限自旋会烧满 CPU、破坏系统公平性。
-
-## 2. Tokio 运行时深度解析
-
-Tokio 是 Rust 生态中广泛使用的异步运行时。建立模型时，可以先把它看成两个核心部分：**Executor（调度器）** 和 **I/O Driver（I/O 驱动器）**，此外还有定时器等能力。
-
-### 2.1 多核调度原理：Task 与 Worker
-
-你可能会问：**“既然 Future 只是个被动的状态机，它是怎么利用 64 核 CPU 的？”**
-
-答案在于 **Executor**。Future 只是定义了“做什么”，Executor 决定“在哪做”。
-
-* **Task (任务)**：`tokio::spawn(my_future)` 会把 Future 包装成可调度 task；
-* **Worker (工人)**：多线程 runtime 使用一组系统线程，数量可配置，默认值也不应当作业务容量规划；
-* **M:N 映射**：大量 task 复用较少 worker。worker 从运行队列取 task，每次 poll 推进一段。
-
-**Send 约束的由来**:
-多线程 worker 可能在两次 poll 之间迁移 task，因此 `tokio::spawn` 要求 Future 与输出满足相应的 `Send + 'static` 边界。更准确地说，是**整个 Future 状态必须是 Send**；一个 `!Send` 局部变量若在 `.await` 前已经销毁，不会让 Future 必然 `!Send`。
-
-确实只需单线程时，可在 `LocalSet` 中用 `spawn_local` 运行 `!Send` Future。即使 runtime flavor 是 `current_thread`，`tokio::spawn` 这个通用 API 本身仍要求 `Send`，不要把“当前运行时只有一个线程”与函数签名混为一谈。
-
-### 2.2 工作窃取调度器 (Work-Stealing Scheduler)
-
-<details>
-<summary><strong>P2 选读：Tokio 工作窃取为什么有收益也有抖动</strong></summary>
-
-Tokio 的多线程运行时 (`rt-multi-thread`) 使用工作窃取算法：
-
-* worker 有本地调度状态，也会处理注入队列中的任务；
-* 空闲 worker 可以从其他 worker 窃取工作；
-* 具体队列顺序、批量大小与公平策略是 runtime 实现细节，会随版本演进。
-
-**HFT 的隐患**:
-
-* **跨核迁移 (Migration)**：task 可在一次 poll 返回后由另一 worker 继续，热状态可能失去 L1/L2 局部性；
-* **共享调度资源**：入队、窃取和 worker 唤醒需要同步；实际尾延迟必须在目标负载测量，不能固定成某个微秒数。
-
-</details>
-
-### 2.3 协作式调度与饥饿
-
-Tokio 是**协作式 (Cooperative)** 的。如果一个 `async` 任务执行了密集的 CPU 计算而不 `await`，它将霸占线程，导致其他 I/O 任务（如心跳包处理）饿死。
-
-```rust,edition2021
-// 错误示范：在 async 中做计算
-use std::time::{Duration, Instant};
-
-async fn heavy_computation() {
-    // 这会阻塞当前 worker 线程 100ms！
-    // 导致同线程的其他 Future 无法被调度。
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(100) {
-        std::hint::spin_loop();
-    }
-}
-```
-
-**解决方案**:
-
-* 很短的循环可拆分并在合理边界 `yield_now().await`，但频繁 yield 也有调度成本；
-* 短期阻塞调用可使用 `spawn_blocking`，同时设置并发上限；
-* 持续 CPU 密集任务更适合有界专用线程池（如数据并行池），否则大量 `spawn_blocking` 也会排队和争抢 CPU。
-
-## 3. HFT 系统中的混合架构 (Hybrid Architecture)
-
-HFT 系统常把混合架构作为起点：大量等待型 I/O 可以用 Async，已确认的固定低延迟数据面可以用专用同步线程。这是按负载做的选择，不是“边缘/核心”位置自动决定模型。
-
-### 3.1 架构图
+异步运行时通常让大量 task 复用较少的系统线程，这种关系常写作 **M:N 调度**：M 个任务由 N 条工作线程推进。
 
 ```mermaid
-graph TD
-    subgraph "Edge (Async/Tokio)"
-        GW[API Gateway] -->|WebSocket| CL[Clients]
-        DB[Database Logger] -->|SQL| RDS[PostgreSQL]
-    end
-
-    subgraph "Core (Thread-per-Core)"
-        MD[Market Data Thread] -->|SPSC Queue| ST[Strategy Thread]
-        ST -->|SPSC Queue| OE[Order Entry Thread]
-    end
-
-    GW -- "Command (RingBuffer)" --> ST
-    ST -- "Execution Report (RingBuffer)" --> GW
+flowchart LR
+    A1["Task A"] --> W1["Worker 1"]
+    A2["Task B"] --> W1
+    A3["Task C"] --> W2["Worker 2"]
+    A4["Task D"] --> W2
 ```
 
-### 3.2 适用场景指南
+一条工作线程每次只执行某个 task 的一段代码。task 在 `.await` 处返回 Pending 后，工作线程才能去执行其他 task。这种由任务主动让出执行权的方式叫作**协作式调度**。
 
-| 组件 | 推荐模型 | 原因 |
+多线程运行时可能在两次 `poll` 之间把 task 安排到不同 worker。正因为存在这种可能，Tokio 的通用 `spawn` API 通常要求 Future 满足 `Send`：Future 保存的状态可以安全地在线程之间转移。
+
+`Send` 检查的是整个 Future 状态。如果一个不能跨线程传递的局部值在 `.await` 之前已经销毁，它就不需要成为挂起状态的一部分。若确实要运行 `!Send` Future，可以使用运行时提供的本地任务机制，但那是明确选择单线程执行范围，而不是关闭类型安全。
+
+## 6. 最重要的工程边界：不要阻塞 worker
+
+协作式调度有一个直接后果：一个 task 在返回 Pending 或 Ready 之前，会一直占用当前 worker。如果它执行很长的 CPU 计算，或调用长时间阻塞的系统接口，同一 worker 上的其他 task 就无法取得进展。
+
+```mermaid
+flowchart LR
+    A["Task A 开始运行"] --> B["长计算或阻塞调用"]
+    B --> C["Task A 终于让出线程"]
+    D["Task B 已就绪"] -. "一直等待同一 worker" .-> C
+```
+
+这叫作**阻塞异步运行时的工作线程**。常见处理方式如下：
+
+| 工作类型 | 常见处理方式 | 原因 |
 | :--- | :--- | :--- |
-| **策略逻辑 (Strategy)** | **常见为 Thread-per-Core** | 单写者状态、缓存局部性和可控尾延迟优先。 |
-| **行情解码 (Feed Handler)** | **按数据率选择专用线程/忙轮询** | 高数据率路径可能值得独占核心；低速源不必照搬。 |
-| **订单发送 (Order Entry)** | **按延迟预算选择专用线程** | 关键发送路径常希望避免与无关 task 共享调度。 |
-| **Web 监控台 (Dashboard)** | **Async (Tokio)** | 处理大量并发 WebSocket 连接，吞吐量优先。 |
-| **历史数据落库** | **异步客户端或有界专用写线程** | 数据库网络等待可由 Async 复用线程；普通阻塞文件 I/O 则应隔离到受控线程，不能只加 `async`。 |
-| **REST API 接口** | **常见为 Async (Tokio)** | 大量连接会等待网络；若连接很少，简单线程模型同样可能足够。 |
+| 很短的普通计算 | 直接执行 | 切换到别处的成本可能更高 |
+| 可拆分的长 CPU 计算 | 有界计算线程池或数据并行库 | 真正利用多核，并限制同时计算的数量 |
+| 没有异步接口的短期阻塞调用 | 运行时的 blocking 线程池 | 避免阻塞负责 I/O task 的 worker |
+| 长期存在的阻塞循环 | 专用线程 | 生命周期和资源预算更明确 |
+| 异步网络或定时器 | 正常 `.await` | 未就绪时可以登记唤醒并让出 worker |
 
-## 4. 实战：在 HFT 中正确使用 Tokio
+Tokio 提供 `spawn_blocking` 把阻塞工作移到专门的线程池，但它不是无限容量。若请求不断创建阻塞任务，队列仍会增长，所以还需要并发上限和背压。
 
-如果你必须在关键路径附近使用 Tokio，请遵循以下原则：
+### 6.1 为什么不能持有普通锁跨越 `.await`
 
-### 4.1 评估单线程运行时 (`current_thread`)
+假设 task A 持有 `std::sync::Mutex` 的 guard，然后在网络操作上 `.await`。A 挂起期间锁仍未释放；task B 若在同一 worker 上尝试获取这把锁，系统线程会被阻塞。此时即使 A 的网络事件已经就绪，worker 也可能无法重新推进 A。
 
-如果目标是避免 task 在多个 worker 间迁移，可以显式评估单线程 runtime；它不会自动降低尾延迟，也不等于独占一个核心。需要时还要用操作系统 affinity 约束承载它的线程，并测量其他 task 是否造成协作式排队。
+更稳妥的顺序是：
 
-下面代码依赖 Tokio runtime 的 Cargo feature，并且线程亲和性还必须在运行时外部单独配置；mdBook 因而只展示构建方式，不执行它。
+1. 加锁并读取或修改必要状态；
+2. 在 `.await` 前让 guard 离开作用域；
+3. 再执行异步 I/O。
 
-```rust,ignore
-fn main() {
-    let rt = tokio::runtime::Builder::new_current_thread() // 关键：单线程
-        .enable_all()
-        .build()
-        .unwrap();
+异步 Mutex 允许等待锁的 task 让出 worker，但“持锁等待外部 I/O”仍会扩大临界区。能否改成消息传递或单拥有者 task，通常比简单换锁更值得先思考。
 
-    rt.block_on(async {
-        // Tokio task 不会在多个 runtime worker 之间迁移。
-        // 但若未设置 affinity，操作系统仍可能迁移这个唯一的系统线程。
-    });
-}
-```
+## 7. 取消、超时与背压
 
-### 4.2 不要把 Mutex guard 带过 `.await`
+真实异步任务不能假设所有操作都会成功完成。连接可能断开，调用方可能取消请求，下游也可能一直不返回。
 
-标准库 Mutex 会阻塞当前系统线程。若持有 guard 跨 `.await`，其他 task 可能在同一 worker 上等待这把锁，而持锁 task 又等不到继续执行，形成死锁或长时间阻塞；许多 guard 的 `!Send` 约束也会直接让 `tokio::spawn` 拒绝编译。
+**超时**为等待设置时间上限。超时结束后，调用方停止继续等待，但这不保证远端操作已经回滚。例如数据库请求超时后，服务器端可能仍然完成了写入。因此，重试前还要考虑操作是否幂等，以及怎样查询最终状态。
 
-选择不是简单的“std Mutex 坏、Tokio Mutex 好”：
+**取消**通常通过丢弃 Future 或发送取消信号实现。Future 被丢弃后不会再被 poll，但已经产生的外部副作用不会自动撤销。实现可取消任务时，需要确保资源能在 Drop 或明确清理流程中释放。
 
-* 临界区很短且**不会跨 await** 时，`std::sync::Mutex` 可能更轻；
-* guard 确实必须跨 await 时，使用 async-aware Mutex，并审视为何需要持锁等待 I/O；
-* 更优先考虑消息传递或单写者 task，消除共享锁。
+**背压**限制新任务进入速度。如果服务接收请求的速度长期高于数据库、模型或其他下游的处理速度，即使每个操作都是异步的，等待队列仍会不断增长。异步提高了等待时的线程利用率，不会创造无限下游容量。
 
-### 4.3 预分配与零拷贝
+## 8. 什么时候使用异步
 
-Tokio 的 I/O 接口 (`AsyncRead`, `AsyncWrite`) 通常需要缓冲区。避免在循环中反复 `vec![0; 1024]`。
+异步通常适合：
 
-下面是 **协议读取循环骨架**：它需要 `bytes::BytesMut`、Tokio 的异步读扩展、具体 `stream`，以及项目自己的拆帧和处理函数。由于这些跨模块依赖被有意省略，mdBook 不执行该片段。
+- 同时维护大量网络连接；
+- 一个任务包含多次网络、定时器或其他可异步等待；
+- 希望在等待期间用较少线程推进其他请求；
+- 使用的库和协议已经提供成熟异步接口。
 
-```rust,ignore
-// 推荐：复用缓冲区
-let mut buf = BytesMut::with_capacity(4096);
-loop {
-    let n = stream.read_buf(&mut buf).await?;
-    if n == 0 {
-        break; // EOF
-    }
+异步不一定适合：
 
-    // TCP 没有消息边界：只取走已经完整的帧，半包继续留在 buf 中。
-    while let Some(frame_len) = complete_frame_len(&buf) {
-        let frame = buf.split_to(frame_len);
-        process_frame(&frame)?;
-    }
-}
-```
+- 程序连接很少，阻塞代码已经足够简单；
+- 核心工作几乎全是 CPU 计算；
+- 依赖库只有阻塞接口，且调用持续时间很长；
+- 任务需要独占线程或严格控制其执行位置。
 
-`clear()` 会保留容量，但也会丢弃当前逻辑长度。只有确认缓冲区中的字节全部消费完时才能 clear；协议解析必须正确处理半包、粘包、长度上限和恶意长度字段。
+一个系统可以同时使用多种模型。例如，异步网络层接收请求，有界队列限制并发，再由计算线程池完成压缩、推理前处理或复杂计算。
 
-## 5. 面试快问快答
+## 9. 三类系统怎样使用异步机制
 
-### Q1：调用 `async fn` 时，函数体是否立即执行？
+- **传统互联网服务**常用异步处理 HTTP、RPC、数据库连接和定时任务，同时用容量限制保护下游；
+- **AI Infra** 常用异步接收推理请求和拉取对象存储数据，再把批处理或 CPU 密集预处理交给受控线程池；
+- **HFT** 可能在管理接口和普通网络服务使用异步，而让需要固定执行位置的数据处理阶段运行在专用线程。
 
-通常不会。调用主要构造 Future，函数体从 Future 第一次被 poll 时开始推进；Future 若从未被 await/spawn/poll，就不会自行取得进展。
+工作窃取队列、Waker 的内部数据结构和某个 Tokio 版本的调度参数属于运行时实现细节。基础面试更重要的是讲清 Pending 怎样被唤醒、协作式调度为何怕阻塞，以及异步为什么不能替代 CPU 并行。
 
-### Q2：`Waker::wake()` 是否直接执行 Future？
+## 10. 本章小结
 
-通常不是。wake 表示“这个 task 现在值得再次 poll”，runtime 会把它标记为就绪并安排入队；真正执行仍发生在某个 worker 后续调用 poll 时。
+- 异步让等待中的任务保存进度并让出线程，主要解决大量等待任务的线程复用；
+- `async fn` 返回惰性的 Future，Future 需要被 poll 才会取得进展；
+- `poll` 返回 Ready 或 Pending，Pending 前必须安排后续唤醒；
+- executor 推进 task，I/O driver 观察外部事件，Waker 把就绪事件连接回调度队列；
+- task 采用协作式调度，长计算和阻塞调用会拖住同一 worker；
+- 超时和取消不会自动撤销外部副作用，异步也不会替代背压和容量规划。
 
-### Q3：为什么 Future::poll 接收 `Pin<&mut Self>`？
+## 11. 思考题与面试追问
 
-挂起状态可能依赖地址稳定性。Pin 让 `!Unpin` Future 在被 poll 后不能通过安全代码整体 move，从而保护编译器生成状态中的内部引用关系。
+1. 调用 `async fn` 后，函数体为什么不一定立即执行？
+2. `Poll::Pending` 与“执行失败”有什么区别？
+3. Waker 被调用后，为什么通常不是直接执行 Future？
+4. `.await` 暂停的是整个系统线程，还是当前 task？
+5. 异步为什么适合大量网络等待，却不会自动加速 CPU 密集计算？
+6. 在 async 函数中持有普通 Mutex guard 跨越 `.await`，可能出现什么问题？
+7. 一个 HTTP 请求在客户端超时后，为什么不能直接断言服务端没有执行写操作？
+8. 如果异步服务的下游处理能力不足，为什么仍然需要有界队列和背压？
 
-### Q4：单线程 Tokio 是否等于低延迟 thread-per-core？
-
-不等于。它能移除 worker 间迁移，但仍有 task 调度、Waker、I/O driver 和协作式饥饿；承载 runtime 的系统线程还需单独设置 affinity。是否满足目标只能用尾延迟测量回答。
-
-## 6. 本章小结
-
-- Async Rust 用固定大小状态机表达暂停与恢复，但固定大小不代表小，也不代表没有分配；
-- `Pin` 保护地址稳定性，`Waker` 只负责通知“值得再 poll”；
-- 多线程 Tokio 的 task 可能在 poll 之间迁移，`Send` 约束来自这一可能性；
-- HFT 常把 Async 放在 I/O 密集边缘、把单写者 thread-per-core 放在关键数据面，但最终边界由延迟预算和实测决定。
-
-权威参考：[标准库 `Future` 文档](https://doc.rust-lang.org/std/future/trait.Future.html)、[标准库 `Waker` 文档](https://doc.rust-lang.org/std/task/struct.Waker.html) 与 [Tokio Runtime 文档](https://docs.rs/tokio/latest/tokio/runtime/)。
+延伸阅读：[标准库 `Future` 文档](https://doc.rust-lang.org/std/future/trait.Future.html)、[标准库 `Waker` 文档](https://doc.rust-lang.org/std/task/struct.Waker.html)与 [Tokio Runtime 文档](https://docs.rs/tokio/latest/tokio/runtime/)。

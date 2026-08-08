@@ -1,12 +1,10 @@
 # 超大规模虚拟网络：让 Agent 能通信，但不能越界
 
-> 难度：必会。官方职责要求超大规模虚拟网络，并允许 Agent 在不离开物理边界的前提下互相通信。
-
-> 先修桥梁：DNS、路由、TCP 和 socket 属于通用网络基础，先读第一册的[网络基础](../../rust-hft/network/basics.html)；TLS、RPC、负载均衡、deadline 和工具出口见[Agent RPC 与工具网络](../systems/network_rpc.md)。本章只新增虚拟化和多租户问题。
+DNS、路由、TCP 和 Socket 的通用机制见系统子书的[网络基础](../../rust-hft/network/network_overview.html)；沙箱网络在其上增加虚拟接入、多租户隔离、工作负载身份和出口控制。
 
 虚拟网络像大型园区的道路系统：房间要有地址，道路要能转发，门禁要决定谁能到哪里，出口海关要检查外发流量。只给每个沙箱一个 IP，并没有解决隔离、规模和故障问题。
 
-本章先分两条线：**数据面**真的转发每个包，**控制面**计算并下发地址、路由和访问策略。ACL 是“谁能访问谁”的规则，egress 是离开沙箱网络的出口，TTL 是消息的过期时间，trace context 是把一次请求跨服务关联起来的追踪标识。P0 要会画包从沙箱到物理网卡的路径，并解释默认拒绝、MTU、连接状态和出口控制；CNI/eBPF 的具体实现、全互连流量计算属于 P1，不要求背某个产品命令。
+本章分两条线：**数据面**真正转发每个包，**控制面**计算并下发地址、路由和访问策略。ACL（Access Control List，访问控制列表）是“谁能访问谁”的规则，egress 是离开沙箱网络的出口，trace context 是把一次请求跨服务关联起来的追踪标识。本章消息字段里的 TTL（Time To Live，生存时间）表示消息何时过期；不要把它与 IPv4 首部中每经过一台路由器就递减的 TTL 跳数混为一谈。
 
 ## 1. 单机数据路径
 
@@ -15,19 +13,19 @@
 ```mermaid
 flowchart LR
     P["沙箱进程"] --> NS["network namespace"]
-    NS --> V1["veth / TAP 虚拟接口一端"]
-    V1 --> V2["宿主端"]
+    NS --> V1["容器侧 veth"]
+    V1 --> V2["宿主侧 veth"]
     V2 --> R["网桥 / 路由 / eBPF 可编程数据路径"]
     R --> NIC["物理 NIC"]
 ```
 
-veth（virtual Ethernet pair，虚拟以太网对）像一根两端网线；TAP 是把二层以太网帧交给用户态程序的虚拟接口，常用于把 VM 虚拟网卡接到宿主。eBPF 是 Linux 内核中的可编程执行机制，可实现转发、策略和观测。CNI（Container Network Interface，容器网络接口）规范定义运行时如何请求插件为容器或 VM 配置网络，但 CNI 本身不是某一种数据面实现。
+veth（virtual Ethernet pair，虚拟以太网对）像一根两端网线，一端位于容器的网络命名空间，另一端留在宿主。VM 是另一条路径：guest 内的虚拟网卡经 virtio 等虚拟设备到 VMM/backend，再接宿主 TAP 或其他数据面；TAP 是把二层以太网帧交给用户态程序的虚拟接口，并不是 veth 的“VM 叫法”。eBPF 是 Linux 内核中的可编程执行机制，可实现转发、策略和观测。CNI（Container Network Interface，容器网络接口）规范定义运行时如何请求插件配置网络，但 CNI 本身不是某一种数据面实现。
 
 ## 2. 跨机：underlay 与 overlay
 
 underlay（底层网络）是物理交换机和路由组成的真实网络。overlay（覆盖网络）在它上面封装租户虚拟网络，例如用隧道携带“内层”地址。
 
-overlay 简化了地址与租户隔离，却增加封装字节、MTU（Maximum Transmission Unit，最大传输单元）、隧道端点状态和排障层次。若底层 MTU 是 1500 B，封装又消耗几十字节，而沙箱仍发送 1500 B 包，可能出现分片或黑洞。面试中看到“能 ping 小包、传大文件卡住”，应想到 MTU 与路径发现。
+overlay 简化了地址与租户隔离，却增加封装字节、MTU（Maximum Transmission Unit，最大传输单元）、隧道端点状态和排障层次。若底层 MTU 是 1500 B，封装又消耗几十字节，而沙箱仍发送 1500 B 包，可能出现分片或黑洞。遇到“能 ping 小包、传大文件卡住”，应检查有效 MTU 与路径 MTU 发现。
 
 ## 3. 地址规模不是只有 IP 数量
 
@@ -82,7 +80,7 @@ overlay 简化了地址与租户隔离，却增加封装字节、MTU（Maximum T
 
 排查应比较节点、包大小和路径，观察重传与 ICMP，验证端到端有效 MTU。修复后要把大包连通性加入节点准入，而不只测 ping。
 
-## 9. DeepSeek Agent Infra 面试怎么问
+## 9. 章末面试问题
 
 **题目：设计允许同一任务 Agent 互通、又禁止跨租户与出物理边界的网络。**
 

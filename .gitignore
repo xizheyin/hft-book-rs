@@ -6,3 +6,4 @@ site/
 books/rust-hft/book/
 books/ai/book/
 temp/
+__pycache__/

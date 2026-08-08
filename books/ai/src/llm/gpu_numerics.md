@@ -2,15 +2,7 @@
 
 把 GPU 想成一家有上万名厨师的大厨房。厨师同时切菜很快，但食材必须从远处仓库运来；如果每做一步都等货车，厨师再多也只能空等。LLM 的矩阵乘法像批量做同一道菜，HBM（High Bandwidth Memory，高带宽显存）像近处仓库，Kernel 像一次下达的工单，而量化像用更小的包装运送食材。
 
-> 本章目标：建立 GPU、HBM、Kernel、算力/带宽瓶颈和数值精度的共同心智模型；能解释 BF16/FP8/量化为何可能省资源，又为何不保证更快或同样准确。
-
-## 学习优先级
-
-| 优先级 | 先掌握什么 | 面试要求 |
-|---|---|---|
-| P1 | GPU 并行、HBM、Kernel、算力受限/带宽受限、FP32/BF16/FP16、量化 | 能从请求阶段判断主要资源账 |
-| P2 | Tensor Core、Kernel Fusion、FP8、Roofline、Per-channel 量化 | 能讲收益成立的前提与风险 |
-| 暂不展开 | CUDA 指令编码、手写汇编、特定 GPU 微架构细节 | 除非岗位明确要求 Kernel 开发 |
+GPU 并行、HBM、Kernel、算力/带宽瓶颈和数值精度是同一条执行链上的不同约束。BF16、FP8 和量化可能减少资源消耗，但是否更快、是否保持质量取决于硬件和算子实现。
 
 ## 1. GPU 为什么适合 LLM
 
@@ -118,9 +110,11 @@ DeepSeek-V3 官方报告描述了其训练中的 FP8 混合精度框架。这是
 量化把连续浮点值映射到有限整数格点。简化的非对称公式是：
 
 ```text
-q = clamp(round(x / scale) + zero_point)
+q = clamp(round(x / scale) + zero_point, q_min, q_max)
 x_hat = (q - zero_point) × scale
 ```
+
+`q_min` 和 `q_max` 是目标整数类型允许的最小、最大编码；`clamp` 把超出范围的结果截到边界。`scale` 必须为正，`zero_point` 选择哪个整数表示实数零。
 
 若 `scale=0.1`、`zero_point=0`、`x=0.37`：
 
@@ -133,7 +127,7 @@ x_hat = 4 × 0.1 = 0.4
 格子更密，误差通常更小但需要更多位；格子更粗则更省空间，但离群值可能挤压大多数普通值的有效分辨率。
 
 <details>
-<summary><strong>P2 选读：量化命名与 Kernel Fusion</strong></summary>
+<summary><strong>拓展：量化命名与 Kernel Fusion</strong></summary>
 
 ## 9. 量化方案名字怎样读
 
@@ -181,7 +175,7 @@ Fusion 也有代价：寄存器压力、复杂编译、形状适配和调试难�
 
 “忙”可能是等待内存、通信或低效 Kernel。查看 Kernel 时间线、HBM 带宽、矩阵形状、通信等待和队列，而不是只看单一利用率百分比。
 
-## 13. DeepSeek Agent Infra 面试怎么问
+## 13. 章末面试问题
 
 ### 30 秒答法
 

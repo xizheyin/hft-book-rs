@@ -248,11 +248,11 @@ impl<C: Context> Strategy<C> {
 }
 ```
 
-在回测中，我们注入 `BacktestContext`；在实盘中，我们注入 `LiveContext`。由于使用了泛型（Generics），编译器会为两种情况分别生成优化的机器码（Monomorphization），实现零成本抽象。
+在回测中注入 `BacktestContext`，在实盘中注入 `LiveContext`。泛型会发生单态化（monomorphization）：编译器为使用到的具体类型生成对应代码，因此这里没有 trait object 的虚表调用；代码体积、是否内联和最终开销仍要查看编译产物并测量。
 
-## 4. 避免未来函数 (Data Snooping Bias)
+## 4. 避免前视偏差与数据窥探
 
-事件驱动架构能降低 look-ahead 风险，但不能自动杜绝。必须同时遵守：
+前视偏差（look-ahead bias）是决策使用了当时尚不可见的信息；数据窥探（data snooping）则包括反复用评估数据调参，使结果过度适应该数据。事件驱动架构能降低前视风险，但不能自动杜绝这两类问题。必须同时遵守：
 
 1.  **时间单调不减**: 允许同时间戳，但必须有稳定 phase 与 tie-break。
 2.  **因果律**: 一个动作只能影响其到达时间之后的状态；下单不能在网络延迟之前成交。

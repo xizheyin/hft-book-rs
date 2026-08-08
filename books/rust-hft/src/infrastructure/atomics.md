@@ -2,7 +2,7 @@
 
 无锁代码最难的地方，通常不是把 `usize` 换成 `AtomicUsize`，而是回答这个问题：**当消费者看见“消息已就绪”时，为什么它也一定能看见生产者刚刚写好的消息内容？**
 
-`Relaxed`、`Acquire`、`Release`、`AcqRel` 和 `SeqCst` 就是在描述这种“可见性与先后关系”。本章不要求你背汇编，而是建立一套能在面试中推导、在代码评审中自证的思考方法。
+`Relaxed`、`Acquire`、`Release`、`AcqRel` 和 `SeqCst` 就是在描述这种“可见性与先后关系”。选择内存顺序的依据不是记忆某条汇编，而是能指出哪次写发布了数据、哪次读接收了数据，以及两者怎样形成先发生关系。
 
 ## 1. 先分清三件事：原子性、顺序、可见性
 
@@ -55,7 +55,7 @@ fn on_packet() {
 发布 ready（Release） ──同步于──▶        └─ 读取 slot
 ```
 
-这里有一个面试最爱追问的限定条件：
+这里有一个必须满足的限定条件：
 
 > **只有当 Acquire 读取到了该 Release 写入的值（或相应的 release sequence）时，才建立 synchronizes-with；随后才能推出 happens-before。**
 
@@ -135,7 +135,7 @@ state.compare_exchange(
 
 AArch64 通常会用带 acquire/release 语义的指令（如 `ldar`/`stlr`）表达约束。只在 x86 上碰巧工作的错误代码，换到 ARM 后更容易暴露。
 
-> 面试回答不要背成“Acquire/Release 在 x86 永远零成本”。具体指令取决于操作类型、目标 CPU、编译器与上下文；原子 RMW 本身还要取得缓存行的独占权。
+> 不能把 Acquire/Release 简化成“在 x86 永远零成本”。具体指令取决于操作类型、目标 CPU、编译器与上下文；原子读改写（Read-Modify-Write，RMW）本身还要取得缓存行的独占权。
 
 ## 5. 性能：Ordering 往往不是最大头
 

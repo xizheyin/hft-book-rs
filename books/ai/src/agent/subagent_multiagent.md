@@ -67,7 +67,7 @@ Subagent 和 Multi-Agent 也是如此。它们的核心价值不是“开更多�
 - 三个 Subagent 完全并行：理论关键路径为 `4 + 3 = 7 分钟`。
 - 若每个委派和结果清洗各需 1 分钟，且有一个任务重试 4 分钟，实际可能是 `1 + 4 + 1 + 4 + 3 = 13 分钟`。
 
-速度收益取决于可并行比例、协调开销和长尾。调用成本也可能从单 Agent 的 12 个模型回合增加到 20 个。面试时应讨论关键路径、总工作量和资源峰值三者，而不只说“并发更快”。
+速度收益取决于可并行比例、协调开销和长尾。调用成本也可能从单 Agent 的 12 个模型回合增加到 20 个。评价方案时要同时计算关键路径、总工作量和资源峰值，而不只说“并发更快”。
 
 ## 5. 上下文隔离为什么有价值
 
@@ -130,7 +130,7 @@ A 等 B 的结论，B 又等 A 的数据。任务依赖图应检测环；超时�
 
 默认隔离通常比默认互信更安全。只有确需协作的通道才开放，并记录谁向谁传了什么。
 
-## 9. DeepSeek Agent Infra 面试怎么问
+## 9. 章末面试问题
 
 ### 典型问题
 
@@ -159,7 +159,6 @@ A 等 B 的结论，B 又等 A 的数据。任务依赖图应检测环；超时�
 
 ## 11. 一手资料
 
-- [DeepSeek：Agent Harness 团队招聘](https://app.mokahr.com/social-recruitment/high-flyer/140576#/job/8d40c764-d2b2-49b1-826c-e3f2adb75c01)
 - [AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation](https://arxiv.org/abs/2308.08155)
 - [CAMEL: Communicative Agents for Mind Exploration](https://arxiv.org/abs/2303.17760)
 - [Anthropic：Building Effective Agents](https://www.anthropic.com/research/building-effective-agents)

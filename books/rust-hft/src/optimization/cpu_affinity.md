@@ -1,6 +1,6 @@
 # CPU 亲和性与隔离 (CPU Affinity & Isolation)
 
-CPU 亲和性限制线程可以在哪些逻辑 CPU 上运行；CPU 隔离则是一组减少其他任务、中断和内核工作的运维措施。二者可能降低迁核和调度抖动，但不会自动改善延迟，也不能消除所有固件、SMT、IRQ、内存和温度干扰。
+中央处理器（Central Processing Unit，CPU）亲和性限制线程可以在哪些逻辑 CPU 上运行；CPU 隔离则是一组减少其他任务、中断和内核工作的运维措施。二者可能降低迁核和调度抖动，但不会自动改善延迟，也不能消除所有固件、同步多线程（Simultaneous Multithreading，SMT）、中断请求（Interrupt Request，IRQ）、内存和温度干扰。
 
 ## 1. 先认识拓扑
 
@@ -16,7 +16,7 @@ flowchart TB
     N --> P["PCIe / NIC locality"]
 ```
 
-数字只是示意，不能假设“前一半 CPU 属于 Socket 0，后一半属于 Socket 1”。固件、内核、容器 cpuset 和离线 CPU 都会改变编号。
+NUMA（Non-Uniform Memory Access，非一致内存访问）节点表示处理器访问本节点内存通常比远端节点更直接。图中数字只是示意，不能假设“前一半 CPU 属于 Socket 0，后一半属于 Socket 1”。固件、内核、容器 cpuset 和离线 CPU 都会改变编号。
 
 Linux 上先查看：
 

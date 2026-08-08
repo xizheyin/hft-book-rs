@@ -2,7 +2,7 @@
 
 把大语言模型想成一个很聪明、但坐在空房间里的人。你问它问题，它能生成文字；可它没有钥匙、电话、日历，也不会自动记住上次关机前做到哪里。Harness 像工作台和操作规程：把任务交给它，准备上下文，允许它使用有限工具，记录每一步，在失败时重试或请人确认。
 
-因此 DeepSeek Agent Harness 官方 JD（职位说明）用了一个非常好记的式子：
+这组职责常被概括成：
 
 ```text
 Model + Harness = Agent
@@ -99,7 +99,7 @@ Prompt 不是聊天框里的一段“玄学咒语”，而是 Agent 的一个版
 - 模型版本和提示版本要进入审计记录；
 - 敏感信息进入模型前应经过授权与最小化处理。
 
-## 4. 模型网关：所有模型调用的 P0 控制点
+## 4. 模型网关：所有模型调用的共同控制点
 
 模型网关位于 Harness 与一个或多个模型服务之间。它像机场塔台：不替飞机完成任务，却统一决定请求去哪里、能否起飞、怎样计费，以及出故障时如何停下来。
 
@@ -213,7 +213,7 @@ stateDiagram-v2
 
 模型提供每一步的候选决策；真正保证“只改允许的目录、命令没越权、测试确实通过”的是 Harness 和沙箱。
 
-## 7. KV Cache 为什么会出现在 Harness JD
+## 7. Harness 为什么需要理解 KV Cache
 
 Transformer 生成新 token 时，需要使用先前 token 的注意力 Key/Value。KV Cache 保存这些中间结果，避免每生成一个 token 都重算完整前缀。
 
@@ -262,7 +262,7 @@ Harness 不应该绕过 Infra 直接获得宿主机权限；Infra 也不应假�
 
 主模型过载，网关把请求切到不支持严格工具 Schema 的备用模型。它返回看似合理但字段含义不同的动作，Harness 仍然执行。修复方法是版本化能力矩阵、上线前契约测试、按任务声明最低能力，并在不兼容时失败关闭。
 
-## 10. DeepSeek Agent Infra 面试怎么问
+## 10. 章末面试问题
 
 ### 典型问题
 
@@ -296,7 +296,6 @@ Harness 不应该绕过 Infra 直接获得宿主机权限；Infra 也不应假�
 
 ## 12. 一手资料
 
-- [DeepSeek：Agent Harness 团队招聘](https://app.mokahr.com/social-recruitment/high-flyer/140576#/job/8d40c764-d2b2-49b1-826c-e3f2adb75c01)
 - [ReAct：Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)
 - [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
 - [Anthropic：Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents)
