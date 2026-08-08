@@ -98,7 +98,7 @@ KV bytes ≈ 层数 × KV头数 × 每头维度 × 2(K和V)
 - MLA 学习 K/V 的联合低秩潜在表示，并处理位置相关部分；
 - KV Cache 量化用更少字节保存元素，但需验证质量和 Kernel 支持。
 
-这些方法共同降低缓存或读取压力，但模型结构和权重必须匹配。不能把一个普通 MHA 权重在服务配置中简单声明成 MLA。
+这些方法共同降低缓存或读取压力，但模型结构和权重必须匹配。不能把一个普通 MHA（Multi-Head Attention，多头注意力）权重在服务配置中简单声明成 MLA。
 
 Prefix Caching 还能复用多个请求共同的系统提示或文档前缀。缓存键必须包含模型、Tokenizer、Chat Template 和影响结果的配置；权限敏感前缀还要隔离租户，避免跨租户信息泄露。
 
@@ -210,7 +210,7 @@ TTFT = 排队 + Tokenize/预处理 + Prefill（含首 Token 计算与采样）+ 
 单请求 TPOT 却从 40ms 变成约 60ms
 ```
 
-因此系统要在吞吐、TTFT、TPOT、公平性和显存间取舍。关于通用批处理与背压，可复用 Rust/HFT 篇的[吞吐量优化：批处理、流水线与背压](../../rust-hft/infrastructure/throughput.html)，本章只讨论 LLM 特有的 Token 迭代调度。
+因此系统要在吞吐、TTFT、TPOT、公平性和显存间取舍。关于通用批处理与背压，可复用第一册的[吞吐量优化：批处理、流水线与背压](../../rust-hft/infrastructure/throughput.html)，本章只讨论 LLM 特有的 Token 迭代调度。
 
 ## 7. 为什么静态批处理浪费资源
 
@@ -281,7 +281,7 @@ Continuous Batching（连续批处理，也称迭代级调度）每轮重新组�
 
 状态转换必须幂等。例如客户端取消与 EOS 同时发生，只能释放一次缓存、只产生一个最终计费记录。
 
-## 12. 一条典型失败路径：KV OOM 雪崩
+## 12. 一条典型失败路径：KV OOM（显存耗尽）雪崩
 
 流量突然出现大量长 Prompt 和长输出：
 

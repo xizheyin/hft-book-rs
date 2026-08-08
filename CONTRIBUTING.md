@@ -6,12 +6,12 @@
 
 仓库使用同一套 mdBook 工具链，但内容分成两本可以独立阅读的书：
 
-- `books/rust-hft/`：Rust、C++ 与 HFT；章节放入 `books/rust-hft/src/`，目录维护在 `books/rust-hft/src/SUMMARY.md`。
-- `books/ai/`：AI；章节放入 `books/ai/src/`，目录维护在 `books/ai/src/SUMMARY.md`。
+- `books/rust-hft/`：共享计算机系统基础、Rust、C++ 与 HFT；章节放入 `books/rust-hft/src/`，目录维护在 `books/rust-hft/src/SUMMARY.md`。
+- `books/ai/`：AI 与 Agent Infra；章节放入 `books/ai/src/`，目录维护在 `books/ai/src/SUMMARY.md`。
 - `shared/theme/`：两本书共用的样式、交互和 `noindex` 页面头。
 - `portal/`：部署后的总入口，只负责把读者带到两本子书。
 
-不要把一本书的 Markdown 文件复制到另一本书。跨书引用应链接部署后的 HTML 页面，例如 AI 首页引用 Rust 生命周期章节时使用 `../rust-hft/rust_advanced/lifetimes.html`。
+通用的 CPU、Linux、内存、并发、网络、存储和性能概念只在第一册主讲。AI 书先用几句话说明本章需要哪项先修，再链接部署后的 HTML 页面，例如 `../rust-hft/foundations/virtual_memory.html`。只有 Agent 平台新增的语义才留在 AI 书，不要复制出第二套定义。
 
 ## 一章的推荐结构
 
@@ -34,6 +34,8 @@
 ## 练习与参考答案
 ## 小结
 ```
+
+首次引入术语时，连续回答三件事：它是什么；本章为什么现在需要它；它会影响哪一个选择、故障或面试问题。若一个名词后文既不用来推理，也不会成为目标岗位的常见追问，就删除它，不要仅为了显得完整而列出。实现函数名、设备字段、产品参数和版本细节只有在解释主线不可替代时才出现；否则改为一手资料链接，等实际项目需要时再查。
 
 ## 系统基础章节的深挖标准
 

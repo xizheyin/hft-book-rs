@@ -2,9 +2,11 @@
 
 > 难度：必会。官方职责包含大规模 VM 集群、应用层调度、节点自动上下线和稳定运行。
 
-> 先修桥梁：本章默认你已理解[进程调度](../systems/process_threads_syscalls.md)、[并发与取消](../systems/concurrency_async_io.md)以及[分布式部分失败](../systems/distributed_foundations.md)。
+> 先修桥梁：通用进程与调度先读第一册的[进程、线程与文件描述符](../../rust-hft/foundations/processes_fds.html)；本章还会使用[Agent 并发与取消](../systems/concurrency_async_io.md)以及[分布式部分失败](../systems/distributed_foundations.md)。
 
 调度器不是“找一台 CPU 还空着的机器”。它像机场塔台：要检查机型与跑道是否兼容，安排时隙，处理取消与迫降，还要防止某家航空公司占满所有资源。
+
+先认四组词：**workload class** 是按时长、资源形状和优先级把任务分组；request/limit/usage 分别是“调度时预留多少、运行时最多允许多少、实际用了多少”；**lease（租约）**是有期限的执行权，**epoch** 是每次重新授权递增的代数，**fencing** 是资源端拒绝旧代写入；**oversubscription（超卖）**则是承诺出去的资源多于同时可提供的物理资源。OOM 表示可用内存无法满足需求，系统或 cgroup 必须回收或终止任务。它们解决的是多租户平台中的放置、公平和旧 worker 复活问题，而不是为了给调度算法堆名词。
 
 ## 1. 先定义生命周期
 
@@ -46,7 +48,7 @@ stateDiagram-v2
 
 ## 3. 一个容量算例
 
-有 100 台节点，每台可分配 64 vCPU 和 256 GiB。预留 10% 给系统后，总预算约为：
+下面所有数字都是容量练习假设，不是 DSec 产品参数。有 100 台节点，每台可分配 64 vCPU 和 256 GiB。预留 10% 给系统后，总预算约为：
 
 ```text
 CPU = 100 × 64 × 0.9 = 5,760 vCPU

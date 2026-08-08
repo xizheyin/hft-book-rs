@@ -4,7 +4,7 @@
 
 > 事实边界：本章只解释 Linux KVM（Kernel-based Virtual Machine，内核虚拟机接口）、QEMU、virtio、gVisor 与 Firecracker 等公开机制。DeepSeek/DSec 是否使用这些组件、如何定制、性能数据和线上参数均未知；面试时应把它们说成“通用机制或可选方案”，不能包装成对内部实现的了解。
 
-> 先修桥梁：先用[程序执行](../systems/computer_execution.md)、[进程与系统调用](../systems/process_threads_syscalls.md)和[虚拟内存](../systems/virtual_memory.md)理解“共享内核”和“独立地址空间”，再读本章。
+> 先修桥梁：先用第一册的[程序执行](../../rust-hft/foundations/computer_execution.html)、[进程与文件描述符](../../rust-hft/foundations/processes_fds.html)和[虚拟内存](../../rust-hft/foundations/virtual_memory.html)理解“共享内核”和“独立地址空间”，再读本章。
 
 ## 本章 P0/P1 地图
 
@@ -78,7 +78,7 @@ VM exit
     └─ 需 VMM 处理 ─────────► KVM_RUN 返回用户态 ─► VMM 模拟/处理 ─► 再调用 KVM_RUN
 ```
 
-`VM entry` 是 CPU 从宿主执行环境进入 guest；`VM exit` 是 CPU 因某个受配置控制的事件返回虚拟化层。例如某些控制寄存器操作、MMIO/PIO、停机、异常或中断可能触发退出。具体哪些事件退出、由哪一层处理，取决于架构和配置。
+`VM entry` 是 CPU 从宿主执行环境进入 guest；`VM exit` 是 CPU 因某个受配置控制的事件返回虚拟化层。例如 guest 执行需要虚拟化层处理的敏感操作、访问模拟设备、停机，或遇到异常与中断时，都可能触发退出。具体哪些事件退出、由哪一层处理，取决于架构和配置；基础面试不需要背事件编号。
 
 有两个高频陷阱：
 
@@ -126,7 +126,7 @@ guest 不能直接假设自己独占宿主的网卡和 NVMe。VMM 必须给它�
 |---|---|---|---|
 | 设备模拟 | 一块已知的真实/传统设备 | 旧 OS 可用原生驱动，兼容性强 | 寄存器访问和设备行为模拟较重，可能产生较多退出 |
 | virtio 半虚拟化 | 标准化的虚拟设备 | guest 与 VMM 都知道是虚拟环境，可批量交换请求，通常更高效 | guest 需要 virtio 驱动；性能仍取决于 backend、拷贝、批处理和通知 |
-| 设备直通 | guest 直接管理物理功能或虚拟功能 | 可减少设备模型参与，性能潜力高 | 需要 IOMMU 等隔离，迁移、共享、重置和运维更复杂 |
+| 设备直通 | guest 直接管理物理功能或虚拟功能 | 可减少设备模型参与，性能潜力高 | 需要 IOMMU（限制设备 DMA 可访问哪些内存的地址翻译与隔离单元）等隔离，迁移、共享、重置和运维更复杂 |
 
 “半虚拟化”不是“半台虚拟机”，而是 guest 驱动主动遵守为虚拟环境设计的接口。virtio 是 OASIS 标准；QEMU 可以在用户态提供 backend，也可配合内核 vhost 或外部 vhost-user backend。
 
@@ -193,7 +193,7 @@ guest 应用
 
 gVisor 通过 Sentry 在用户态实现 Linux 风格的系统接口，让大量系统调用不直接进入宿主内核；`runsc` 又保持 OCI 运行时接口。它不等同于 VM，也不只是 syscall allowlist。
 
-代价是兼容性与性能需按负载验证。gVisor 官方生产指南明确提醒文件 I/O 和网络往往受影响较大。编译、包管理、海量小文件和频繁联网正是常见 Agent 负载，因此必须用真实任务测试，而不能只跑一个 CPU microbenchmark。
+代价是兼容性与性能需按负载验证。gVisor 官方生产指南明确提醒文件 I/O 和网络往往受影响较大。编译、包管理、海量小文件和频繁联网正是常见 Agent 负载，因此必须用真实任务测试，而不能只跑一个只隔离单项操作的 CPU microbenchmark（微基准）。
 
 ## 6. 选型不是“谁绝对更安全”的排行榜
 
@@ -254,7 +254,7 @@ KVM 的 dirty log 可为 guest memory slot 返回 bitmap，通常每个 guest pa
 
 - dirty bitmap 不说明页里的数据在业务上是否有效。
 - 它不让内存与磁盘自动落在同一时刻。
-- 设备 DMA 是否完整计入脏页跟踪，要看 IOMMU、设备和迁移实现。
+- 设备 DMA（设备绕过 CPU 逐字节搬运而直接读写内存）是否完整计入脏页跟踪，要看 IOMMU、设备和迁移实现。
 - 它也不替代 vCPU、虚拟中断和 virtqueue 状态的保存。
 
 因此，“有 dirty tracking，所以快照一致”是错误答案。

@@ -47,6 +47,8 @@
 目标：Agent  调用  工具 <EOS>
 ```
 
+`<BOS>` 与 `<EOS>` 分别表示序列开始和结束的特殊 Token。
+
 每个位置预测后一个 Token，Loss 是各位置交叉熵的平均或加权组合。
 
 ### 一个数字例子
@@ -91,7 +93,7 @@ flowchart LR
     P["Prompt"] --> S["SFT 模型采样多个回答"]
     S --> H["人类排序"]
     H --> R["训练 Reward Model"]
-    R --> RL["用近端策略优化（PPO）等方法更新策略"]
+    R --> RL["用近端策略优化（Proximal Policy Optimization，PPO）等方法更新策略"]
     RL --> E["独立评测"]
 ```
 
@@ -106,7 +108,7 @@ InstructGPT 是这一流程的代表案例。Reward Model 学的是标注分布�
 但若只追最高奖励，模型可能为了得分偏离原有语言能力。常见做法包括：
 
 - 限制新旧策略概率比的变化；
-- 加入与参考模型的 KL 惩罚；
+- 加入与参考模型的 KL divergence（衡量两个概率分布差异）惩罚；
 - 混合通用任务，减少能力遗忘；
 - 独立监控长度、语言、格式和安全回归。
 
@@ -299,7 +301,7 @@ flowchart LR
 3. **P2**：一个 `2048×2048` 权重用秩 8 的 LoRA，需要多少低秩参数？
 4. **P2**：LoRA 与蒸馏分别解决什么问题？
 5. 为什么 1B 参数的 2GB 权重文件不能代表训练只需 2GB？
-6. Data、Tensor、Pipeline 和 Expert Parallel 各切分什么？
+6. **P2**：Data、Tensor、Pipeline 和 Expert Parallel 各切分什么？
 
 ## 15. 本章速记
 

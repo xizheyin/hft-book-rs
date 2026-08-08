@@ -1,6 +1,6 @@
 # Summary
 
-- [首页：Rust、C++ 与 HFT 基础宝典](README.md)
+- [首页：系统、Rust、C++ 与 HFT 基础宝典](README.md)
 - [前言：这本书解决什么问题](introduction/README.md)
 - [如何使用本书：从零基础到面试表达](introduction/how_to_use.md)
 - [为什么选择 Rust 构建低延迟系统](introduction/why_rust.md)
@@ -15,19 +15,26 @@
 - [HFT 系统设计面试](hft/system_design_interview.md)
 - [HFT 高频面试题库](hft/interview_question_bank.md)
 
-# 第二部分：系统基础与性能模型
+# 第二部分：从零认识计算机系统
 
 - [部分导论](foundations/README.md)
-- [CPU 微架构原理](foundations/cpu_arch.md)
+- [一次程序怎样在计算机里运行](foundations/computer_execution.md)
+- [进程、线程与文件描述符](foundations/processes_fds.md)
+- [虚拟内存：程序为什么看见自己的地址空间](foundations/virtual_memory.md)
 - [操作系统原理回顾](foundations/os_internals.md)
+- [一次 write 到底做了什么](foundations/file_write_path.md)
+- [CPU 微架构原理](foundations/cpu_arch.md)
 - [内存布局与缓存效率](foundations/memory_layout.md)
+
+# 第三部分：Rust 性能模型与并发
+
 - [零成本抽象](foundations/zero_cost.md)
 - [编译器优化与底层原理](foundations/compiler_optimizations.md)
 - [Unsafe Rust 实战：SIMD 与 Intrinsics](foundations/unsafe_rust.md)
 - [并发模型选择：Async vs Thread vs Actor](foundations/concurrency.md)
 - [Async Rust 原理与 Tokio](foundations/async_rust.md)
 
-# 第三部分：Rust 语义与抽象成本
+# 第四部分：Rust 语义与抽象成本
 
 - [部分导论](rust_advanced/README.md)
 - [所有权与生命周期进阶](rust_advanced/lifetimes.md)
@@ -39,7 +46,7 @@
 - [宏编程实战](rust_advanced/macros.md)
 - [闭包与函数指针](rust_advanced/closures.md)
 
-# 第四部分：现代 C++ 与低延迟开发
+# 第五部分：现代 C++ 与低延迟开发
 
 - [部分导论：从零认识现代 C++](cpp/README.md)
 - [C++ 基础复习：重新找回手感](cpp/basics_refresher.md)
@@ -60,7 +67,7 @@
 - [编译优化、基准与诊断工具](cpp/optimization_tooling.md)
 - [C++ HFT 贯穿项目](cpp/hft_capstone.md)
 
-# 第五部分：算法笔试与面试编码
+# 第六部分：算法笔试与面试编码
 
 - [部分导论：从思路到 C++20](algorithms/README.md)
 - [从题目到算法：一套固定解题流程](algorithms/problem_solving.md)
@@ -85,7 +92,7 @@
 - [算法模式覆盖矩阵](algorithms/coverage_matrix.md)
 - [8 周、28 天与 14 天训练计划](algorithms/study_plan.md)
 
-# 第六部分：吞吐量、并发与基础设施
+# 第七部分：吞吐量、并发与基础设施
 
 - [部分导论](infrastructure/README.md)
 - [原子操作详解](infrastructure/atomics.md)
@@ -99,7 +106,7 @@
 - [配置热更新：一致快照、审计与回滚](infrastructure/config.md)
 - [指标监控与遥测](infrastructure/metrics.md)
 
-# 第七部分：网络与高性能 I/O
+# 第八部分：网络与高性能 I/O
 
 - [部分导论](network/README.md)
 - [网络基础：消息如何从网线走进程序](network/basics.md)
@@ -113,7 +120,7 @@
   - [Solarflare OpenOnload](network/openonload.md)
 - [Linux 网络调优](network/tuning.md)
 
-# 第八部分：行情、协议与订单接入
+# 第九部分：行情、协议与订单接入
 
 - [电子市场协议概览](connectivity/protocols.md)
   - [FIX 协议解析](connectivity/fix.md)
@@ -123,7 +130,7 @@
   - [增量更新、快照与恢复](connectivity/incremental_updates.md)
 - [订单路由系统](connectivity/order_routing.md)
 
-# 第九部分：交易引擎、风控与策略
+# 第十部分：交易引擎、风控与策略
 
 - [订单簿管理](engine/order_book.md)
 - [风控系统](engine/risk.md)
@@ -133,7 +140,7 @@
   - [信号生成](engine/signals.md)
   - [执行算法](engine/execution.md)
 
-# 第十部分：性能工程、测试与仿真
+# 第十一部分：性能工程、测试与仿真
 
 - [基准测试](optimization/benchmarking.md)
 - [性能分析](optimization/profiling.md)

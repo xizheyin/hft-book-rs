@@ -1,6 +1,6 @@
 # 学习计划：28 天零基础、14 天/7 天冲刺与最后 24 小时
 
-面试准备最容易出现两种错觉：看过等于会了，答案很长等于答得好。真正有效的训练必须产生可以检查的输出：30 秒答案、白板图、容量计算、故障处理、STAR 录音和错题修订。
+面试准备最容易出现两种错觉：看过等于会了，答案很长等于答得好。真正有效的训练必须产生可以检查的输出：30 秒答案、白板图、容量计算、故障处理、STAR（情境、任务、行动、结果）录音和错题修订。
 
 本章给四套节奏。零基础且有四周时用 28 天完整版；已经学过 OS 与网络时用 14 天冲刺版；只剩一周就用 7 天版；最后 24 小时只做收敛，不再打开新主题。每一天都遵循一个小循环：
 
@@ -20,7 +20,7 @@
 - **Agent 20%**：只补理解沙箱上层负载所需的模型、工具、状态、评测和安全执行。
 - **简历 20%**：HFT、rustc/Buck2、Crates-Pro 与三篇重点论文的证据核验。
 
-每天固定保留 60-90 分钟实操。推荐在 Linux VM 或容器环境进行；没有 root 权限时，选择不要求提权的 Rust 编码、`strace`、`perf`、`ss` 和文件 I/O，不把“命令看过”算完成。旧 epoch、节点排空、数据库断连、网络分区等破坏性场景，若没有完整的隔离、资源上限和清理脚手架，就只做纸上状态机或伪代码推演。
+每天固定保留 60-90 分钟实操。推荐在 Linux VM 或容器环境进行；没有 root 权限时，可选择 Rust 编码，以及观察系统调用的 `strace`、采样 CPU 热点的 `perf`、查看 socket 状态的 `ss` 和文件 I/O，不把“命令看过”算完成。旧 epoch、节点排空、数据库断连、网络分区等破坏性场景，若没有完整的隔离、资源上限和清理脚手架，就只做纸上状态机或伪代码推演。
 
 ## 2. 开始前先建立四份卡片
 
@@ -63,11 +63,11 @@
 
 | 层级 | 目标 | 这本书里的重点 | 达标标准 |
 |---|---|---|---|
-| **P0：最高优先** | 不在第一轮系统追问中断链 | 八章系统地基；Runtime/Platform 核心，包括文件、隔离、VM、存储、网络、调度、控制面、分布式核心、观测、容量、可靠性与安全边界；Agent loop、工具权限和持久执行 | 能在 30 秒给结论、2 分钟画机制，并说出一个失败证据 |
+| **P0：最高优先** | 不在第一轮系统追问中断链 | 第一册的共享系统主线；本书的 Agent 增量与 Runtime/Platform 核心，包括隔离、VM、存储、网络、调度、控制面、恢复、观测、容量、可靠性与安全边界 | 能在 30 秒给结论、2 分钟画机制，并说出一个失败证据 |
 | **P1：连续深挖** | 支撑系统设计取舍 | 数学与神经网络积木、GPU 与推理取舍、DeepSeek 公开架构、训练阶段、评测、检索、多 Agent，以及分布式、观测、容量和安全的进阶机制 | 能比较两个方案，写出假设并做一个数量级计算 |
 | **P2：边界扩展** | 面对开放题不慌 | 高级训练/推理实现、特定算法与产品细节、研究方法、高级治理及跨 Rust/HFT 迁移 | 能说明适用边界、未知项和怎样继续验证 |
 
-使用方法很简单：先闭卷做题，不会的 P0 立即回章节；P1 在 P0 达标后补；P2 只有在简历或面试方向真的会触发时再展开。不要按页数平均用力。
+使用方法很简单：P0 表示岗位相关题池，不表示必须在冲刺期把所有 P0 逐题背完。先闭卷通过题库的 28 道技术红线，再按第 3.2 节从其余 P0 做两轮不重复抽测；错题立即回章节。P1 在这套门槛达标后补；P2 只有在简历或面试方向真的会触发时再展开。不要按页数平均用力。
 
 ### 3.1 全书优先级与 28 天中央矩阵
 
@@ -76,7 +76,7 @@
 | 主题 | 全局优先级 | 对应题号 | 28 天日期 |
 |---|---|---|---|
 | 程序执行、进程与虚拟内存 | P0；NUMA、深层调度证据为 P1 | 7-8、20、81-90 | 1-3、19 |
-| 并发、取消与异步 I/O | P0；内存序、futex、io_uring 细节为 P1 | 47、57、91-96 | 4、20-22 |
+| 并发、取消与异步 I/O | 竞态、取消、deadline 和背压为 P0；内存序、futex、io_uring 实现为第一册 P1/P2 | 47、57、91-96 | 4、20-22 |
 | 网络、RPC 与虚拟网络 | P0；overlay/eBPF 深层实现为 P1 | 24、39、54、97-100 | 5、21 |
 | 文件系统、数据库与沙箱存储 | P0；存储引擎高级实现为 P1 | 4-6、21、23、37、45、51、101-103 | 6、18、20 |
 | 分布式核心、控制面与恢复 | **P0**；跨地域、复杂分片与协议实现为 P1/P2 | 11-14、18、38、46、48-50、53、57、68、104-105 | 7、21-22 |
@@ -100,20 +100,20 @@
 
 ## 4. 28 天零基础完整版
 
-每天建议 3-4 小时：系统地基 8 天，AI/LLM 5 天，Agent 4 天，Runtime/Platform 8 天，事实与模拟 3 天。前六部分的主体知识顺序与 `SUMMARY` 一致；面试实战部分会按训练依赖重排，先整合系统设计，再验收事实和题库。表中写出的“小节”就是当天核心输入；时间不够时先完成这些小节和产出，不打开未列出的 P1/P2。
+每天建议 3-4 小时：共享系统先修与 Agent 增量 8 天，AI/LLM 5 天，Agent 4 天，Runtime/Platform 8 天，事实与模拟 3 天。前六部分的主体知识顺序与 `SUMMARY` 一致；面试实战部分会按训练依赖重排，先整合系统设计，再验收事实和题库。跨书链接不是额外作业，只用于补当天明确列出的前置概念；当天产出达标就停止，不继续追逐 P1/P2 名词。
 
 实验只应在自己的 Linux VM、容器或测试环境运行。旧 epoch、节点排空、数据库断连、网络分区等实验，默认使用**纸上状态机或伪代码**；只有书中给出完整、可清理、有资源上限的安全脚手架时才真实运行，不在生产机或共享宿主制造故障。
 
 | 天 | 核心输入：只读这些 | 当天必须交付的东西 |
 |---:|---|---|
-| 1 | [岗位地图](../orientation/role_map.md) §2-4、[候选人策略](../orientation/candidate_strategy.md) §1-2，以及[程序执行](../systems/computer_execution.md)的 P0 主链（§1-4、§8、§11-13） | 程序执行全链路图；30 秒岗位定位 |
-| 2 | [进程、线程与系统调用](../systems/process_threads_syscalls.md) §1-13；调度策略名只理解作用，不背参数 | 用 `strace` 观察小程序；资源共享表和进程树 |
-| 3 | [虚拟内存](../systems/virtual_memory.md)的 P0 小节 §1-15 | 地址翻译图；区分 minor/major fault、页缓存和 OOM |
-| 4 | [并发与异步 I/O](../systems/concurrency_async_io.md) §1-4、§7、§11-17；§5-10 的内存序/futex/io_uring 只做 P1 预览 | 有界并发小程序；竞态、背压与取消传播图 |
-| 5 | [网络与 RPC](../systems/network_rpc.md)的 P0 小节 §1-12；具体产品与 eBPF 暂缓 | 用 `ip`/`ss`/`curl` 观察测试连接；RPC 往返图 |
-| 6 | [文件系统与数据库](../systems/filesystem_database.md) §1-16；Direct I/O 和 compaction 深挖暂缓 | 文件写入与数据库提交两条路径；标出持久化点 |
-| 7 | [分布式系统地基](../systems/distributed_foundations.md) §1-9、§11-16；复杂分片只读结论 | leader 切换时间线；解释 lease 为何不能替代 fencing |
-| 8 | [性能与跨层诊断](../systems/performance_diagnostics.md)的 P0 小节 §1-10、§12-16；§11 只掌握 `ss` 的用途 | 两道容量题；“现象→假设→证据→动作”排障表 |
+| 1 | [岗位地图](../orientation/role_map.md) §2-4、[候选人策略](../orientation/candidate_strategy.md) §1-2，以及第一册的[程序执行总览](../../rust-hft/foundations/computer_execution.html) | 程序执行全链路图；30 秒岗位定位 |
+| 2 | 第一册的[进程、线程与文件描述符](../../rust-hft/foundations/processes_fds.html) P0 主线，再读[Agent 沙箱命令执行](../systems/process_threads_syscalls.md) | 用 `strace` 观察小程序；资源共享表和进程树 |
+| 3 | 第一册的[虚拟内存](../../rust-hft/foundations/virtual_memory.html) P0 主线，再读[Agent 内存隔离与容量](../systems/virtual_memory.md) | 地址翻译图；区分缺页、工作集和 OOM |
+| 4 | 第一册的[并发模型](../../rust-hft/foundations/concurrency.html)与[I/O 模型](../../rust-hft/network/io_models.html)只读概念主线，再读[Agent 并发协议](../systems/concurrency_async_io.md) | 有界并发小程序；竞态、背压与取消传播图 |
+| 5 | 第一册的[网络基础](../../rust-hft/network/basics.html)，再读[Agent RPC 与工具网络](../systems/network_rpc.md)；具体产品暂缓 | 用 `ip`/`ss`/`curl` 观察测试连接；RPC 往返图 |
+| 6 | 第一册的[一次文件写入](../../rust-hft/foundations/file_write_path.html) P0 主线，再读[数据库与可恢复状态](../systems/filesystem_database.md) | 文件写入与数据库提交两条路径；标出持久化点 |
+| 7 | [分布式控制面的基础取舍](../systems/distributed_foundations.md)；复杂共识证明和分片实现暂缓 | leader 切换时间线；解释 lease 为何不能替代 fencing |
+| 8 | 第一册的[指标](../../rust-hft/infrastructure/metrics.html)与[性能分析](../../rust-hft/optimization/profiling.html)只读主线，再读[Agent 容量与诊断](../systems/performance_diagnostics.md) | 两道容量题；“现象→假设→证据→动作”排障表 |
 | 9 | [AI/ML/LLM](../foundations/ai_ml_llm.md) §1-9；[数学与学习](../foundations/math_and_learning.md) §1-7、§9-10 | 训练/推理边界图；手算一次 softmax、Loss 与梯度更新 |
 | 10 | [数据与泛化](../foundations/data_and_generalization.md) §1-10；[神经网络积木](../foundations/neural_network_blocks.md) §1-8、§10-12 | 时间泄漏反例；跟踪小网络形状、参数量和残差路径 |
 | 11 | [Transformer](../llm/transformer.md) §1-12；[生成与采样](../llm/generation.md) §1-8、§10-12，可复现性深挖暂缓 | 手算一次注意力；Decoder block 与生成循环图 |
@@ -123,7 +123,7 @@
 | 15 | [Context 与 Memory](../agent/context_and_memory.md) §1-10；[Reasoning 与 Planning](../agent/reasoning_and_planning.md) §1-10 | 上下文预算表；可版本化的重规划状态机 |
 | 16 | [Subagent 与 Multi-Agent](../agent/subagent_multiagent.md) §1-10；[持久执行](../agent/durable_execution.md) §1-11 | 多 Agent 消息/权限边界；可恢复任务状态机 |
 | 17 | [Agent 评测](../agent/evaluation_and_rl.md) §1-16，§11 只掌握 rollout/奖励/成本三本 Infra 账；[RAG](../agent/retrieval.md) §1-11、§13-15，§7 只掌握 HNSW/IVF/PQ 三个直觉；RL 算法定义回看训练章，Agentic Retrieval §12 暂缓 | `PASS/FAIL/INCONCLUSIVE` verifier；校准/消融卡；召回→索引→重排→上下文失败归因图 |
-| 18 | [文件写入](../systems/file_write_path.md) §1-8；[沙箱威胁模型](../runtime/sandbox_threat_model.md) §1-8 | 原子替换安全实验；资产、攻击者、信任边界和剩余风险表 |
+| 18 | 第一册的[一次 `write` 完整路径](../../rust-hft/foundations/file_write_path.html) P0 主线；[沙箱威胁模型](../runtime/sandbox_threat_model.md) §1-8 | 原子替换安全实验；资产、攻击者、信任边界和剩余风险表 |
 | 19 | [容器、用户态内核与 microVM](../runtime/containers_and_vms.md)只读 §1-2、§5-7、§9-12；两阶段翻译和设备中断为 P1 | 隔离决策矩阵；快照恢复必须刷新状态的清单 |
 | 20 | [生命周期与调度](../runtime/lifecycle_and_scheduling.md) §1-10；[沙箱存储](../runtime/storage.md) §1-10 | **纸上状态机/伪代码**：节点排空；旧 epoch 写共享卷被拒绝 |
 | 21 | [虚拟网络](../runtime/virtual_network.md) §1-10；[控制面与数据面](../runtime/control_plane.md) §1-10 | 单机/跨机网络图；**伪代码**模拟数据库断连、重复消息和旧 worker |
@@ -152,7 +152,7 @@
 
 ### 第 2 天：文件写入与 I/O 排障
 
-- 学[一次文件写入](../systems/file_write_path.md)：`write`、页缓存、writeback、块层、`fsync` 和目录持久化。
+- 学第一册的[一次文件写入](../../rust-hft/foundations/file_write_path.html)：`write`、页缓存、writeback（后台回写）、块层、`fsync` 和目录持久化。
 - **实操 60-90 分钟**：在 Linux 上写小型 Rust 程序比较 buffered write、批量写和 `sync_all`；用 `strace` 核对 syscall，记录口径而非追求漂亮数字。
 - 演练题库 4-6、22、45。
 - 输出：写入全链路图和一张 I/O p99 排障表。

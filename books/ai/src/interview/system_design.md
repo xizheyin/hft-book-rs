@@ -16,7 +16,9 @@
 
 所以 DSec 不是一个聊天页面，而是一个**不可信任务执行平台**。模型给出意图；策略系统决定是否允许；沙箱执行动作；状态机记录进度；验证器检查结果；人类在高风险边界作最终决定。
 
-如果上面一串名词还像“组件拼盘”，先用系统地基补因果链：从[一次程序怎样跑起来](../systems/computer_execution.md)开始，再读[进程与系统调用](../systems/process_threads_syscalls.md)、[网络与 RPC](../systems/network_rpc.md)、[文件系统与数据库](../systems/filesystem_database.md)和[分布式系统地基](../systems/distributed_foundations.md)。白板中的每条箭头都应能继续下钻到线程、内存、协议、持久化或共识，而不是停在产品名。
+如果上面一串名词还像“组件拼盘”，先从第一册的[一次程序怎样跑起来](../../rust-hft/foundations/computer_execution.html)补通用因果链，再读本书的[沙箱命令执行](../systems/process_threads_syscalls.md)、[Agent RPC](../systems/network_rpc.md)、[可恢复状态](../systems/filesystem_database.md)和[分布式控制面](../systems/distributed_foundations.md)。白板中的每条箭头都应能继续下钻到线程、内存、协议、持久化或共识，而不是停在产品名。
+
+先认四个角色：**控制面**保存期望状态并做授权、调度，**数据面**真正运行模型、工具和沙箱；**Tool Proxy** 是执行工具前的确定性权限检查点；**verifier** 是独立检查产物是否满足测试或策略的程序。`attempt` 表示一次执行尝试，`fencing epoch` 是接管时递增、用于拒绝旧 worker 的代数，`logical_effect_id` 是跨重试保持稳定的副作用身份。面试官考的不是这些英文，而是你能否解释重复、取消、失联和越权时谁负责收口。
 
 ### 1.1 这是一份参考答案，不是逐字背诵稿
 
@@ -79,7 +81,7 @@
 
 ### 3.5 练习 SLO
 
-以下数字只为完成白板推导：
+SLO（Service Level Objective，服务目标）是团队承诺努力达到的可测指标。以下数字只为完成白板推导：
 
 - 控制面 API 月可用性目标 99.9%。
 - 99% 的已接受任务在 2 秒内进入持久队列。
@@ -170,7 +172,12 @@
 - 轨迹和产物保留策略是核心成本问题，不是上线后的清理工作。
 - 队列等待时间、模型等待时间和工具执行时间必须分开观测。
 
+<details>
+<summary><strong>P1 连续追问：完整 API、字段与执行信封示例</strong></summary>
+
 ## 5. API 设计
+
+先抓住四条 API 语义，再看字段：创建是异步的；重复创建用与租户绑定的幂等键去重；取消和审批也要有状态版本；具体 attempt 可以变化，但同一个外部副作用必须复用稳定身份并先查询结果。下面的路径、字段名、配额和 policy 名全部是教学示例，不是产品接口。
 
 ### 5.1 创建任务
 
@@ -272,6 +279,8 @@ POST /v1/jobs/{job_id}:replay
 
 Tool Proxy 验证 capability 的 audience、tenant、job、tool、resource、epoch、expiry 和一次性 nonce。使用 `argv` 数组而不是拼接 shell 字符串，可以减少转义和注入风险，但仍需检查命令、路径、环境、网络和子进程。
 
+</details>
+
 ## 6. 总体架构
 
 ```mermaid
@@ -298,7 +307,7 @@ flowchart LR
     end
 
     subgraph ST["存储与观测"]
-        O[("Object / CAS Store")]
+        O[("Object / CAS Store<br/>按内容哈希寻址")]
         C[("Repository & Dependency Cache")]
         EV[("State Event Stream")]
         AU[("Append-only Audit Store")]
@@ -396,7 +405,10 @@ stateDiagram-v2
 
 ### 7.1 单写者与租约
 
-同一 attempt 只允许一个 worker 推进状态。Scheduler 每次分配都在数据库事务中递增单调 `fencing_epoch`，并发放带过期时间的租约；worker 定期续租。状态提交同时检查版本、epoch、取消代数和数据库看到的租约有效期：
+同一 attempt 只允许一个 worker 推进状态。Scheduler 每次分配都在数据库事务中递增单调 `fencing_epoch`，并发放带过期时间的租约；worker 定期续租。状态提交同时检查版本、epoch、取消代数和数据库看到的租约有效期。P0 要理解这些条件为什么缺一不可；具体 SQL 属于 P2 实现草图：
+
+<details>
+<summary><strong>P2 实现草图：条件更新 SQL</strong></summary>
 
 ```text
 UPDATE job
@@ -408,6 +420,8 @@ WHERE job_id = ?
   AND cancellation_epoch = ?
   AND lease_expires_at > database_now()
 ```
+
+</details>
 
 只检查 `lease_owner` 不够：租约过期后、接管前，旧 worker 仍可能写。数据库、Tool Proxy、卷服务与结果服务都记录已经见过的最高 fencing epoch，拒绝更小 epoch；租约过期后也拒绝当前 epoch。取消先递增 `cancellation_epoch`，使排队中和在途的旧能力立即失效，再终止进程组和清理资源。单靠数据库锁仍挡不住已经发往外部系统的副作用。
 

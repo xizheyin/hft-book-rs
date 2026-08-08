@@ -2,9 +2,11 @@
 
 > 难度：必会。官方 JD 要求熟练使用压测与可观测工具，定位跨多个系统层级的复杂问题。
 
-本章不再重复 Little 定律、分位数、开环/闭环模型和 Linux 性能工具的基础定义。第一次接触这些概念，请先读[性能与跨层诊断](../systems/performance_diagnostics.md)。这里专门讨论它们在 Agent Infra 中怎样落地：一个平台如何同时接住交互请求、代码沙箱、长任务和批量评测，并在过载时保持可控。
+本章不再重复通用的吞吐、分位数、压测和 Linux 性能工具。第一次接触这些概念，先读第一册的[吞吐量与背压](../../rust-hft/infrastructure/throughput.html)、[指标系统](../../rust-hft/infrastructure/metrics.html)和[性能分析](../../rust-hft/optimization/profiling.html)；再用[Agent 容量与跨层诊断](../systems/performance_diagnostics.md)理解资源向量、准入和重试放大。这里专门讨论它们怎样落到 Agent 平台的压测与容量规划。
 
 可以把平台想成机场。CPU 和内存像跑道，镜像与仓库数据像行李，沙箱启动槽位像登机口，外部模型和 API 又像其他机场。只统计“有多少架飞机”远远不够；任何一处先塞住，都会让总队列增长。
+
+先认三个量：**workload class** 是资源行为相近的一组任务，**resource vector（资源向量）**是一个任务同时需要的 CPU、内存、GPU、磁盘、网络和外部配额，**capacity planning（容量规划）**是用到达率、占用时间和这些资源分布判断系统何时会排队或拒绝。`task` 是用户目标，`attempt` 是一次执行尝试，`sandbox` 是承载尝试的环境，runtime class 表示它采用哪类隔离或硬件环境，trace 则记录一次请求各阶段的时间线；下文会分别计数。P0 是分类、容量表、准入/队列、冷启动、长任务和过载恢复；gang scheduling（相关资源要成组同时获得，否则整组等待）、复杂故障注入矩阵等术语只需在相应追问时理解作用，不背产品参数。
 
 ## 1. 先把任务分成 workload class
 
@@ -48,7 +50,7 @@ accepted tasks -> queued attempts -> starting sandboxes -> running attempts
 
 ## 3. 用资源向量做容量表
 
-先把统计对象说清楚。假设在一个队列不再持续增长的稳态窗口中：
+先把统计对象说清楚。下面全部是为了演示计算关系而构造的教学数字，不是任何平台的流量或配额。假设在一个队列不再持续增长的稳态窗口中：
 
 - 平台平均接收 `500 tasks/s`，逻辑 task 的平均端到端停留时间为 `50 s`，p95 为 `180 s`；
 - 重试后平均启动 `550 attempts/s`，每个运行中 attempt **固定**占 `2 vCPU`、`3 GiB`，平均实际运行 `40 s`；

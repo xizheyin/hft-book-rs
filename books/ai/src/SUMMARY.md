@@ -1,20 +1,19 @@
 # Summary
 
-- [首页：DeepSeek AI Agent Infra 面试宝典](README.md)
+- [首页：AI 与 Agent Infra 面试宝典](README.md)
 - [官方岗位要求与知识边界](orientation/role_map.md)
 - [候选人能力矩阵与面试定位](orientation/candidate_strategy.md)
 
-# 第一部分：操作系统与计算机系统地基
+# 第一部分：共享系统先修与 Agent Infra 增量
 
-- [一次程序怎样跑起来：CPU、内存、内核与设备](systems/computer_execution.md)
-- [进程、线程、系统调用与调度](systems/process_threads_syscalls.md)
-- [虚拟内存：页表、TLB、缺页、COW 与 OOM](systems/virtual_memory.md)
-- [并发与异步 I/O：锁、原子、内存序、epoll 与 Tokio](systems/concurrency_async_io.md)
-- [网络与 RPC：从网卡、TCP、DNS、TLS 到 gRPC](systems/network_rpc.md)
-- [文件系统与数据库：inode、日志、WAL、事务与缓存](systems/filesystem_database.md)
-- [一次文件写入：从 write 到真正落盘](systems/file_write_path.md)
-- [分布式系统地基：时间、一致性、复制、共识与分区](systems/distributed_foundations.md)
-- [性能诊断：排队、尾延迟、profiling 与跨层证据](systems/performance_diagnostics.md)
+- [先修导航：系统基础在哪里学](systems/README.md)
+- [Agent 沙箱怎样安全执行命令](systems/process_threads_syscalls.md)
+- [Agent 内存隔离与容量](systems/virtual_memory.md)
+- [Agent 并发协议：领取、取消与背压](systems/concurrency_async_io.md)
+- [Agent RPC 与工具网络](systems/network_rpc.md)
+- [数据库、Checkpoint 与可恢复状态](systems/filesystem_database.md)
+- [分布式控制面的基础取舍](systems/distributed_foundations.md)
+- [Agent 容量规划与跨层诊断](systems/performance_diagnostics.md)
 
 # 第二部分：AI 与学习基础
 

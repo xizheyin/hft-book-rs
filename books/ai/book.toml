@@ -2,8 +2,8 @@
 authors = ["AI 学习团队"]
 language = "zh-CN"
 src = "src"
-title = "DeepSeek AI Agent Infra 面试宝典"
-description = "从计算机系统与 AI/GPU 地基，到 Agent Harness、沙箱云平台、可靠性和 120 题实战的中文宝典"
+title = "AI 与 Agent Infra 面试宝典"
+description = "从 AI/LLM 地基，到 Agent Harness、沙箱平台、可靠性与 DeepSeek 岗位实战的中文面试宝典"
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
