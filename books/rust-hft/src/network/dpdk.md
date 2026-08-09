@@ -159,7 +159,17 @@ port/queue、mempool 和处理线程尽量位于 NIC 所在 node。EAL socket me
 | 协议栈责任 | 多由应用承担 | redirect 部分由应用承担 | 内核承担 |
 | 调试与抓包 | 需 mirror/telemetry | tap 点需设计 | 工具成熟 |
 
-## 10. 面试追问
+## 10. 代码推演方法：mbuf 所有权与 burst 返回值
+
+1. **为每个 mbuf 标唯一所有者**：mempool、应用 RX、应用处理、TX queue 或回收阶段只能选一个；跨线程时再标经过哪条 ring。
+2. **逐次推演 `rx_burst`**：返回 `n` 后只有前 `n` 个数组槽有效；应用对丢弃包立即释放，对转发包完成必要头部检查与长度校验。
+3. **逐次推演 `tx_burst`**：若请求发送 `m` 个只返回 `n`，前 `n` 个转移给 PMD，后 `m-n` 个仍归应用，必须重试、排队或释放。
+4. **加入多段与分片**：检查 `pkt_len`、`data_len`、segment 链和 offload 元数据；不能假定所有包都在单个连续 buffer。
+5. **验算守恒与活性**：mempool 可用数 + 所有在途 mbuf 数应守恒；压力结束后池应回到基线；任何错误路径都恰好释放一次。
+
+常见陷阱：批量 API 部分成功仍释放全部；把 TX queue 接受当线上可见；忽略 NUMA 远端内存；只测最大 batch 的吞吐而不测首包等待；旁路后忘记 ARP、分片、重组和协议恢复责任。
+
+## 11. 面试追问
 
 ### Q1：为什么 DPDK 快？
 
@@ -173,6 +183,6 @@ port/queue、mempool 和处理线程尽量位于 NIC 所在 node。EAL socket me
 
 可以用 RAII、生命周期和 typestate 封装绝大多数调用面，但 FFI、DMA、共享 ring 和 C ABI 仍是 unsafe 边界。安全性取决于 wrapper 是否正确表达所有权、segment、并发和 shutdown 契约。
 
-## 11. 总结
+## 12. 总结
 
 DPDK 是高包率用户态数据面的强大工具，但不是万能答案。只有当内核 socket/AF_XDP 等方案达不到明确 SLA，团队又能承担设备、协议栈、权限与运维责任时，它才是合适选择。

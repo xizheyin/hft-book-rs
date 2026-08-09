@@ -364,6 +364,19 @@ C++20 和 Rust 的原子内存顺序源自同一套模型，概念可以直接�
 6. **无限自旋却没有停机条件**：若对方线程退出，自旋线程可能永远不结束。
 7. **忽略缓存行争用**：即使 Ordering 正确，多个核心频繁写同一原子也可能产生很差的尾延迟。
 
+## 做题方法
+
+原子内存序题不要从代码上下位置猜顺序，要画事件图：每个原子读写是节点，边分为 sequenced-before、reads-from、synchronizes-with 和 happens-before。
+
+1. 先分别列出每个线程内的操作顺序；普通读写也要列出，因为它们是否被跨线程保护正是问题核心。
+2. 为每个原子读选择它可能读取的写，且该选择必须符合该原子对象的 modification order。
+3. 若 acquire 读到了 release 写或其 release sequence 中允许的值，添加 synchronizes-with 边，再传递得到 happens-before。
+4. 检查每对冲突的普通访问：若来自不同线程、至少一个是写且没有 happens-before，就是 data race，程序行为未定义。
+5. `relaxed` 只保证该原子自身的原子性和 modification order，不自动发布旁边的普通数据；`seq_cst` 也不能修复非原子数据本身的竞态。
+6. 比较交换循环要分别推演成功和失败内存序，并处理 spurious failure；失败路径没有执行写入。
+
+验算发布模式时，从消费者的普通读沿 happens-before 反向走，必须能到达生产者初始化普通数据的写；仅看到“flag 最后是 true”不够。
+
 ## 11. 练习与参考答案
 
 ### 练习 1

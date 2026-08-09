@@ -168,7 +168,17 @@ VI、poll thread、DMA 内存与 NIC PCIe node 尽量对齐。是否使用 `isol
 
 跨厂商是硬要求时，可评估 DPDK 或 AF_XDP；但它们也有各自 PMD/驱动能力矩阵，并非天然无硬件差异。
 
-## 8. 面试追问
+## 8. 故障定位方法：区分 accelerated、fallback 与 packet API
+
+1. **先确认抽象层**：OpenOnload 是兼容 Socket 的用户态栈，TCPDirect 是显式用户态 API，ef_vi 是更底层的 packet queue；先写清当前程序实际使用哪一层。
+2. **确认实际加速路径**：检查目标 FD/流量是否 accelerated、是否因不支持的功能 fallback，以及过滤器把包导向哪个 stack/queue。
+3. **画事件与所有权**：ef_vi 路径逐个推演 RX event、TX submit、TX completion 和 buffer 回收；Socket 路径仍按字节流与部分 I/O 推演。
+4. **三处观测对账**：NIC/硬件过滤器、用户态 stack/queue、应用序号与 ACK 同窗比较；tcpdump 缺包时先检查 tap 点而不是直接归因上游。
+5. **验证恢复**：覆盖 preload/版本不匹配、NIC reset、link flap、event queue overflow、进程退出和重新附着，确认 fallback 或回滚行为符合预期。
+
+常见陷阱：把三种产品都叫硬件 TCP offload；透明加速就不测 FD/epoll 语义；TX event 当交易所 ACK；忽略厂商/驱动/固件能力矩阵；只测 accelerated happy path。
+
+## 9. 面试追问
 
 ### Q1：OpenOnload 与 ef_vi 的区别是什么？
 
@@ -182,6 +192,6 @@ OpenOnload 提供兼容 BSD socket 的用户态协议栈，迁移成本较低；
 
 socket feature 可能不受支持或 fallback；FD、epoll、timestamp、multicast、路由与容器语义也可能变化。必须验证实际 accelerated path、故障恢复和版本矩阵，而不是只比较 happy-path 延迟。
 
-## 9. 总结
+## 10. 总结
 
 OpenOnload、TCPDirect 和 ef_vi 提供了不同抽象层。最合适的方案取决于是否需要 BSD socket、用户态 TCP、直接 packet control、跨硬件能力与团队运维成熟度，不能只凭“路径更短”做决定。

@@ -176,7 +176,17 @@ TX ring 满时需要有界 backpressure。订单数据不能无限重试并悄�
 | 权限 | BPF/XDP、memlock、queue | VFIO/IOMMU、hugepage | 相对较少 |
 | 应用责任 | frame/ring、L2+协议 | mbuf/queue、L2+协议 | framing/业务协议 |
 
-## 11. 面试追问
+## 11. 代码推演方法：用 frame 所有权检查四个 Ring
+
+1. **给每个 UMEM frame 编号**：在纸上记录它当前只属于应用空闲池、Fill、RX、TX 或 Completion 中的一处。
+2. **推演 RX**：应用把空闲 frame 放入 Fill；内核交付到 RX 后应用取得所有权；处理完必须回 Fill 或转入 TX，不能两边同时引用。
+3. **推演 TX**：应用提交 TX 后停止修改 frame；Completion 返回后才能回空闲池。另列生产者/消费者索引，检查 wrap-around。
+4. **加入异常事件**：Fill 耗尽、RX 满、TX 部分提交、Completion 未及时回收、XSKMAP miss 与 copy fallback，各自写明计数和恢复动作。
+5. **验算守恒**：所有状态中的 frame 总数始终等于 UMEM frame 总数；任一 frame 没有双重归属；队列长期不平衡时能指出最先耗尽的池。
+
+常见陷阱：看到 zero-copy 能力就假定实际 bind 成功；Completion 当作对端收到；只消费 RX 不补 Fill；多个线程无协议地操作同一 ring；依赖普通 tcpdump 观察被 XDP redirect 的全部流量。
+
+## 12. 面试追问
 
 ### Q1：AF_XDP 是否一定 zero-copy？
 
@@ -190,6 +200,6 @@ TX ring 满时需要有界 backpressure。订单数据不能无限重试并悄�
 
 不。设备仍由 Linux 驱动管理，但被 XDP redirect 的 fast-path packet 不继续走普通协议栈；工具能否看到取决于 tap 点与 XDP action。应设计 BPF/ring/NIC telemetry 和端口镜像。
 
-## 12. 总结
+## 13. 总结
 
 AF_XDP 在 Linux 驱动与用户态 packet ring 之间提供了灵活折中，但性能和语义都取决于内核、驱动、XDP 程序、queue 与 UMEM 生命周期。它不是默认最佳方案；只有在能力探测、权限收敛、ring 背压和故障回滚都清楚时才适合上线。

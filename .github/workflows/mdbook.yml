@@ -35,6 +35,9 @@ jobs:
       - name: Check both books
         run: python3 scripts/check_book.py
 
+      - name: Check question and answer coverage
+        run: python3 scripts/check_question_answers.py
+
       - name: Compile Rust examples in both books
         run: |
           mdbook test books/rust-hft

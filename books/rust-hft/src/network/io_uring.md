@@ -187,7 +187,17 @@ notification 解决的是**内存所有权**，不是 wire-time 证明。即使 
 | send_zc | 可能降低复制与内存带宽 | 双 completion、fallback、所有权 | 大块/高带宽发送 |
 | 用户态网络 | 更直接控制 NIC queue | 驱动接管、协议栈、权限与工具 | 极端数据路径 |
 
-## 9. 面试追问
+## 9. 代码推演方法：SQE、CQE 与 buffer 生命周期
+
+1. **给操作分配稳定 ID**：记录 opcode、FD、buffer、长度、用户数据和状态 `prepared→submitted→in-flight→completed/cancelled`。
+2. **推演 SQ 容量**：批量准备不等于已经提交；检查可用 SQE、`io_uring_enter`/SQPOLL 唤醒条件以及部分提交后的剩余操作。
+3. **逐个解释 CQE**：`res>0` 推进字节数，`res=0` 按 opcode 判断 EOF/零完成，负数是错误码；multishot 还要看 `F_MORE` 是否允许继续等待。
+4. **单独画 buffer 归还点**：普通发送、provided buffer receive 与 `send_zc` 的归还事件不同；后者不能只看首个 CQE 就复用。
+5. **验算**：每个 operation ID 最终只终结一次；CQ 不溢出；所有 registered/provided buffer 在 shutdown 前均已取消或归还。
+
+常见陷阱：SQE 写好就算提交；CQE 等于 NIC DMA 或对端收到；忽略 CQ 背压；取消成功前释放内存；multishot 最后一个 CQE 没有 `F_MORE` 却不重新补请求。
+
+## 10. 面试追问
 
 ### Q1：SQPOLL 能否让整个生命周期都不调用 syscall？
 
@@ -201,7 +211,7 @@ notification 解决的是**内存所有权**，不是 wire-time 证明。即使 
 
 不能这样概括。CQE 表示内核定义的操作完成。`recv` CQE 表示字节已在用户 buffer；send CQE/notification 各有自己的语义。线上可见性需硬件时间戳或外部测量。
 
-## 10. 总结
+## 11. 总结
 
 `io_uring` 的价值是可批量的 operation/completion 模型，而不是一个“自动更快”的标签。选择前要固定内核、crate、权限、驱动和 opcode 能力，设计 SQ/CQ 与 buffer 背压，并用真实流量测量完整延迟分布。
 

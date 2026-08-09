@@ -222,7 +222,7 @@ stateDiagram-v2
 
 跨机器比较时间戳之前必须讨论时钟同步、硬件/软件打点位置和时钟误差。否则“系统 A 快 300ns”可能只是两台机器的钟不同。
 
-## 7. 面试答题模板：两分钟讲清生命周期
+## 7. 做题方法：两分钟讲清生命周期
 
 参考答法：
 
@@ -257,15 +257,42 @@ stateDiagram-v2
 ## 9. 练习
 
 1. 画出“行情序号缺口 → 暂停决策 → 申请快照 → 回放增量 → 恢复”的状态机。
+
+<details><summary>展开参考答案与解答</summary>
+
+`Live --发现 expected=104、收到105--> Stale/Gap --停止新增风险并有界缓存--> FetchingSnapshot --校验快照基准S--> Replaying --连续应用S+1...last--> Live`。快照超时、缓存溢出、二次 gap 或不变量失败都回到 Stale 并启动新 generation；旧 generation 响应不得覆盖新恢复。恢复条件是序号连续、簿不变量成立且候选簿原子发布。
+
+</details>
+
 2. 某买单数量为 100，已经成交 30，撤单请求已发出但未确认。此时最坏情况下还可能再成交多少？风险模块应预留多少数量？
+
+<details><summary>展开参考答案与解答</summary>
+
+在撤单得到权威确认前，剩余 `100-30=70` 仍可能全部成交，因此继续预留 70。若风险按名义金额计，还要按最坏允许成交价与乘数换算。Cancel sent 不是 Canceled；只有 cancel ack、最终 fill 或场所查询/对账事实才能释放。
+
+</details>
+
 3. 设计一个 `OrderState` 枚举，列出哪些事件可以让它从一个状态转到另一个状态。
+
+<details><summary>展开参考答案与解答</summary>
+
+可用 `PendingNew, Working, PartiallyFilled, PendingCancel, PendingReplace, Filled, Canceled, Rejected, Unknown`。NewAck：PendingNew→Working；PartialFill：Working/PendingCancel→PartiallyFilled；Fill：任一仍有剩余的活动态→Filled；CancelSent：Working/PartiallyFilled→PendingCancel；CancelAck→Canceled；Reject：PendingNew→Rejected。断线使未确认请求进入 Unknown；重复事件按 exec/order ID 去重，非法转换报警并对账。具体状态以场所协议为准。
+
+</details>
+
 4. 如果本地成交记录是 99 笔，drop copy 是 100 笔，你会按什么顺序排查？
+
+<details><summary>展开参考答案与解答</summary>
+
+先冻结相关账户的新风险并保留原始证据；按 venue、session、order/execution ID、交易日与序号对齐两边，不只比较 count。检查本地 gap、重复去重、断线窗口、日界线与更正/撤销成交；再向订单会话/场所查询权威状态。确认缺失执行后，以原 exec ID 幂等补记持仓、PnL 与风险，并记录根因和恢复验证。
+
+</details>
+
 5. 用一分钟解释“低延迟、吞吐量、尾延迟”三者的区别。
 
-<details>
-<summary>第 2 题参考思路</summary>
+<details><summary>展开参考答案与解答</summary>
 
-在撤单得到确认前，剩余 70 仍可能全部成交。因此不能因为“已经发送撤单”就释放这 70 的风险占用；只有取消确认或最终成交等权威事件到达后，才能按状态释放或转换占用。
+延迟是一项从明确起点到终点的耗时；吞吐量是单位时间完成多少项；尾延迟是高分位慢请求，如 p99。系统可有很高吞吐但因排队使 p99 很差，也可在低负载 p50 很小却无法承受峰值。比较时必须固定负载、成功口径、时间窗和测量边界，并同时报告分布与过载行为。
 
 </details>
 

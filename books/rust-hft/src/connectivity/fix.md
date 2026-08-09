@@ -204,7 +204,17 @@ stateDiagram-v2
 - 将 tag 分派成 `match` 或生成代码可避免通用 Map，但扩展 tag 与 repeating group 仍要支持。
 - 优化后必须保持 golden、差分、fuzz 与 session recovery 测试全绿。
 
-## 8. 验证清单
+## 8. 做题方法：用字节范围和期望序号推演 FIX
+
+1. **Framing 题标字节边界**：从 `8=BeginString`、`9=BodyLength` 定位消息；BodyLength 的计数范围与 `10=CheckSum` 前的分隔符按所用 FIX 版本规范逐字节标出，不凭字符串字段数估计。
+2. **校验题按原始字节计算**：保留 SOH 分隔符，对校验和字段之前的全部规定字节求和再模 256；不要先把消息转成 Unicode 或重排字段。
+3. **会话题画双向序号表**：分别维护入站期望值和出站下一值。收到等于期望、低于期望、高于期望三种情况逐一处理，并结合 `PossDupFlag`、重发请求和 Sequence Reset 语义。
+4. **订单题另画业务状态**：用 `ClOrdID`、`OrigClOrdID`、`OrderID`、执行标识等关联消息；会话重发不得重复产生业务副作用。
+5. **验算**：切包后每条消息字节长度自洽；入站序号只按有效会话规则前进；重放与实时消息合并后每个 Execution Report 恰好应用一次。
+
+常见陷阱：用 `split('|')` 代替真实 SOH framing；BodyLength/CheckSum 范围少算一个分隔符；把 TCP 重连当 FIX 序号重置；对低序号消息一律静默丢弃；把所有场所的 Sequence Reset、日切与重发政策视为相同。最终以 FIX 版本、FIXT 会话和对手方规则为准。
+
+## 9. 验证清单
 
 - [ ] TCP 半包、粘包、连续多消息和最大长度均有测试。
 - [ ] BodyLength 与 Checksum 按原始 bytes 验证。

@@ -208,7 +208,17 @@ impl StrategyContext for BacktestContext {
 }
 ```
 
-## 6. 总结
+## 6. 做题方法：先选时钟，再排同刻事件
+
+1. **读题分时间语义**：事件时间、接收时间、单调耗时和墙钟日期分别用途不同；超时用单调时钟，市场日历才使用可解释的墙钟。
+2. **画时间轴**：为事件、定时器设置 `(timestamp, tie_breaker)`，明确同一时间戳按序号、优先级还是插入顺序处理。
+3. **推演模拟时钟**：只允许前进到下一事件时间；新增早于当前时间的事件应拒绝或按明确迟到规则处理，不能让时间倒退。
+4. **定时器题列状态**：Scheduled→Fired/Cancelled，取消与触发同刻时按规定顺序；周期定时器从计划时间还是实际执行时间续排必须声明。
+5. **验算**：同一输入多次运行事件顺序一致；duration 不受墙钟跳变影响；没有事件时不会忙等；所有定时器最终触发或取消一次。
+
+常见陷阱：用系统墙钟计算超时；相同时间无稳定 tie-break 导致回放漂移；回调中倒退时钟；把 TSC 周期固定换成纳秒却未校准/验证平台；模拟中偷偷调用真实睡眠。
+
+## 7. 总结
 
 | 特性 | 系统时间 (`SystemTime`) | RDTSC 时钟 | 仿真时钟 (`SimClock`) |
 | :--- | :--- | :--- | :--- |
@@ -219,7 +229,7 @@ impl StrategyContext for BacktestContext {
 
 通过 `Clock` trait 和泛型，同一套策略可以在实盘与回测中切换。更重要的是，它让“时间的语义”变得可审查：duration 不受 UTC 校时影响，回测不读取真实时间，审计时间戳也不会与 TSC tick 混为一谈。
 
-## 7. 面试高频问答
+## 8. 面试高频问答
 
 ### Q1：`SystemTime` 和 `Instant` 有什么区别？
 
@@ -233,7 +243,7 @@ impl StrategyContext for BacktestContext {
 
 只有事件循环可以推进时钟；策略只看到当前事件及此前状态；输入读取与策略可见性隔离；相同 timestamp 使用稳定 tie-break；测试断言时间不倒退并对相同输入比较结果 hash。
 
-## 8. 权威依据
+## 9. 权威依据
 
 - [Rust 标准库：`Instant`](https://doc.rust-lang.org/stable/std/time/struct.Instant.html)：说明单调但不保证匀速、平台相关的挂起语义及底层时钟来源。
 - [Rust 标准库：`SystemTime`](https://doc.rust-lang.org/stable/std/time/struct.SystemTime.html)：说明墙上时间不是单调时钟。

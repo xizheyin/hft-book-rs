@@ -444,6 +444,22 @@ assert_eq!(consumer.try_pop(), None);
 - Release/Acquire 负责发布槽位，角色唯一负责避免并发访问；
 - Drop、回绕、背压与尾延迟都是完整实现的一部分。
 
+## 10. 做题方法：逐槽验算一个完整代次
+
+选定逻辑序号 k 对应的槽位 `k mod capacity`，只追踪它的一轮生命周期：
+
+```text
+Empty(k) → producer 独占写 → Full(k) → consumer 独占读/移出 → Empty(k+capacity)
+```
+
+1. 检查 head 只有生产者写、tail 只有消费者写；若句柄可克隆或 API 允许第二个写者，SPSC 前提已经失败。
+2. 队列非满才能从 Empty 进入写入，元素完全初始化后才能 Release 发布 head；消费者 Acquire 观察到该 head 后才可读取。
+3. 消费者移出元素后 Release 发布 tail，生产者 Acquire 观察到该 tail 后才可复用槽位。两条方向相反的同步链都不能少。
+4. 分别推演空队列、满队列、游标接近整数回绕、生产者写一半暂停、消费者取出后 panic。每条路径都要满足一个 `T` 最多初始化一次、最多移出或析构一次。
+5. 计算容量和索引时同时保留单调逻辑序号与取模下标；若只剩下标，就无法区分同一槽位的不同代次。
+
+最后用 Drop 计数器验算：成功 pop 的元素由调用者负责析构，仍留在队列中的元素由队列析构，未初始化槽位绝不能当作 `T` drop。
+
 进一步阅读：[Rust 原子操作与内存顺序](atomics.md)、[SPSC/MPSC 队列](queues.md)、[rigtorp/SPSCQueue](https://github.com/rigtorp/SPSCQueue)。
 
 ---

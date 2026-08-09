@@ -181,6 +181,18 @@ AArch64 通常会用带 acquire/release 语义的指令（如 `ldar`/`stlr`）�
 - Ordering 选择来自 happens-before 证明，而不是性能口号；
 - HFT 优化中，缓存行争用和所有权拓扑通常比单条屏障更值得先处理。
 
+## 9. 做题方法：为普通内存画出同步链
+
+分析一段原子代码时，把原子变量和它保护的普通数据分开画：
+
+1. 标出每个原子对象的唯一修改顺序，以及普通数据由哪个线程写、哪个线程读。原子本身不撕裂，不能自动使旁边的普通数据安全。
+2. 找发布点：哪次 Release store/RMW 之前完成了普通写入？再找接收点：哪次 Acquire load/RMW **实际读到该发布写入的值**？若中间还有多次 RMW，应按 Rust 内存模型逐项核对，不能默认同步关系会自动跨过整条链。
+3. 只有两者接上，才写出“普通写 → Release → Acquire → 普通读”的 happens-before 链。若 Acquire 读到旧值，就不能借用这条同步关系。
+4. 对 CAS 分开检查成功与失败路径。成功路径是否既读取旧状态又发布新状态？失败后是否会读取赢家发布的数据？据此验证 success/failure Ordering，而不是只看循环里最常走的分支。
+5. 最后做反例验算：把发布或接收一侧降成 Relaxed，能否构造“标志已见但数据未同步”的执行？把全部操作升成 SeqCst 后，槽位双写、悬垂指针等所有权错误是否仍存在？
+
+答案至少要明确写出一条 read-from 关系和一条 happens-before 链；只说“Acquire 保证可见”没有指出它观察了谁，证明是不完整的。
+
 权威参考：[Rust `Ordering` 文档](https://doc.rust-lang.org/std/sync/atomic/enum.Ordering.html) 与 [Rustonomicon: Atomics](https://doc.rust-lang.org/nomicon/atomics.html)。
 
 ---

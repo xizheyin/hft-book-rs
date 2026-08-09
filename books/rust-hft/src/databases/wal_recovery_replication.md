@@ -253,23 +253,125 @@ CAP 讨论的是发生网络分区时，分布式系统不能同时保证所有�
 - **“分片后容量乘 N，其他都不变。”** 路由、跨分片操作、再均衡和全局约束都会变化。
 - **“CAP 是平时任选两个字母。”** 它讨论网络分区期间的一致性与可用性取舍。
 
-## 14. 推演题
+## 14. 做题方法：从稳定存储边界恢复
+
+WAL 恢复题不要按“程序原来想做什么”猜结果，而要只看崩溃时已经持久化的事实：
+
+1. 列出稳定 WAL 的最大 LSN、每个数据页的 `pageLSN`、最近 checkpoint 提供的恢复起点，以及哪些 COMMIT 已经进入承诺的持久化边界。
+2. 从日志识别 winner 和 loser：已有持久 COMMIT 的事务是 winner；崩溃时仍未结束的是 loser。客户端是否看见响应不能替代日志事实。
+3. REDO 从恢复起点按 LSN 正序扫描。只有记录确实作用于该页、且页的 `pageLSN` 落后时才应用；这样重复恢复也不会重复修改。
+4. 在需要 UNDO 的模型中，沿 loser 的日志链逆序撤销，并记录补偿日志。已经提交的 winner 不能因为数据页尚未刷盘就被撤销。
+5. 最后验证三个不变量：所有已提交效果都存在；所有未提交效果都不可见；任何被写入数据文件的变化都有更早持久化的 WAL 保护。
+
+复制题再多画一条进度轴：`sent → write → flush → replay`。题目问“故障后不丢”至少要追到 flush 和故障域；题目问“备库查询可见”则必须追到 replay。同步复制、备份和 RPO 的结论都应绑定到这条轴上的具体确认点。
+
+## 15. 推演题
 
 1. 写出 WAL 的两条先写顺序，并分别说明违反后会出现什么故障。
+
+<details><summary>展开参考答案与解答</summary>
+
+第一，写脏数据页前，描述该页修改的 WAL 必须先持久化至少到 `pageLSN`；否则崩溃后磁盘出现无日志可撤销/解释的修改。第二，向客户端确认提交前，事务 COMMIT 记录及其此前日志必须达到承诺的持久位置；否则客户端收到成功后，恢复却找不到该事务。
+
+</details>
+
 2. STEAL 为什么需要考虑 UNDO？NO-FORCE 为什么需要 REDO？
+
+<details><summary>展开参考答案与解答</summary>
+
+STEAL 允许未提交事务的脏页被写回，崩溃后的数据文件可能含 loser 修改，所以通用 ARIES 模型要 UNDO。NO-FORCE 不要求提交时刷完数据页，winner 的部分结果可能只在日志里，所以要 REDO。具体 MVCC 产品可能用不可见版本代替物理逐条 UNDO，但故障边界仍要说明。
+
+</details>
+
 3. 根据本章 LSN 10–40 的例子，分别指出 winner、loser、需要重做和撤销的修改。
+
+<details><summary>展开参考答案与解答</summary>
+
+T1 在 LSN 30 有 COMMIT，是 winner；T2 没有结束记录，是 loser。REDO 从合适起点重复 LSN 10 的 `A:100→80`、LSN 20 的 `B:200→220` 与 LSN 40 的 `A:80→50` 中尚未反映到页的动作，`pageLSN` 已覆盖的可跳过；随后逆向 UNDO T2 的 LSN 40，使 A 回到 80。最终 `A=80,B=220`。
+
+</details>
+
 4. `pageLSN` 怎样让 REDO 可以重复执行？恢复过程中再次断电为何不能破坏结果？
+
+<details><summary>展开参考答案与解答</summary>
+
+每条页修改日志有 LSN，页记录已应用的最大 `pageLSN`。REDO 仅在页的 `pageLSN < record.LSN` 时应用，并把它推进；再次恢复看到已应用记录就跳过。UNDO 还要写补偿日志记录已完成的撤销，因此恢复中再次断电可以从日志继续，而不会反复加减。
+
+</details>
+
 5. 模糊 checkpoint 记录哪些恢复起点信息？它为什么不等于完整备份？
+
+<details><summary>展开参考答案与解答</summary>
+
+典型信息包括活跃事务及最后 LSN、脏页表及各页最早需 REDO 的 LSN、checkpoint 日志位置。它让恢复少扫日志，但事务仍在运行、脏页未必全刷，且记录通常与同一数据文件和后续 WAL 配合才有意义。备份还要能在介质丢失时从独立副本重建数据，checkpoint 做不到。
+
+</details>
+
 6. 一次 group commit 同时确认 20 个事务，减少了什么成本，又可能增加什么等待？
+
+<details><summary>展开参考答案与解答</summary>
+
+20 个事务共享一次或少数几次日志 flush/fsync，摊薄设备提交与系统调用成本，提高吞吐。最早到达的事务可能等待凑批或等待当前批刷盘，增加提交延迟；批大小/时间窗要在吞吐和尾延迟之间测量。
+
+</details>
+
 7. 区分备库 sent、write、flush、replay 四个位置。哪个位置至少满足查询读到该事务？
+
+<details><summary>展开参考答案与解答</summary>
+
+sent 是主库已发送到哪里；write 是备库已写入 OS/缓冲层；flush 是备库已持久化；replay 是备库已把 WAL 应用到数据页/可见状态。普通备库查询至少要等 replay 到该事务的 commit LSN；只到 flush 能保证故障后可恢复，却不保证当前查询已看见。
+
+</details>
+
 8. 异步复制故障切换为何可能丢失客户端已经收到成功的事务？
+
+<details><summary>展开参考答案与解答</summary>
+
+主库本地持久化后即可回复，而 WAL 可能尚未传到备库。此时主库永久损坏，提升的备库只拥有较早 LSN，客户端已确认事务不在新历史中。RPO 取决于复制滞后；同步等待远端持久化能缩小该窗口，但增加提交延迟且仍需正确选主。
+
+</details>
+
 9. 等待 remote flush 后立刻读备库，为什么仍可能读不到自己的写？给出两种解决方案。
+
+<details><summary>展开参考答案与解答</summary>
+
+remote flush 只说明日志已持久化，replay 线程可能尚未应用到可查询状态。方案一：提交返回 commit LSN，读取前等待目标备库 replay LSN 至少达到它；方案二：读主库或使用承诺 remote apply/session consistency 的路由。所有等待都应受 deadline 限制。
+
+</details>
+
 10. 什么是脑裂？fencing 必须阻止哪个节点继续做什么？
+
+<details><summary>展开参考答案与解答</summary>
+
+脑裂是两个节点都认为自己是当前主并接受冲突写。新主获得更高世代/token 后，存储、代理或共享资源必须拒绝旧世代的写与对外服务；只让旧主“收到通知后自觉停”无法覆盖暂停、网络隔离后复活。fencing 要作用在最终副作用执行点。
+
+</details>
+
 11. 为什么在线副本不能替代离线、带保留点的备份？
+
+<details><summary>展开参考答案与解答</summary>
+
+误删、逻辑损坏、勒索或错误 schema 变更会迅速复制到在线副本；副本只提高可用性，不提供历史时间点与故障域隔离。备份应独立、保留多个恢复点、受不同权限保护，并定期实际恢复验证 RTO/RPO。
+
+</details>
+
 12. 为多租户系统选择 tenant_id 或 created_at 做分片键，分别分析热点、范围查询和跨分片风险。
+
+<details><summary>展开参考答案与解答</summary>
+
+按 tenant_id 可把单租户读写放在一片，隔离和局部事务简单；大租户会成热点，跨租户时间报表需 scatter-gather。按 created_at 便于时间范围扫描与淘汰旧分区，但最新时间片承受全部写入，同一租户数据跨片，事务/查询更复杂。常见改进是哈希租户、逻辑分片或 `time bucket + hash`，仍要按访问模式验算。
+
+</details>
+
 13. 用一句准确的话说明 CAP 在网络分区期间讨论的取舍，而不是“选两个字母”。
 
-## 15. 权威依据
+<details><summary>展开参考答案与解答</summary>
+
+当节点间通信发生分区且请求仍到达各侧时，系统不能同时保证每次请求都得到非错误响应（可用性）和所有操作表现为单一最新副本（线性一致性）；它必须拒绝/等待部分请求，或允许某侧返回可能陈旧、冲突的结果。
+
+</details>
+
+## 16. 权威依据
 
 - [Database System Concepts, 7th Edition 官方页面](https://codex.cs.yale.edu/avi/db-book/)：日志恢复、并发、分布式数据库与复制的经典教材依据。
 - [CMU 15-445/645 公开课程](https://15445.courses.cs.cmu.edu/fall2024/schedule.html)：Logging、Checkpoints、ARIES 与 Database Recovery 主线。

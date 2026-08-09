@@ -245,24 +245,144 @@ lease 若没有可靠误差界和 fencing，节点暂停后恢复可能提供陈
 - **“Raft 保证任意 follower 读最新值。”** 线性一致读还需 ReadIndex、日志读或经证明的 lease。
 - **“租约到期判断就是 fencing。”** fencing 需要资源拒绝较旧世代，不只依赖持有者自觉停止。
 
-## 15. 推演题
+## 15. 做题方法：分别验算副本集合和 Raft 日志
+
+### 15.1 Quorum 题先枚举集合
+
+1. 写出一个键的 N 个固定首选副本，并明确读写是否都只从这组节点选择。
+2. 枚举一次成功写的 W 集合和一次读的 R 集合；`R+W>N` 只证明二者至少相交一个节点。若要检查成功写之间相交，再验算 `2W>N`。
+3. 给每个副本标出版本，而不是只写“新/旧”。读集合相交以后，还要说明协调者怎样比较顺序版本或保留并发版本。
+4. 若题目允许 sloppy quorum，把临时节点画到首选集合之外；此时不能继续套用固定集合的相交结论。最后再追 hinted handoff、read repair 或 anti-entropy 是否能让副本收敛。
+
+### 15.2 Raft 题维护一张状态表
+
+为每个节点记录 `currentTerm`、`votedFor`、日志 `(index,term)`、`commitIndex` 和 `lastApplied`，每收到一条消息就更新一行：
+
+1. 先比较消息 term；旧 term 消息拒绝，看到更高 term 就更新并退回 follower。
+2. RequestVote 先检查本 term 是否已投票，再按“最后日志 term 优先，term 相同才比 index”判断候选者是否足够新。
+3. AppendEntries 先核对 `prevLogIndex/prevLogTerm`；不匹配就找共同前缀，只覆盖未提交的冲突后缀。
+4. leader 数副本时，只有当前 term 条目达到多数派才能按标准规则推进 `commitIndex`；它会连带提交此前前缀，不能直接按副本数提交旧 term 条目。
+5. 只有 `index≤commitIndex` 的命令才能按序应用。最终验算：同一 index 不会在两个状态机应用不同命令，且任何更高 term leader 都含已提交前缀。
+
+### 15.3 Lease 题在“检查”和“使用”之间插入暂停
+
+让旧 leader 检查租约后暂停，新 leader 获得更高 token，再让旧 leader 恢复写入。若下游只相信调用者自报“租约有效”，方案失败；若下游持久保存最大 fencing token 并拒绝较小值，迟到写才被挡住。
+
+## 16. 推演题
 
 1. 主从同步、异步分别把哪些等待放进客户端提交路径？故障切换的 RPO 有何差别？
+
+<details><summary>展开参考答案与解答</summary>
+
+同步复制把至少一个/多数远端的接收、持久化或应用等待放进提交路径，具体边界由承诺定义；异步只等主本地提交。同步到持久多数可把相应故障模型下 RPO 收紧到 0，异步 RPO 取决于复制 lag，可能丢已确认写；同步代价是更高延迟与分区时不可用。
+
+</details>
+
 2. 多主同时修改同一字段时，列出三种冲突处理方式及各自丢失的信息。
+
+<details><summary>展开参考答案与解答</summary>
+
+LWW 按时间戳/版本选一个，会丢另一并发值且受时钟规则影响；保留 siblings/版本向量把冲突交给应用，不丢候选但增加读取与合并复杂度；CRDT/业务合并能保留可交换信息，但只适用于有明确定义的合并语义。人工裁决也可保真但延迟高。
+
+</details>
+
 3. `N=5` 时选择哪些 R、W 能满足 `R+W>N` 和 `2W>N`？这些条件为何仍不证明线性一致？
+
+<details><summary>展开参考答案与解答</summary>
+
+`2W>5` 要求 `W≥3`；再满足 `R+W>5`：W=3 时 R≥3，W=4 时 R≥2，W=5 时 R≥1。其余更大 R 也可。推导还依赖同一固定 N、真实读写集合、版本比较和完成写传播；sloppy quorum、并发写、读修复滞后或没有单一写序都可能只给相交而非线性一致。
+
+</details>
+
 4. 什么是 sloppy quorum？它为什么可能破坏“读写集合必相交”的简单推导？
+
+<details><summary>展开参考答案与解答</summary>
+
+首选副本不可达时，sloppy quorum 把写临时放到其他健康节点并记 hinted handoff。后续读可能仍从首选集合取 R 个，而写实际落在替代集合，两集合即使数量满足公式也可能不相交。必须定义协调者、版本/读修复和 handoff 的实际保证。
+
+</details>
+
 5. 删除为什么需要带版本 tombstone？过早回收会发生什么？
+
+<details><summary>展开参考答案与解答</summary>
+
+tombstone 是“删除也是一个有版本的写”，能在反熵时压过旧值。若某副本离线期间 tombstone 被回收，它带旧值回来时系统缺少更高删除版本，旧数据会复活。回收需等待覆盖最大离线/修复窗口或用更强成员与版本证明。
+
+</details>
+
 6. 5 节点共识集群最多容忍多少节点不可达仍取得多数派？
+
+<details><summary>展开参考答案与解答</summary>
+
+多数为 `floor(5/2)+1=3`，因此最多 2 节点不可达，剩余 3 仍可形成多数。失去 3 个只剩 2，不能选主或提交新条目，但已持久数据不应因此被随意改写。
+
+</details>
+
 7. 手推 A、B、C 平票后进入下一 term 的 Raft 选举。
+
+<details><summary>展开参考答案与解答</summary>
+
+term 4 中 A、B、C 若超时接近并各先投自己，没人得到 2 票；各自保持 candidate，随机选举超时重新开始。假设 B 最先超时，它递增到 term 5、投自己并发 RequestVote；A/C 看到更高 term 转 follower，其中一个在日志不落后且本 term 未投票时投 B。B 得 2/3 成 leader；迟到 term 4 消息被拒绝。
+
+</details>
+
 8. 候选者日志最后项 term 更大但 index 更小，和 term 更小但 index 更大，谁更新？按 Raft 规则说明。
+
+<details><summary>展开参考答案与解答</summary>
+
+Raft 按 `(lastLogTerm,lastLogIndex)` 字典序比较：先看 term，只有 term 相等才看 index。因此 term 更大但 index 更小的候选者更 up-to-date；term 更小即使 index 更大也不更新。投票者还要检查本 term 尚未投票。
+
+</details>
+
 9. 三节点 leader 只把条目写到本地就崩溃，新 leader 是否必须保留该条目？为什么？
+
+<details><summary>展开参考答案与解答</summary>
+
+不必须。它未复制到多数、未 committed；另外两节点可选出不含该条目的 leader，新 leader 通过日志匹配覆盖旧 leader 恢复后的未提交后缀。客户端也不能在只写本地时收到“已提交”承诺。
+
+</details>
+
 10. 画一个日志冲突例子，按 prevLogIndex/prevLogTerm 找共同前缀并覆盖未提交后缀。
+
+<details><summary>展开参考答案与解答</summary>
+
+leader 日志为 `[(1,1),(2,1),(3,3),(4,3)]`，follower 为 `[(1,1),(2,1),(3,2),(4,2)]`，元组是 `(index,term)`。leader 先以 `prev=(3,3)` 发送，follower 在 index3 term2 不匹配而拒绝；leader 回退到 `prev=(2,1)`，匹配后 follower 删除 index3 起的冲突后缀并追加 `(3,3),(4,3)`。已提交前缀不能出现在这种可覆盖冲突中。
+
+</details>
+
 11. 多数派交集与投票日志限制怎样共同保护 committed entry？
+
+<details><summary>展开参考答案与解答</summary>
+
+已提交条目存在于某个多数集合；任何后续选举多数与它至少交一个节点。但仅有交集还不够，投票者必须拒绝日志比自己旧的候选者，迫使获多数的 leader 拥有足够新的日志。配合 log matching，已提交前缀不能被新 leader 覆盖。
+
+</details>
+
 12. 为什么当前 leader 不能仅数旧 term 条目的副本数直接提交它？
+
+<details><summary>展开参考答案与解答</summary>
+
+Raft 规定 leader 只能通过“当前 term 的条目已复制到多数”推进 commitIndex；旧 term 条目会随该当前 term 条目间接提交。若仅数旧条目，存在论文 Figure 8 的选举历史，使它虽一度在多数节点上仍被不同日志的新 leader 覆盖。current-term rule 补上 leader completeness 所需条件。
+
+</details>
+
 13. follower read 可能违反 linearizability 的时间线是什么？ReadIndex 解决了哪一步不确定性？
+
+<details><summary>展开参考答案与解答</summary>
+
+旧 leader/follower 与多数隔离后仍以为有效；新多数选出 leader 并提交 x=2，客户端再向旧节点读到 x=1，违反实时顺序。ReadIndex 让 leader 先通过当前 term 的多数 heartbeat 确认自己仍是 leader并取得安全 commit index，再等本地应用到该 index；普通 follower 还需由 leader 授权/同步。
+
+</details>
+
 14. 旧 leader 带 token=8 醒来，新 leader 已有 token=9。下游资源应怎样处理两者请求？
 
-## 16. 权威依据
+<details><summary>展开参考答案与解答</summary>
+
+资源保存已接受的最高 fencing token：接受 9 后，所有 token 8 写必须拒绝；9 的重复请求再按 operation_id 幂等处理。token 要由单调权威生成并在最终写点校验，仅在协调服务里记录新 leader 不能阻止旧进程直接写资源。
+
+</details>
+
+## 17. 权威依据
 
 - Diego Ongaro、John Ousterhout, [In Search of an Understandable Consensus Algorithm（Raft 扩展论文）](https://web.stanford.edu/~ouster/cgi-bin/papers/raft-extended.pdf)。
 - [Raft 官方资料站](https://raft.github.io/)：论文、可视化、形式化规范与实现资料入口。

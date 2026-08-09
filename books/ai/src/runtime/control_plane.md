@@ -90,7 +90,17 @@ flowchart LR
 
 修复包括：策略字段显式必填、版本协商、未知或缺失时 fail closed、兼容矩阵、混合版本集成测试，以及先 canary 节点验证数据面真实行为。
 
-## 9. 章末面试问题
+## 9. 做题方法：对比期望状态与观测状态
+
+1. 为对象记录 spec generation、resource version、desired state、observed generation、实际状态和 owner。一次 reconcile 只处理读到的版本，写回时用条件更新防止覆盖新 spec。
+2. 把差异翻译成幂等动作，例如 create/start/stop/delete；动作请求带对象 ID 与 generation。ACK 丢失后再次 reconcile 应查询现状或重复同一幂等动作，而不是创建第二个资源。
+3. 画事件流和周期性全量扫描两条修复路径。丢事件时扫描最终发现差异；事件重复、乱序时版本检查阻止状态倒退。
+4. 让 controller 在发动作后崩溃、worker 成功但状态未回写、两个 controller 同时接管。lease/fencing 决定当前 owner，旧 owner 的 observation 不得覆盖新世代。
+5. 容量题按对象变更率、每次 reconcile 成本、队列深度和 worker 数估算追平时间；持续处理率必须大于变更率，才能在故障后消化 backlog。
+
+验算点：observed generation 不会超过已处理 spec；重复 reconcile 不产生重复资源；旧版本写入被拒绝；事件丢失仍能由扫描收敛；控制面过载时数据面已有任务不会因状态风暴被无界放大。
+
+## 10. 章末面试问题
 
 **题目：控制面怎样管理数万个不可靠节点与沙箱？**
 
@@ -103,7 +113,19 @@ flowchart LR
 3. 如何发现并回收 orphan VM、卷和 IP？
 4. 控制面升级失败怎样回滚，同时不回滚已经创建的数据面资源？
 
-## 10. 本章速记
+### 参考答案与解答
+
+<details>
+<summary>展开答案</summary>
+
+1. 把业务状态和一条待发布事件写进同一数据库事务，即 Outbox。事务提交后，独立发布器反复扫描未发送记录并投递；发送成功前崩溃会造成重复而不是丢失，所以消费者按 event ID 去重。验算时分别在“提交前、提交后发送前、发送后标记前”插入崩溃，任务都不应永久消失。
+2. 只有持有当前 leader lease/generation 的 scheduler 可以派发，创建资源时还要把该 generation 交给资源端校验。网络分区后的旧 scheduler 即使仍运行，其 lease 会过期，携带旧 generation 的条件写被拒绝。多数派选主只决定新 leader，真正阻止旧 leader 写入还需要 fencing。
+3. 每个资源带 owner run ID、generation、创建时间和期望终态。reconciler 周期性对比数据库期望状态、云/节点实际清单与租约：实际存在但 owner 不存在、终态已删除或长期无心跳的对象进入隔离清单；再次确认引用和宽限期后幂等删除。先隔离再删除可避免因短暂控制面故障误删活资源。
+4. 控制器版本与资源 schema 要向前/向后兼容，并把“期望状态”与“已创建事实”分开。升级失败时回滚控制器和路由，不发送反向删除命令；旧版本继续读取它理解的字段，对未知新字段 fail closed。已经创建的数据面资源由 reconciler 依据原 run 状态接管，必要时 roll forward 修复，而不是把软件回滚等同于业务资源回滚。
+
+</details>
+
+## 11. 本章速记
 
 - API 写期望状态，reconciler 让实际状态逐步收敛。
 - 慢资源创建应异步；重试必须配 idempotency key。

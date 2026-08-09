@@ -231,20 +231,105 @@ else:
 - **“CAP 是 C、A、P 平时任选两个。”** 它讨论网络分区期间线性一致性与每请求成功响应的冲突。
 - **“RYW 等于所有客户端立刻看到。”** 它只是会话级保证。
 
-## 12. 推演题
+## 12. 做题方法：只根据可观察事实下结论
+
+### 12.1 Timeout 题画四个时间点
+
+依次画出“客户端发送、服务端收到、业务效果持久化、客户端收到响应”，再把丢包或崩溃插入其中。客户端 timeout 时，只能确定最后一步没有按时发生，不能反推前三步。答案应把结果分成：有证据确定未执行、有持久记录确定已执行、暂时无法确定。
+
+接着检查接口是否提供三种恢复能力：同一次业务意图是否复用稳定幂等键；服务端能否查询该键的最终状态；重试是否受总 deadline 和次数限制。如果只能说“再发一次”，就还没有解决已执行但响应丢失的分支。
+
+### 12.2 时钟题先画 happens-before 图
+
+每个进程内按程序顺序连边，发送到接收连边，再做传递闭包。两事件之间没有路径才叫并发；不要拿墙上时间戳大小代替因果边。计算 Lamport clock 时逐事件执行“本地加一、发送携带、接收取最大值再加一”，最后只用 `a→b ⇒ L(a)<L(b)` 验算，不能使用逆命题。
+
+### 12.3 CAP 题必须给出分区中的具体操作
+
+先指定同一个键的副本位于分区两侧，再让一侧完成写、另一侧收到读或写。若另一侧仍返回成功，要写清可能返回旧值或产生冲突；若要求线性一致，就写清它必须等待、拒绝或把请求转到仍有法定人数的一侧。只给系统贴“CP/AP”标签而没有请求时间线，不构成推演。
+
+## 13. 推演题
 
 1. RPC 超时后，列出“未执行、已执行、仍未知”三条可能时间线。为什么客户端不能仅凭 timeout 区分？
+
+<details><summary>展开参考答案与解答</summary>
+
+未执行：请求在发送前/途中丢失，服务端没收到。已执行：服务端提交成功，响应在回程丢失。仍未知：请求或服务端仍在排队/执行，客户端 deadline 已到。timeout 只证明客户端按时没收到可确认响应，三条时间线的本地观测相同；必须用稳定 operation_id 查询、去重或对账。
+
+</details>
+
 2. 对扣款接口，怎样设计稳定幂等键？为什么每次重试生成 UUID 不正确？
+
+<details><summary>展开参考答案与解答</summary>
+
+幂等键应绑定一次业务意图，例如 `account_id + payment_id + operation_type`，并由首次请求持久保存；所有 attempt 复用它。服务端在同一事务中记录该键、请求摘要和结果。每次重试换 UUID 会被服务端视为新扣款，失去重复识别能力；同键不同参数则必须拒绝。
+
+</details>
+
 3. wall clock 和 monotonic clock 分别适合日志时间与 deadline 的哪一项？为什么？
-4. 根据一组消息发送/接收事件画 happens-before 图，指出哪些事件并发。
-5. 按 Lamport 三条规则计算两个节点的逻辑时间。为什么 `L(a)<L(b)` 不能证明 `a→b`？
+
+<details><summary>展开参考答案与解答</summary>
+
+wall clock 能映射 UTC/日历，适合审计日志，但会被 NTP 校正、人工改时或闰秒影响。monotonic clock 只保证本机持续时间不倒退，适合 `deadline=now+budget` 和 elapsed。跨进程传 deadline 时通常传绝对协议时间或剩余预算并明确时钟域，不能直接比较两台机器的 monotonic 数值。
+
+</details>
+
+4. A 上事件 `a1→send(m)→a3`，B 上事件 `b1→recv(m)→b3`，另有节点 C 的事件 `c1→c2` 且无通信；画 happens-before 图，指出哪些事件并发。
+
+<details><summary>展开参考答案与解答</summary>
+
+进程内有 `a1→send→a3`、`b1→recv→b3`、`c1→c2`；消息边是 `send→recv`，传递闭包得到 `a1→recv→b3`。`a3` 与 `recv` 若没有额外消息边则并发；C 的两个事件与 A/B 所有事件都并发。并发表示既推不出 `x→y` 也推不出 `y→x`，不等于墙钟时间相同。
+
+</details>
+
+5. 两节点逻辑钟从 0 开始：A 做本地事件 a1、发送 m；B 先做本地事件 b1，再接收 m，随后发送 n；A 接收 n。按 Lamport 规则计算时间。为什么 `L(a)<L(b)` 不能证明 `a→b`？
+
+<details><summary>展开参考答案与解答</summary>
+
+每个事件前自增，发送携带时钟；接收设为 `max(local,msg)+1`。因此 `a1=1`、`send(m)=2`；`b1=1`、`recv(m)=3`、`send(n)=4`；`recv(n)=5`。Lamport 保证 `a→b ⇒ L(a)<L(b)`，逆命题不成立：两个无通信的并发事件也可因本地计数得到 1 和 7。
+
+</details>
+
 6. 写出一个满足 sequential consistency 但不满足 linearizability 的读写历史。
+
+<details><summary>展开参考答案与解答</summary>
+
+初始 x=0。客户端 A 完成 `write(x=1)` 后，真实时间上客户端 B 才开始 `read(x)`，却读到 0。可以把全局顺序排成 `read 0 → write 1`，且各客户端内部只有一个操作，所以满足 sequential consistency；但它违反实时先后，因此不满足 linearizability。
+
+</details>
+
 7. eventual consistency 还必须补充哪些冲突与会话政策才能成为可用接口？
+
+<details><summary>展开参考答案与解答</summary>
+
+至少定义并发写如何合并（LWW、版本向量、CRDT 或人工冲突）、删除/tombstone、反熵与收敛条件；再说明 read-your-writes、monotonic reads、会话粘滞和最大陈旧度。还要给冲突可见性与失败返回。只说“最终会一致”没有告诉用户现在读到什么、冲突是否丢数据。
+
+</details>
+
 8. 网络分区时，一侧收到写、一侧收到读。分别说明保持 C 或保持 A 会怎样响应。
+
+<details><summary>展开参考答案与解答</summary>
+
+保持线性一致性时，无法确认多数/当前 leader 的一侧必须拒绝或等待写/读，避免返回旧值或产生分叉。保持可用性时，两侧都在有限时间给非错误响应，读侧可能返回旧值，写侧可能接受以后要合并的版本。实际可按操作区分，前提是接口明确冲突与陈旧语义。
+
+</details>
+
 9. 为什么“系统是 AP”不足以描述正常时期延迟、会话保证和冲突解决？
+
+<details><summary>展开参考答案与解答</summary>
+
+CAP 只约束发生分区时 C/A 的选择，不说明无分区时同步几份副本、读哪份、延迟多大，也不规定 read-your-writes、冲突检测或合并。两个都自称 AP 的系统可能一个用 LWW 丢并发写，另一个保留 siblings，行为完全不同。
+
+</details>
+
 10. 用 PACELC 分别描述同地域同步复制和跨地域异步复制的主要代价。
 
-## 13. 权威依据
+<details><summary>展开参考答案与解答</summary>
+
+同地域同步复制在无分区 Else 阶段偏向 Consistency，以等待副本换较小但非零提交延迟；分区时通常拒绝少数侧。跨地域异步复制在 Else 阶段偏向低 Latency，主地域先确认，但容灾 RPO 与远端陈旧度增加；分区时若两地都写则偏 Availability 并承担冲突，若只允许主地则偏 Consistency。
+
+</details>
+
+## 14. 权威依据
 
 - Martin Kleppmann，《Designing Data-Intensive Applications》；[作者主页与出版信息](https://martin.kleppmann.com/)：复制、分区、事务、一致性与时间问题的主线参考。
 - [MIT 6.5840 Distributed Systems 官方课程](https://pdos.csail.mit.edu/6.824/index.html)：容错、复制与一致性的公开课程与论文阅读入口。

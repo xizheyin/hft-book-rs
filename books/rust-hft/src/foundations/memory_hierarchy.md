@@ -474,6 +474,18 @@ flowchart LR
 - 多级 Cache 要区分局部和全局 miss rate；一致性不等于语言级线程同步。
 - 虚拟内存按页做翻译与保护，Cache 按行保存数据；TLB miss、page fault 和 Cache miss 是不同事件。
 
+## 做题方法
+
+Cache 计算题最好固定使用同一张草稿表：
+
+1. 由容量 `C`、块大小 `B`、相联度 `E` 算组数 `S=C/(B×E)`，检查 `S` 是否为题设允许的整数。
+2. 地址位数为 `m` 时，块内偏移位数 `b=log₂B`，组索引位数 `s=log₂S`，标记位数 `t=m-s-b`。验算必须满足 `t+s+b=m`。
+3. 对每个访问地址依次求块号 `address/B`、组号 `block mod S` 和 tag；按时间顺序维护每组的有效位、tag、脏位和替换次序，不能只统计地址出现次数。
+4. 写访问同时回答两组独立问题：写命中采用 write-through 还是 write-back，写 miss 采用 write-allocate 还是 no-write-allocate。
+5. 平均访问时间先画命中层次，再按条件概率计算。两级 Cache 中要区分 L1 的 local miss rate 与“访问到主存”的 global miss rate。
+
+访问序列做完后，用三个检查验算：每组行数不能超过 `E`；块内不同偏移应映射到同一 Cache 块；未命中总数应等于 compulsory、capacity、conflict 等分类之和（若题目把一致性 miss 单列，也要另计）。
+
 ## 19. 思考题与面试、408 追问
 
 1. 为什么 SRAM 适合 Cache、DRAM 适合主存？“SRAM 不刷新”为什么不等于断电不丢数据？
@@ -496,6 +508,33 @@ flowchart LR
 18. 对本章给出的 2 组 2 路访问序列继续追加 `8, 0, 4`，按 LRU 更新每组并统计新增 hit/miss。
 19. 大块能降低哪些 miss，又可能增加哪些成本？为什么不存在对所有程序都最优的块大小？
 20. 为什么硬件预取有时使程序变慢？请从带宽、污染和页边界三个角度分析。
+
+### 参考答案与解答
+
+<details><summary>展开答案</summary>
+
+1. SRAM 单元快、无需刷新但面积大，适合小容量 Cache；DRAM 密度高、成本低但需刷新，适合主存。二者都是易失存储，SRAM“不刷新”不表示断电保持。
+2. 行缓冲保存一次激活的 DRAM 行；后续访问同一行可省去重新激活的部分开销。随机跨行会频繁关闭/激活行，降低行命中率。
+3. 时间局部性：循环反复读取同一计数器；空间局部性：顺序遍历数组。Cache 按块填充是利用邻近地址很可能随后访问，并分摊下层传输固定开销。
+4. `AMAT=2 ns+0.04×80 ns=5.2 ns`。miss rate 降至 2% 后为 `2+0.02×80=3.6 ns`，减少 `1.6 ns`，相对改善 `1.6/5.2≈30.8%`。单位验算是“概率 × ns = ns”。
+5. 组数 `S=64 KiB/(64 B×4)=256=2^8`。offset `log₂64=6` 位，index `log₂256=8` 位，tag `48-8-6=34` 位；三者相加为 48。
+6. 用 index 选中一组，并行比较各路 `valid=1` 且 tag 相等；匹配一路即命中，再由 offset 选块内字节。无匹配则 miss，并按替换/填充协议处理。
+7. 直接映射比较 1 个 tag，4 路比较 4 个，全相联比较全部行。更高相联度减少 conflict miss，却增加比较器、选择、替换、能耗和命中路径复杂度。
+8. 精确 LRU 要记录所有路的相对新旧关系，路数升高时状态和更新逻辑快速增大。随机或 pseudo-LRU 用更少状态近似选择，可能多一些 miss，但硬件成本更可控。
+9. clean 行与下层一致，可直接失效；dirty 行含尚未下传的修改，驱逐前要写回。dirty bit 避免对每个被替换行都做不必要写流量。
+10. 四种写 miss：① write-through+write-allocate：先取块、更新 Cache，并立即写下层；② write-through+no-write-allocate：绕过 Cache 写下层；③ write-back+write-allocate：取块、在 Cache 修改并置 dirty；④ write-back+no-write-allocate：本次绕过写下层、Cache 不填充（组合较少见）。前一维回答命中后何时下传，后一维回答 miss 是否取块。
+11. 第一次访问块是 compulsory；同容量全相联仍 miss、且不是第一次，是 capacity；全相联命中但当前相联组织 miss，是 conflict。增容量主要减 capacity，提高相联度主要减 conflict；增块可减相邻访问的 compulsory，但也可能加大污染和 penalty。
+12. 全局 L2 miss rate `0.08×0.25=0.02=2%`。25% 的分母只是到达 L2 的请求，不是所有 CPU 访问。
+13. L1 miss 后通常先访问 L2/L3，只有更低层也 miss 才到 DRAM。两级教学式为 `AMAT=T_L1+MR_L1×(T_L2+MR_L2_local×P_mem)`。
+14. coherence 约束多个 Cache 对同一地址副本怎样一致；consistency 约束不同内存操作对线程可见的顺序。MESI 不理解 Rust 数据竞争和复合不变量，程序仍需锁/原子建立语言层 happens-before。
+15. 两个计数器若落在同一 Cache 行，任一核心写都会请求整行独占并使对方副本失效，产生伪共享与 coherence miss。协议粒度是行，不是变量。
+16. TLB miss 补地址翻译缓存；page fault 处理页表无有效映射/权限等异常；Cache miss 补数据行。缺页涉及分配、I/O 或进程信号，需 OS 决策；TLB miss 可由硬件遍历页表，也可由软件管理 TLB 的内核处理。
+17. `4 KiB=2^12 B`，页内 offset 12 位；`64 B=2^6 B`，行内 offset 6 位；每页行数 `4096/64=64`。
+18. 原序列结束时组 0 的 LRU→MRU 为块 `0,4`，组 1 含块 `1`。追加地址 `8`（块2）miss，驱逐块0；地址 `0` miss，驱逐块4；地址 `4`（块1）hit。新增 `1 hit、2 miss`，最终组0为块 `2,0`，组1仍为块1。
+19. 大块利用空间局部性，可减少相邻地址首次访问的 miss；也会增加 miss penalty、带宽占用、Cache 污染并减少可容纳块数。访问步长和工作集不同，所以没有统一最优值。
+20. 错误预取占用主存/互连带宽；预取无用块会驱逐有用块；跨到未映射或新页会增加 TLB/页表压力，且预取器通常受页边界限制。先用计数器验证覆盖率、准确率和带宽变化。
+
+</details>
 
 ## 20. 权威依据与延伸阅读
 

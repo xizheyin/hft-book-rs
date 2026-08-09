@@ -171,7 +171,17 @@ Normalization 还要保留 auction、implied、hidden、trade condition、delete
 
 不同 clock domain 未校准前不能直接相减。纳秒单位也不代表纳秒精度。
 
-## 8. 验证清单
+## 8. 做题方法：从包序号推进到可交易状态
+
+1. **读题先画流水线**：packet→message→规范化事件→订单簿→策略；在每段标 sequence、时间戳、产品/频道和丢弃原因。
+2. **列每类输入分支**：期望序号、重复/旧包、向前 gap、乱序缓存、会话重置和坏消息分别更新什么状态，哪些分支必须把 book 标为 stale。
+3. **逐事件推演状态表**：记录 `expected_seq`、缓存范围、book generation、是否可交易和恢复请求；一个 packet 含多条消息时同时推进 packet 与 message 口径。
+4. **故障证据同窗对账**：A/B feed、NIC/内核 drop、解析拒绝、应用队列和序号 gap 在同一时间窗口比较，先找最早分叉。
+5. **验算**：恢复后事件连续、没有重复应用；异常产品不会污染其他分片；“可交易”只能由完整性与市场状态共同恢复。
+
+常见陷阱：接收成功等于数据连续；坏包只记日志后继续交易；用本机到达顺序替代交易所序号；混淆 packet、message 和 event 数；不同 venue 的 reset、retransmission 和 snapshot 规则未隔离。
+
+## 9. 验证清单
 
 - [ ] 按 feed 规范确认 packet/message sequence、count、scope 与 rollover。
 - [ ] A/B duplicate、单路 gap、双路 gap、乱序和 channel reset 均有测试。

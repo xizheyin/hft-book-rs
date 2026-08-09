@@ -18,7 +18,7 @@ HFT 系统设计面试不是比谁能说出更多“DPDK、无锁、FPGA”。�
 | 风险与合规 | 风控、kill switch、审计不缺席 | 为速度绕过安全检查 |
 | 沟通 | 先总图再下钻，数字有假设 | 细节很多但没有主线 |
 
-## 2. 一套可复用的八步框架
+## 2. 做题方法：一套可复用的八步框架
 
 ```text
 1. 澄清范围与假设
@@ -440,16 +440,50 @@ backlog = (2.5M − 1.0M) × 0.1 = 150,000 events
 ## 18. 练习题
 
 1. 将假设改为 4 个场所，重画架构，说明每场所订单状态和全局风险怎样协调。
+
+<details><summary>展开参考答案与解答</summary>
+
+每场所保留独立行情会话、订单网关、序号、订单状态 owner 与恢复状态机；策略/SOR 只发带 parent/child ID 的意图。全局风险服务按账户维护 `filled + outstanding reservation`，发子单前原子预占，场所 owner 用 fill/cancel/reject 释放或转持仓。跨场所不做同步热路径订单状态机，但事件按稳定 ID 汇总；任一场所 stale 只停该场所新增风险，账户级 kill 可扇出全部场所并对账。
+
+</details>
+
 2. 峰值 3M msg/s 持续 200ms，系统可持续处理 2.2M msg/s。计算理论积压，并说明为什么仅扩队列不够。
+
+<details><summary>展开参考答案与解答</summary>
+
+净积压率 `0.8M/s`，200ms 产生 `0.8M×0.2=160000` 条。队列能装下只避免立即丢数据，最后一批至少还要约 `160000/2.2M≈72.7ms` 才被处理，状态已陈旧；若突发反复出现将不再清空。需要峰值能力、准入/降级和 stale 安全策略共同处理。
+
+</details>
+
 3. 设计一个 crash recovery 流程，列出进入 Live 前必须满足的五个条件。
+
+<details><summary>展开参考答案与解答</summary>
+
+先以新 generation 启动且禁止发新单，加载持久 checkpoint/日志；重建行情快照并连续回放；恢复本地订单后向 order session、drop copy/场所查询 Unknown；按 exec ID 重算持仓、PnL 和风险预占；重建连接与配置并运行不变量。五个 Live 门槛是：行情连续可信、所有活动/未知订单已裁决、成交与持仓对账一致、风险额度由当前 fenced owner 掌握、配置/时钟/连接健康且审计记录恢复世代。
+
+</details>
+
 4. 让 `Risk owner` 崩溃，设计额度恢复协议，避免新进程和旧进程同时使用同一额度。
+
+<details><summary>展开参考答案与解答</summary>
+
+权威存储保存 owner lease 与单调 epoch。新进程在 lease 到期后条件更新取得 epoch 9，先从订单/成交事实重建 `position + outstanding reservations`；所有预占、释放和下游发单票据都携带 9，执行点拒绝旧 epoch 8。旧进程恢复只能读/退出，不能凭本地余额提交；对不支持 fencing 的场所通过唯一订单网关隔离。
+
+</details>
+
 5. 给订单状态机写一套乱序、重复和断线重放测试矩阵。
+
+<details><summary>展开参考答案与解答</summary>
+
+维度一事件：NewAck、PartialFill、Fill、CancelAck、Reject；维度二扰动：原序、每项重复、相邻交换、缺失、断线后从 checkpoint 重放；维度三初态：PendingNew、Working、PendingCancel、Unknown。逐格检查 exec ID 只计一次、cumQty 单调且 `cum+leaves=orderQty`、终态不复活、Fill/Cancel race 符合场所规则、重放后状态 hash 与无故障权威序列一致。非法序列应进入对账而非猜测。
+
+</details>
+
 6. 用三分钟回答本章题目，录音后检查是否同时提到了数据连续性、撤单竞态、对账和合规。
 
-<details>
-<summary>第 2 题参考答案</summary>
+<details><summary>展开参考答案与解答</summary>
 
-积压为 `(3.0M - 2.2M) × 0.2 = 160,000` 个事件。即使内存装得下，最后一批事件也会显著陈旧，破坏低延迟目标；需要让目标峰值下的处理能力足够，或及时阻止基于陈旧状态的新动作并恢复。
+可按“范围与 SLO→数据流→状态 owner→风险→故障恢复→容量验证”回答：行情按场所序号构建，gap 时停止新增风险并快照重放；订单单写者维护显式状态，Cancel sent 期间仍可能 Fill；全局风险按成交和在途量预占。断线后的 Unknown 用订单会话、drop copy 和稳定 ID 对账，旧 owner 用 fencing 拒绝。最后给出峰值积压、端到端 p99 测量、确定性重放和故障注入，并明确场所规则、审计、kill switch 与合规不可被低延迟绕过。录音逐项打勾，缺一项就补证据或边界。
 
 </details>
 

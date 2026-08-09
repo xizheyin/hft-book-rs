@@ -155,7 +155,17 @@ DPDK/ef_vi 的 raw Ethernet 路径可能需要应用或配套栈处理 ARP/ND、
 
 内核、固件、BIOS、PMD 和用户态库构成兼容矩阵。发布前要验证绑定/解绑设备、fallback 网络、进程崩溃后的资源清理，以及旧版本能否重新附着 queue。
 
-## 8. 面试追问
+## 8. 故障定位方法：先画旁路后的责任边界
+
+1. **确认实际路径**：画 NIC queue→驱动/PMD/XDP→用户 ring→协议处理→应用，标出哪些包仍走内核、哪些可能 fallback。
+2. **列三类完成**：队列接受、buffer 可回收、线上可见分别对应什么事件和时间戳；不要用一个“发送成功”覆盖三层语义。
+3. **逐层对账**：交换机/NIC、descriptor、用户 ring、解析器和业务序号使用同一时间窗口；普通内核计数为零可能只是流量绕开了观测点。
+4. **验证故障路径**：进程崩溃、queue reset、链路 flap、buffer 耗尽和升级回滚各跑一次，观察设备与内存能否被旧/新实例安全接管。
+5. **做对照实验**：相同包长、burst、CPU/NUMA 与业务逻辑下比较内核基线；同时报告吞吐、全分位延迟、CPU、drop 和运维失败。
+
+常见陷阱：旁路等于零拷贝；轮询等于不会丢包；只测 happy path；把抓不到包当网络没流量；为了降低路径长度重写一个不完整的 TCP 栈。
+
+## 9. 面试追问
 
 ### Q1：Kernel bypass 是否等于 zero copy？
 
@@ -169,7 +179,7 @@ DPDK/ef_vi 的 raw Ethernet 路径可能需要应用或配套栈处理 ARP/ND、
 
 它需要设备接管、专用 CPU、内存与权限配置，还可能失去内核 TCP、抓包和成熟运维能力。若 socket busy poll/OpenOnload 已满足 SLA，更复杂方案未必值得。
 
-## 9. 延伸阅读
+## 10. 延伸阅读
 
 - [DPDK Documentation](https://doc.dpdk.org/guides/)
 - [Linux AF_XDP Documentation](https://docs.kernel.org/networking/af_xdp.html)

@@ -169,6 +169,16 @@ impl FpgaDevice {
 - **Xilinx XDMA / QDMA**: 官方提供了 Linux 驱动，Rust 可以通过 `ioctl` 与之交互。
 - **VFIO/UIO**: Linux 提供的用户态设备访问机制；VFIO 具备 IOMMU 隔离能力，UIO 更简单但保护能力较弱。
 
+## 做题方法：沿 DMA、队列和完成事件推演
+
+1. **读题画边界**：CPU 用户态、驱动/VFIO、IOMMU、DMA ring、FPGA pipeline 和 NIC/线缆分别标输入输出，说明哪层负责协议与风控。
+2. **列 descriptor 状态**：Free→Prepared→Submitted→DeviceOwned→Completed→Free，每个状态允许谁读写 buffer，内存屏障与 doorbell 在哪里。
+3. **做容量计算**：按消息率、单条 descriptor/数据字节和最坏服务时间估算在途数与 ring 深度；单位统一并留 burst 余量。
+4. **推演异常**：ring 满、DMA fault、设备 reset、completion 丢失/迟到、bitstream 不匹配和主机进程崩溃时，指出停止发送与重新同步步骤。
+5. **验算**：descriptor/buffer 数守恒且不重复回收；设备完成、wire timestamp 和交易所 ACK 三种完成不混淆；软件与 FPGA 对协议向量输出逐字节一致。
+
+常见陷阱：把 FPGA 当自动低延迟；CPU 写完 descriptor 未做所需可见性同步就敲 doorbell；completion 当成交回报；忽略 IOMMU/权限和 reset 恢复；固定某场所编码却未绑定协议版本。
+
 ## 面试高频问答
 
 ### Q1：MMIO 与 DMA 的区别是什么？

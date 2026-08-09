@@ -402,20 +402,110 @@ STUDENT_INSTRUCTOR(student, instructor)
 - **“3NF 一定等于 BCNF。”** BCNF 要求每个决定因素都是超键，条件更强。
 - **“表拆得越多越规范。”** 还要证明无损连接，并评估依赖保持与查询成本。
 
-## 12. 推演题
+## 12. 做题方法：把 SQL 和函数依赖都变成可验算步骤
+
+### 12.1 SQL 题先追踪“中间关系”
+
+遇到 JOIN、聚合、NULL 混在一起的查询，不要从 `SELECT` 猜最终答案。按逻辑阶段画一张小表：
+
+1. 从 `FROM` 和每个 `JOIN ... ON` 开始，写出匹配后的行。外连接未匹配侧要补 NULL，并标记哪一侧必须保留。
+2. 对 `WHERE` 的每个条件分别算 TRUE、FALSE 或 UNKNOWN；只有 TRUE 的行留下。这样能直接发现把右表条件放进 `WHERE` 后，为什么 LEFT JOIN 可能表现得像 INNER JOIN。
+3. 按 `GROUP BY` 键把剩余行装入组。逐组计算 `COUNT(*)`、`COUNT(expr)`、`SUM`，不要忘记 `COUNT(expr)` 跳过 NULL。
+4. 用 `HAVING` 过滤组。若有窗口函数，它看到的是分组、聚合和 HAVING 之后的行；再按各自的 `PARTITION BY`、`ORDER BY` 计算窗口值。
+5. 最后形成 `SELECT` 输出，再处理 `DISTINCT`、顶层 `ORDER BY` 和 `LIMIT`。做三个不变量检查：一对多连接是否扩行；外连接的保留侧是否无故消失；排序键相同时是否还需要稳定的第二排序键。
+
+### 12.2 范式题用闭包、键、违例、分解四步
+
+1. 先求属性闭包 `X+`：反复加入函数依赖右侧，直到集合不再增长。若 `X+` 包含关系的全部属性，X 是超键；再逐个删除 X 中属性，判断它是不是最小的候选键。
+2. 标出主属性，也就是出现在某个候选键中的属性。检查依赖时必须使用题目给出的语义，不能因为样例数据碰巧唯一就臆造函数依赖。
+3. 把右侧拆成单个属性后，对每条非平凡 `X→A` 检查决定因素 X。做 BCNF 题时，X 不是超键就是违例；做 3NF 题时，还要看右侧属性 A 是否为主属性。
+4. 按违例依赖分解后，先用公共属性判定二元分解是否无损，再把每条原依赖投影到子关系，检查能否不做 JOIN 就验证。无损连接和依赖保持必须分开作答。
+
+验算时把分解后的表自然连接回一个最小样例。如果出现原关系没有的虚假元组，分解一定不是无损；如果必须连接多表才能检查原依赖，就没有保持该依赖。
+
+## 13. 推演题
 
 1. `orders.user_id` 为什么既不是 orders 的主键，也仍然适合作为外键？
+
+<details><summary>展开参考答案与解答</summary>
+
+`orders` 中同一用户可以有多张订单，所以 `user_id` 会重复，不能唯一标识订单；订单主键应是 `order_id`。外键的要求相反：它的每个非 NULL 值必须能在被引用表 `users(user_id)` 中找到，并不要求在 `orders` 中唯一。它用于保证“订单指向的用户存在”。
+
+</details>
+
 2. 一名用户有 3 张订单。`users JOIN orders` 会产生几行？若还有一名无订单用户，`LEFT JOIN` 后总行数怎样变化？
+
+<details><summary>展开参考答案与解答</summary>
+
+内连接的中间关系包含 3 行，因为用户行会分别与 3 张订单匹配。加入一名无订单用户后，左连接保留这名用户，并用一行 NULL 扩展右表列，因此总数是 `3+1=4`。连接行数按匹配组合计，不按用户数计。
+
+</details>
+
 3. 解释为什么 `COUNT(*)` 与 `COUNT(right_table.id)` 在左外连接中可能不同。
+
+<details><summary>展开参考答案与解答</summary>
+
+`COUNT(*)` 统计左连接结果的所有行，包括“右侧无匹配、右表列全为 NULL”的补行；`COUNT(right_table.id)` 只统计该列非 NULL 的行。上一题中二者分别是 4 和 3。前提是右表 `id` 本身声明为非 NULL，否则还要区分真实 NULL 与补出的 NULL。
+
+</details>
+
 4. 手推一条含 JOIN、WHERE、GROUP BY、HAVING、SELECT、ORDER BY 的查询逻辑顺序。
+
+<details><summary>展开参考答案与解答</summary>
+
+例如查询每位活跃用户的大额订单总额：`SELECT u.id, SUM(o.amount) AS total FROM users u JOIN orders o ON o.user_id=u.id WHERE o.status='PAID' GROUP BY u.id HAVING SUM(o.amount)>1000 ORDER BY total DESC`。中间关系依次是：`FROM/JOIN` 生成用户与订单匹配行；`WHERE` 删除非 PAID 行；`GROUP BY` 按用户分组；聚合计算 `SUM`；`HAVING` 删除总额不超过 1000 的组；`SELECT` 投影 `id,total`；最后 `ORDER BY` 排序。物理执行器可以改换算法与顺序，但必须保持这套逻辑语义。
+
+</details>
+
 5. `x NOT IN (1, NULL)` 为什么不能理解成“x 既不是 1 也不是 NULL”？怎样用 `NOT EXISTS` 重写？
+
+<details><summary>展开参考答案与解答</summary>
+
+它等价于 `x<>1 AND x<>NULL`，第二项是 UNKNOWN；即使 `x=2`，`TRUE AND UNKNOWN` 仍是 UNKNOWN，`WHERE` 不保留该行。对子查询应写成相关反连接：`WHERE NOT EXISTS (SELECT 1 FROM forbidden f WHERE f.value = t.x)`；若业务还要求排除 `x IS NULL`，再显式加 `AND t.x IS NOT NULL`。不能用另一种含 NULL 的 `NOT IN` 假装修复。
+
+</details>
+
 6. 给定 `R(A,B,C,D)` 与依赖 `A→B, B→C, AC→D`，计算 `A+`，判断 A 是否为候选键。
+
+<details><summary>展开参考答案与解答</summary>
+
+从 `{A}` 开始：由 `A→B` 加入 B；由 `B→C` 加入 C；此时已有 A、C，可用 `AC→D` 加入 D。因此 `A+={A,B,C,D}`，A 是超键；A 只有一个属性，无法再删除属性，所以也是候选键。
+
+</details>
+
 7. 在选课分解算例中，若一门课程允许多位教师，哪些依赖不再成立？候选键应怎样调整？
+
+<details><summary>展开参考答案与解答</summary>
+
+`course_id→instructor_id` 不再成立，因此由它推得的 `course_id→instructor_office` 也不能成立。若成绩按“学生参加某课程的某位教师班级”记录，键应改为 `(student_id, course_id, instructor_id)`；若成绩仍只按课程给一次，则必须另建 `COURSE_INSTRUCTOR(course_id,instructor_id)`，而选课键仍可为 `(student_id,course_id)`。答案取决于 grade 的业务粒度，必须先声明。
+
+</details>
+
 8. 用自己的话区分 2NF 的部分依赖和 3NF 关注的传递依赖。
+
+<details><summary>展开参考答案与解答</summary>
+
+部分依赖是非主属性只需要复合候选键的一部分，例如 `(student_id,course_id)→student_name` 实际只靠 `student_id`。常见的传递依赖是候选键先决定某个非主属性，该属性再决定另一个非主属性，例如 `course_id→instructor_id→office`。2NF 先消除“没用完整键”，3NF 再处理“经非键中转”；正式判定仍应使用函数依赖与主属性定义。
+
+</details>
+
 9. 为什么 BCNF 分解可能无法在单表内保持全部原依赖？这会给写入路径带来什么成本？
+
+<details><summary>展开参考答案与解答</summary>
+
+分解后，某条依赖的决定项与被决定项可能不再同处一张表。示例 `TEACH(student,course,instructor)` 分解后，`(student,course)→instructor` 不能只检查任一子表。写入时可能需要跨表查询、连接、事务锁或额外唯一性结构来验证，增加 I/O、竞争和实现复杂度；这正是更强规范化与依赖保持之间的取舍。
+
+</details>
+
 10. 举一个有意反规范化的例子，并说明重复字段的更新与校验责任。
 
-## 13. 权威依据
+<details><summary>展开参考答案与解答</summary>
+
+例如在 `orders` 中冗余保存 `customer_tier_at_order`，避免历史报表每次连接当前客户表。若它表示下单时快照，就应写入后不可随客户当前等级变化；若它表示当前等级缓存，则客户升级必须通过同一事务、CDC 或可重放修复任务更新所有副本，并用定期对账验证。先定义字段语义，才能判断“不一致”究竟是历史事实还是复制故障。
+
+</details>
+
+## 14. 权威依据
 
 - [Database System Concepts, 7th Edition 官方页面](https://codex.cs.yale.edu/avi/db-book/)：关系模型、SQL 与关系设计的经典教材主线。
 - [Database System Concepts 官方目录](https://www.mheducation.co.in/database-system-concepts-9789390727506-india)：第 2–7 章覆盖关系模型、SQL、ER 与关系数据库设计。

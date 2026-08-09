@@ -222,7 +222,17 @@ head 与 tail 各有唯一写者，不需要多个线程竞争“谁获得下一
 - CAS、Ordering、ABA 与内存回收必须形成一条完整证明链；
 - HFT 中最有效的无锁优化常常是减少共享：分片、单写者和有界消息通道。
 
-进一步阅读：[内存布局与缓存效率](../foundations/memory_layout.md#12-mesi-协议与伪共享-mesi--false-sharing)、[Ring Buffer](ring_buffer.md) 与 [Rust Atomics and Locks](https://marabos.nl/atomics/)。
+## 10. 做题方法：从线性化点检查进展与回收
+
+1. 先为 push、pop 等每个操作找**线性化点**：是哪次成功 CAS、slot sequence 发布或指针交换，使操作从未发生变成已经发生？找不到时，先不要讨论 lock-free。
+2. 写出节点或槽位的状态机和所有者。对“线程预留后暂停”“CAS 连续失败”“线程在读指针后暂停”分别插入调度点，检查其他线程是否仍能完成操作。
+3. 证明进展时解释一次失败代表什么。CAS 失败若意味着另一个线程修改成功，可以支持系统整体进展；但当前线程可能永远失败，因此不能把它说成 wait-free。
+4. 单独追踪对象寿命：线程取得裸指针后，谁可能删除节点？hazard pointer、epoch 或所有权约束在哪一步保证解引用前对象仍存活？
+5. 做 ABA 验算时不要只写 A→B→A；给 A 加对象身份或 generation，说明旧观察为何会被误认，以及标签位宽回绕后算法靠什么仍不混淆代次。
+
+最终答案应分别给出安全性、进展保证和回收策略。只证明 CAS 原子，不能推出容器安全；只说“系统有人前进”，也不能推出某个请求有完成上界。
+
+进一步阅读：[内存布局与缓存效率](../foundations/memory_layout.md#12-mesi-协议与伪共享-mesi--false-sharing)、[Ring Buffer](ring_buffer.md) 与 Herlihy、Wing 的原始论文 [Linearizability: A Correctness Condition for Concurrent Objects](https://cs.brown.edu/~mph/HerlihyW90/p463-herlihy.pdf)。
 
 ---
 下一章：[Ring Buffer 实现](ring_buffer.md)。
