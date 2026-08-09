@@ -1,6 +1,6 @@
-# 追加盲测卷：完整输入输出与陌生组合
+# 追加盲测与协作编码：陌生组合、需求演进与代码评审
 
-前一章的模拟用于第一次验收；本章再提供两套不在标题中提示算法模式的盲测卷。每题都要求写完整 `stdin/stdout` 程序，适合检查“函数会写，但到了在线评测不会读写”的断层。
+前一章的模拟用于第一次验收；本章先提供两套不在标题中提示算法模式的盲测卷，再提供两道会逐轮增加需求的协作编码题。前者检查“函数会写，但到了在线评测不会读写”的断层；后者检查能否先澄清语义、写出最小正确版本，再在保留已有行为的前提下修改设计、补测试并接受代码评审。
 
 > 这些题是本书训练题，不是公司真题。先只看题目区，限时结束后再展开答案。
 
@@ -160,6 +160,7 @@ int main() {
 #include <cassert>
 #include <cstdint>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -559,7 +560,325 @@ int main() {
 
 </details>
 
-## 6. 两套卷覆盖了什么
+## 6. 协作编码 E：需求会在实现过程中继续变化
+
+这一组不是闭卷 OJ。面试官会先给最小需求，在你写出可工作的基线后再增加约束。每一轮都应先复述新语义，指出原接口哪里需要变化，再修改代码和测试。不要假装第一分钟就猜中了全部后续需求。
+
+### E1. 版本化内存键值存储
+
+**第一轮：**实现一个单线程内存存储，支持 `put(key, value)` 和 `get(key)`。
+
+**第二轮：**每次成功写入获得全局单调递增版本号；增加 `get_at(key, version)`，返回该键在不晚于指定版本时的最新值。
+
+**第三轮：**增加 `compare_and_set(key, expected_version, value)`。只有该键当前版本等于期望版本时才写入；不存在的键把当前版本视为 0。失败不能消耗版本号。
+
+请在编码过程中说明：
+
+1. 每个接口对不存在键返回什么；
+2. 为什么每个键的历史可以二分；
+3. 哪些整数边界会让版本号失去唯一性；
+4. 这个“比较并写入”在多线程程序中是否已经原子；
+5. 你会用哪些测试区分当前值、历史值和写入失败。
+
+### E2. 可增量输入的长度前缀帧解码器
+
+协议中的每个帧格式如下：
+
+```text
+2-byte big-endian payload_length | payload
+```
+
+**第一轮：**输入恰好是一帧完整字节，返回 payload。
+
+**第二轮：**网络一次读取可能只有半个头、半个 payload，也可能同时包含多帧。改成 `feed(chunk)` 接口，跨调用保留未完成字节，并返回本次新完成的所有帧。
+
+**第三轮：**构造函数给出最大 payload 长度。看到超长声明后，解码器进入终止错误状态，之后所有 `feed` 都失败，直到上层丢弃或重建解码器。
+
+请在编码过程中说明：
+
+1. 当前已消费位置和缓冲区分别表示什么；
+2. 空 payload 是否合法；
+3. 为什么不能按照尚未验证的长度直接分配；
+4. 一次调用先解析出合法帧、随后遇到非法头时，已经产出的帧怎样处理；
+5. 怎样系统测试每一种分包位置，而不是只测一次完整输入。
+
+## 7. 协作编码 E 完整答案
+
+### E1 参考答案：先固定接口语义和历史不变量
+
+第一轮用 `unordered_map<string,string>` 就能完成当前值查询。第二轮出现历史查询后，不能再覆盖旧值；可以把每个键映射到按版本递增的 `vector<Entry>`。因为全局版本只增加，每个键追加进去的版本也严格增加，`get_at` 可以使用 `upper_bound` 找到“第一个大于目标版本”的条目，再退一格。
+
+第三轮的关键不是先写代码，而是定义：
+
+- 不存在键的当前版本为 0；
+- 版本 0 永远不分配给真实写入；
+- CAS 失败不修改状态，也不消耗版本；
+- 本实现明确为单线程对象；在多线程环境中，“检查当前版本”和“追加新版本”必须处于同一临界区，函数名字不会自动提供线程原子性。
+
+下面是完整实现和边界测试：
+
+```cpp
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+using Version = std::uint64_t;
+
+struct VersionedValue {
+    Version version;
+    std::string value;
+};
+
+class VersionedStore {
+public:
+    Version put(std::string key, std::string value) {
+        const Version version = allocate_version();
+        history_[std::move(key)].push_back(
+            VersionedValue{version, std::move(value)});
+        return version;
+    }
+
+    std::optional<std::string> get(const std::string& key) const {
+        const auto found = history_.find(key);
+        if (found == history_.end() || found->second.empty()) {
+            return std::nullopt;
+        }
+        return found->second.back().value;
+    }
+
+    std::optional<std::string> get_at(const std::string& key,
+                                      Version version) const {
+        const auto found = history_.find(key);
+        if (found == history_.end()) {
+            return std::nullopt;
+        }
+
+        const auto& entries = found->second;
+        const auto after = std::upper_bound(
+            entries.begin(), entries.end(), version,
+            [](Version wanted, const VersionedValue& entry) {
+                return wanted < entry.version;
+            });
+        if (after == entries.begin()) {
+            return std::nullopt;
+        }
+        return std::prev(after)->value;
+    }
+
+    std::optional<Version> compare_and_set(std::string key,
+                                           Version expected_version,
+                                           std::string value) {
+        const auto found = history_.find(key);
+        const Version current = found == history_.end()
+            ? 0
+            : found->second.back().version;
+        if (current != expected_version) {
+            return std::nullopt;
+        }
+        return put(std::move(key), std::move(value));
+    }
+
+private:
+    Version allocate_version() {
+        if (next_version_ == 0) {
+            throw std::overflow_error("version space exhausted");
+        }
+        const Version allocated = next_version_;
+        next_version_ = allocated == std::numeric_limits<Version>::max()
+            ? 0
+            : allocated + 1;
+        return allocated;
+    }
+
+    Version next_version_{1};
+    std::unordered_map<std::string, std::vector<VersionedValue>> history_;
+};
+
+int main() {
+    VersionedStore store;
+    assert(!store.get("job"));
+    assert(!store.get_at("job", 100));
+
+    const Version v1 = store.put("job", "queued");
+    const Version v2 = store.put("other", "ready");
+    const Version v3 = store.put("job", "running");
+    assert(v1 == 1 && v2 == 2 && v3 == 3);
+    assert(store.get("job") == std::optional<std::string>{"running"});
+    assert(store.get_at("job", 0) == std::nullopt);
+    assert(store.get_at("job", v1) ==
+           std::optional<std::string>{"queued"});
+    assert(store.get_at("job", v2) ==
+           std::optional<std::string>{"queued"});
+    assert(store.get_at("job", v3) ==
+           std::optional<std::string>{"running"});
+
+    assert(!store.compare_and_set("job", v1, "wrong"));
+    assert(store.get("job") == std::optional<std::string>{"running"});
+    const auto v4 = store.compare_and_set("job", v3, "finished");
+    assert(v4 == std::optional<Version>{4});
+    assert(store.get("job") == std::optional<std::string>{"finished"});
+
+    const auto v5 = store.compare_and_set("new", 0, "");
+    assert(v5 == std::optional<Version>{5});
+    assert(store.get("new") == std::optional<std::string>{""});
+    std::cout << "latest version=" << *v5 << '\n';
+}
+```
+
+**正确性不变量：**全局已分配版本唯一且递增；每个键的历史是全局写入序列的一个子序列，所以也严格递增；`get` 取末项；`get_at` 取最后一个 `entry.version≤wanted`；CAS 只有在比较成立后才调用分配函数。
+
+**复杂度：**令某键有 h 个历史版本，`put` 摊还 `O(1)`，`get` 平均 `O(1)` 哈希定位后取末项，`get_at` 平均 `O(1)+O(log h)`，总空间与保留的全部历史版本数成正比。这里的平均 `O(1)` 依赖哈希分布，不是最坏保证。
+
+**代码评审继续追问：**
+
+- `get` 返回字符串副本，接口简单但可能复制；返回引用或 `string_view` 又会引入后续写入、rehash 和对象销毁导致的寿命问题，不能只为省复制就改；
+- 历史会无限增长，生产设计要定义保留窗口、快照和旧 reader 语义；
+- 全局版本溢出时显式失败，不能回绕后复用旧版本；
+- 多线程版本应让 CAS 的检查与写入持同一 mutex，或重新设计成适合原子状态的数据结构；仅把 `next_version_` 改成 atomic 仍不能保护每个键的历史；
+- 落盘、崩溃恢复和跨节点顺序都不在这个内存对象的承诺内。
+
+### E2 参考答案：把输入流建模为可恢复解析状态
+
+解析器保存“尚未完成解析的字节”和已消费下标。只有至少有 2 byte 时才能读长度；只有缓冲区达到 `2+length` 时才能产出完整 payload。长度必须先与上限比较，再复制或预留对应数据。
+
+本答案规定：长度 0 的空 payload 合法；一次 `feed` 在非法头之前已经完成的帧仍返回给调用者；遇到非法头后解析器进入终止错误状态并丢弃内部剩余字节。调用者必须先处理返回的已完成帧，再关闭连接或重建解码器。把这个政策写进接口，比只返回一个含糊的 `false` 更重要。
+
+```cpp
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <span>
+#include <vector>
+
+enum class FeedStatus { Ok, ProtocolError };
+
+class FrameDecoder {
+public:
+    explicit FrameDecoder(std::size_t max_payload)
+        : max_payload_(max_payload) {}
+
+    FeedStatus feed(std::span<const std::uint8_t> chunk,
+                    std::vector<std::vector<std::uint8_t>>& completed) {
+        if (failed_) {
+            return FeedStatus::ProtocolError;
+        }
+        buffer_.insert(buffer_.end(), chunk.begin(), chunk.end());
+
+        while (available() >= header_size) {
+            const std::size_t length =
+                (static_cast<std::size_t>(buffer_[read_index_]) << 8U)
+                | static_cast<std::size_t>(buffer_[read_index_ + 1]);
+            if (length > max_payload_) {
+                failed_ = true;
+                buffer_.clear();
+                read_index_ = 0;
+                return FeedStatus::ProtocolError;
+            }
+
+            const std::size_t frame_size = header_size + length;
+            if (available() < frame_size) {
+                break;
+            }
+            const auto payload_begin =
+                buffer_.begin() + static_cast<std::ptrdiff_t>(read_index_ + header_size);
+            const auto payload_end =
+                payload_begin + static_cast<std::ptrdiff_t>(length);
+            completed.emplace_back(payload_begin, payload_end);
+            read_index_ += frame_size;
+        }
+
+        compact_if_useful();
+        return FeedStatus::Ok;
+    }
+
+    bool failed() const { return failed_; }
+
+private:
+    std::size_t available() const {
+        return buffer_.size() - read_index_;
+    }
+
+    void compact_if_useful() {
+        if (read_index_ == buffer_.size()) {
+            buffer_.clear();
+            read_index_ = 0;
+        } else if (read_index_ >= 4096 && read_index_ * 2 >= buffer_.size()) {
+            buffer_.erase(
+                buffer_.begin(),
+                buffer_.begin() + static_cast<std::ptrdiff_t>(read_index_));
+            read_index_ = 0;
+        }
+    }
+
+    static constexpr std::size_t header_size = 2;
+    const std::size_t max_payload_;
+    std::vector<std::uint8_t> buffer_;
+    std::size_t read_index_{0};
+    bool failed_{false};
+};
+
+void append_frame(std::vector<std::uint8_t>& output,
+                  std::span<const std::uint8_t> payload) {
+    assert(payload.size() <= 0xFFFFU);
+    const auto length = static_cast<std::uint16_t>(payload.size());
+    output.push_back(static_cast<std::uint8_t>(length >> 8U));
+    output.push_back(static_cast<std::uint8_t>(length & 0xFFU));
+    output.insert(output.end(), payload.begin(), payload.end());
+}
+
+int main() {
+    const std::array<std::uint8_t, 3> abc{'a', 'b', 'c'};
+    const std::array<std::uint8_t, 1> z{'z'};
+    const std::array<std::uint8_t, 0> empty{};
+    std::vector<std::uint8_t> wire;
+    append_frame(wire, abc);
+    append_frame(wire, empty);
+    append_frame(wire, z);
+
+    FrameDecoder decoder{8};
+    std::vector<std::vector<std::uint8_t>> frames;
+    for (const std::uint8_t byte : wire) {
+        const std::array<std::uint8_t, 1> one{byte};
+        assert(decoder.feed(one, frames) == FeedStatus::Ok);
+    }
+    assert((frames == std::vector<std::vector<std::uint8_t>>{
+        {'a', 'b', 'c'}, {}, {'z'}}));
+
+    FrameDecoder multiple{8};
+    std::vector<std::vector<std::uint8_t>> all_at_once;
+    assert(multiple.feed(wire, all_at_once) == FeedStatus::Ok);
+    assert(all_at_once == frames);
+
+    FrameDecoder limited{3};
+    const std::array<std::uint8_t, 2> declares_four{0, 4};
+    std::vector<std::vector<std::uint8_t>> none;
+    assert(limited.feed(declares_four, none) == FeedStatus::ProtocolError);
+    assert(limited.failed());
+    assert(limited.feed(wire, none) == FeedStatus::ProtocolError);
+    assert(none.empty());
+    std::cout << "decoded frames=" << frames.size() << '\n';
+}
+```
+
+**正确性不变量：**`read_index_≤buffer_.size()`；其前方字节都已属于已返回帧；从 `read_index_` 开始的字节要么不足一个头，要么声明了一个未收完整的合法长度帧；任何超过上限的长度都会使状态永久变成 failed。
+
+**复杂度：**每个输入字节被追加一次、属于某个完整帧后被读取和复制一次；偶尔 compact 会移动未消费后缀。对总输入 N 和总输出 payload 大小 P，正常路径可按摊还 `O(N+P)` 理解。返回拥有数据的 `vector` 明确了生命周期，但会复制 payload；零拷贝视图需要固定底层缓冲寿命，并防止后续扩容或 compact 让视图悬空，不能直接把返回类型换成 `span`。
+
+**系统化测试：**上面的逐 byte 测试覆盖所有头部和 payload 分割。进一步可以对同一 wire 枚举每个二分切点 `wire[0:i]`、`wire[i:n]`，再生成随机 chunk 序列，始终与一次完整 feed 的结果比较。还要测试空帧、最大合法长度、上限加一、连续多帧、只到一半就 EOF，以及合法帧后紧跟非法头的返回政策。
+
+**代码评审继续追问：**单帧长度上限只限制一帧，不限制一次 `feed` 的 chunk、返回帧集合或连接总内存；上层仍需读取缓冲和每轮产出预算。真实 socket 还要处理 EOF 时残留半帧、连接级错误、背压与超时。协议若把长度定义为包含头部，或使用其他字节序，公式也必须随规范改变。
+
+## 8. 盲测卷与协作题覆盖了什么
 
 | 题 | 隐藏的核心 | 主要失分点 |
 |---|---|---|
@@ -569,5 +888,7 @@ int main() {
 | D1 | 正数滑动窗口 | 把含负数版本误套进来 |
 | D2 | KMP + 行读取 | 重叠匹配、空格、空模式政策 |
 | D3 | 窗口 + 哈希频次 | 离开时不删零频键、非法 `k` |
+| E1 | API 演进 + 版本化状态 + CAS 语义 | 覆盖历史、失败消耗版本、把函数名误当线程原子性 |
+| E2 | 增量解析 + 有界输入 + 状态机测试 | 假定 read 等于一帧、先按不可信长度分配、忽略分包与寿命 |
 
 若同一模式连续两次失分，回到对应基础章重新推演定义、操作和复杂度，再从训练章选择一道不同外形的题复测。

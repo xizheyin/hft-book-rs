@@ -2,8 +2,8 @@
 authors = ["AI 学习团队"]
 language = "zh-CN"
 src = "src"
-title = "AI 与 Agent Infra 面试宝典"
-description = "从 AI 与 LLM 基础，到 Agent Harness、沙箱运行时、可靠性与系统设计的中文面试宝典"
+title = "AI 系统与 Agent Infra 基础宝典"
+description = "从 AI 与 LLM 基础，到 PyTorch、GPU、分布式训推、Agent Harness、沙箱运行时与可靠性的中文开发面试宝典"
 
 [preprocessor.mermaid]
 command = "mdbook-mermaid"

@@ -3,7 +3,7 @@
 这是一个面向零基础求职者的中文知识库。仓库中包含两本独立的 `mdBook`，但共用同一套主题、质量检查和 GitHub Pages 部署流程：
 
 - **《系统、Rust、C++ 与 HFT 基础宝典》**：按 408 主干和经典教材讲解程序执行、数据结构、Linux、内存、网络、数据库、分布式系统与并发，再进入 Rust/C++、传统后端、AI Infra 和 HFT 应用。
-- **《AI 与 Agent Infra 面试宝典》**：引用第一册的共享系统基础，专注机器学习、LLM、GPU、Agent Harness、沙箱平台、可靠性与 DeepSeek 架构。
+- **《AI 系统与 Agent Infra 基础宝典》**：引用第一册的共享系统基础，讲解机器学习与 LLM、PyTorch、GPU、分布式训推、AI 编译器、集群存储、Agent Harness、沙箱平台与可靠性。
 
 ## 仓库结构
 
@@ -44,6 +44,7 @@ cargo install --locked --version 0.5.2 mdbook
 cargo install --locked --version 0.17.0 mdbook-mermaid
 
 python3 scripts/check_book.py
+python3 scripts/check_question_answers.py
 python3 scripts/check_cpp_examples.py --run
 mdbook test books/rust-hft
 mdbook test books/ai

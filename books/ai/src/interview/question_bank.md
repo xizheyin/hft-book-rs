@@ -1,4 +1,4 @@
-# AI 与 Agent Infra 高频问题库
+# AI 系统与 Agent Infra 高频问题库
 
 每个问题都围绕同一套技术结构组织：先定义对象，再解释机制和失败模式，最后给出验证方法或适用限制。系统题如果涉及多个组件，还应画出状态、数据或信任边界，避免只列产品名。
 
@@ -413,7 +413,193 @@
 - 基线回答“比什么好”，消融回答“提升来自哪个组件”，置信区间或重复实验回答“差异是否可能只是随机波动”。
 - 除被测变量外，其余数据、Harness、模型、预算和评测器版本都要固定；只挑最好一次运行或只报一个总分，无法证明系统改进可复现。
 
-## 5. AI 与 Agent 综合问题
+## 5. AI 核心系统开发
+
+### 58. Tensor 的 shape、stride、Storage 和 View 分别是什么？
+
+答题要点：
+
+- Storage 保存底层元素；Tensor 用 shape、stride、storage offset、dtype 和 device 解释这些元素；View 与原 Tensor 共享 Storage。
+- `transpose` 后逻辑形状改变，但数据未必重排，所以可能 non-contiguous；`contiguous()` 必要时会分配并复制。
+- 原地修改共享 Storage 会被其他 View 看见，编译器和 Autograd 必须知道 alias/mutation。
+
+### 59. Autograd 在 forward 时保存什么，backward 为什么会占显存？
+
+答题要点：
+
+- forward 同时建立由操作组成的动态计算图，并为梯度公式保存必要 Tensor 或元数据。
+- backward 按反向拓扑应用链式法则，把梯度累积到叶子或所需中间量。
+- 激活显存取决于网络、Batch、序列和算子保存策略；activation checkpointing 丢弃部分激活并在 backward 重算，用计算换显存。
+
+### 60. CUDA 的 grid、block、thread 和 warp 是什么关系？
+
+答题要点：
+
+- CPU 启动 Kernel，形成 grid；grid 由 thread block 组成，block 可被调度到 SM，block 内线程可用 shared memory 与 barrier 协作。
+- warp 是硬件共同发射一组线程指令的执行单位；同一 warp 分支走不同路径会产生 divergence，路径可能串行执行。
+- block 必须能独立调度，跨 block 同步通常需要另一个 Kernel 或专门机制，不能随意用 block 内 barrier。
+
+### 61. 什么是合并访存（coalescing）？为什么 stride 会影响 Kernel？
+
+答题要点：
+
+- 相邻线程访问相邻且对齐的数据时，硬件更容易用较少内存事务服务整个 warp；访问分散则会增加事务与浪费带宽。
+- Tensor 逻辑相邻不保证物理相邻，真实地址由 stride 决定；Kernel 必须支持该布局或先明确复制成本。
+- 是否成为瓶颈要看实际字节、缓存和 profiler，不是看到 non-contiguous 就必然复制。
+
+### 62. Occupancy 越高是否一定越快？
+
+答题要点：
+
+- Occupancy 描述一个 SM 上活跃 warp 相对于硬件上限的比例，受每 block 线程、寄存器和 shared memory 限制。
+- 足够 warp 可隐藏部分等待，但盲目减少寄存器可能造成 spill，更多 warp 也不能修复低效访存或算法。
+- 应同时看 Kernel 时间、带宽、指令、stall 和资源使用；目标是端到端更快，不是单一 occupancy 最大。
+
+### 63. 为什么普通 CPU 时钟容易把 GPU Kernel 测得过快？
+
+答题要点：
+
+- Kernel launch 通常是异步提交，CPU 可能在 GPU 完成前就走过结束时间。
+- 使用同 stream 的 GPU event 或在计时边界正确同步，先预热并排除首次 JIT/分配；固定 shape、dtype、layout 和并发。
+- 同步过多也会改变流水，微基准与真实端到端都要测。
+
+### 64. All-Reduce、All-Gather、Reduce-Scatter 和 All-to-All 各做什么？
+
+答题要点：
+
+- All-Reduce 聚合每个 rank 的输入，并让每个 rank 得到完整聚合结果。
+- Reduce-Scatter 先聚合再把不同结果块分给各 rank；All-Gather 把各 rank 的块收集成每个 rank 都有的完整结果，两者组合可实现一种 All-Reduce。
+- All-to-All 让每个 rank 向所有 rank 发送各自片段，常用于专家并行 Token 派发；它对负载均衡和网络很敏感。
+
+### 65. DDP 与 FSDP/ZeRO 的根本区别是什么？
+
+答题要点：
+
+- DDP（Distributed Data Parallel）通常每 rank 保存完整模型副本，处理不同数据并同步梯度。
+- FSDP/ZeRO 进一步分片参数、梯度或优化器状态，在使用前后 All-Gather、Reduce-Scatter 等，以通信和调度复杂度换单卡显存。
+- 选择先算权重、梯度、优化器、激活和通信；不能只说“FSDP 更省显存所以总更好”。
+
+### 66. 一个 collective 卡住，为什么首先核对所有 rank 的调用顺序？
+
+答题要点：
+
+- 参与者必须以兼容的顺序、count、dtype 和 communicator 调用匹配操作；某 rank 少调用、提前异常或进入另一 collective，会让其他人等待。
+- 先找最后一次全体完成点，收集各 rank 栈、stream、进程/设备错误，再查 NCCL、NIC、链路和拥塞。
+- 无条件增大 timeout 只会推迟发现协议不一致或失联参与者。
+
+### 67. RDMA 为什么仍需要内存注册、队列和完成处理？
+
+答题要点：
+
+- RDMA 让 RNIC 在被授权的注册内存区域之间搬运数据，减少远端 CPU 参与；注册产生可供设备使用的地址/权限信息。
+- QP（Queue Pair，队列对）包含发送与接收工作队列；应用把工作请求提交为 WQE（Work Queue Entry，工作队列项），CQ（Completion Queue，完成队列）返回完成信息。连接、授权、缓冲生命周期、拥塞和错误仍由协议处理。
+- GPUDirect RDMA 可减少经过主存的搬运，但不自动提供 collective 顺序、一致性或应用层重试语义。
+
+### 68. 编译器的 graph break、guard 和 recompile 分别是什么？
+
+答题要点：
+
+- graph break 是捕获图无法继续，程序在编译区与 Eager 区之间切换；过多 break 会切碎融合机会并增加交界成本。
+- guard 验证已编译版本依赖的 shape、dtype、layout 或 Python 条件；失败时可能选择另一版本、重新编译或回退。
+- 动态输入过散可造成重新编译风暴，应结合日志、shape 分布、bucket/动态策略和缓存观察，不是简单扩大缓存上限。
+
+### 69. 一个自定义训练算子怎样证明正确？
+
+答题要点：
+
+- 先声明 shape、dtype、device、layout、alias、mutation 与特殊值契约。
+- 与可信高精度参考实现比较正常、极值、零长、非整块和 non-contiguous 输入；按 dtype/归约规模设置合理容差。
+- 使用 `torch.library.opcheck` 一类工具核对 Schema、FakeTensor 与编译注册等框架契约，再用 `gradcheck` 或数值差分核对数学梯度；覆盖 Eager、compiled、不同设备和动态形状，最后才做正确同步与预热后的性能比较。
+
+### 70. 为什么 GPU 作业需要 gang scheduling 和拓扑感知？
+
+答题要点：
+
+- 分布式作业少一个 rank 就可能全部等待，部分启动会占住 GPU，因此要达到最小集合后成组提交，并让预留可超时回滚。
+- GPU、CPU、NUMA、PCIe、NVLink/NVSwitch 与 RNIC 的相对位置会改变通信路径。
+- 总卡数够仍可能因节点级碎片、型号/健康/版本或拓扑硬约束而无法运行。
+
+### 71. 一张慢卡为什么会拖慢整个训练作业？
+
+答题要点：
+
+- 同步训练在 collective 或流水依赖处以最慢参与者为准，其他 rank 会等待。
+- 按 rank 对齐数据加载、forward、backward、collective 和 Checkpoint，找最早偏离点；再查降频、Xid/ECC、Kernel、shape、NIC 和存储。
+- 集群平均 GPU 利用率会掩盖慢 rank，必须看同一步骤的分布。
+
+### 72. Checkpoint 为什么需要 manifest 和 READY 状态？
+
+答题要点：
+
+- 多 rank 分片不会同时完成，看到部分文件不代表模型、优化器、随机数、数据进度和并行元数据完整。
+- 每个 shard 保存大小/checksum，manifest 绑定 job/attempt/step、格式和全部对象；验证后原子发布 READY。
+- 恢复只选 READY 版本，WRITING/坏 shard 被拒绝；失败临时对象由幂等 GC 清理。
+
+### 73. 推理调度为什么不能只按请求到达顺序处理？
+
+答题要点：
+
+- 请求的输入长度、预期输出长度、优先级和 KV Cache 占用不同。严格先进先出会让一个超长 Prefill 挡住后面的短请求，也可能让显存被少量长会话占满。
+- 调度器要在 TTFT、TPOT、吞吐、公平性和显存之间取舍，可使用连续批处理、Token 预算、队列年龄和租户配额；过载时应准入或拒绝，而不是无限排队。
+- 抢占不是免费动作：可以丢弃后重算 KV、换出到较慢存储，或保留部分块。比较方案时要把搬运/重算成本和尾延迟算进去。
+
+### 74. Prefix Cache 的 key 为什么不能只有 Prompt 文本？
+
+答题要点：
+
+- 可复用 KV 取决于产生它的模型权重、Tokenizer、位置编码、精度、适配器和实际 Token 序列；相同可见文字不一定得到相同 Token 或状态。
+- 多租户系统还要把权限与隔离域纳入 key，避免一个租户通过命中、计时或返回内容观察另一个租户的数据。
+- 更新模型、系统提示或适配器后必须自然失效；命中率、节省的 Prefill 计算、额外显存和错误命中都要监控。
+
+### 75. Prefill/Decode 分离后，KV Cache 怎样安全交给 Decode 节点？
+
+答题要点：
+
+- Prefill 产出按层组织的 KV 块及元数据；控制面先选择兼容的 Decode 节点，再传输数据，接收端校验模型版本、请求代次、层/块范围、dtype、shape 和完整性信息。
+- 只有全部必需块可见且元数据原子发布后，请求才能进入 Decode READY；超时或发送端重试必须靠稳定 request/attempt id 去重，旧 attempt 的迟到块不能覆盖新 attempt。
+- 分离减少某些资源干扰，却新增网络字节、排队、失败恢复和容量耦合；是否划算要比较 TTFT、TPOT、吞吐与传输带宽，而不是看到“解耦”就采用。
+
+### 76. CUDA Stream 与 Event 解决什么问题？同步到哪里才算完成？
+
+答题要点：
+
+- Stream 给其中排入的工作定义顺序；不同 Stream 之间默认不能凭主机提交先后推断依赖。Event 可在一个 Stream 中记录完成点，让另一个 Stream 或主机等待并用于设备时间测量。
+- Kernel launch、异步拷贝和 NCCL 调用返回，通常只表示工作已经排入相应队列，不表示 GPU 或网络已经完成。复用缓冲、读回结果或报告成功前必须建立所需依赖。
+- 全设备同步最容易理解，却会破坏重叠。正确做法是只等待真实数据依赖，并用 profiler 时间线确认计算、拷贝和通信是否按预期重叠。
+
+### 77. TP、PP、EP 和分片数据并行分别在哪里通信？为什么恢复时可能要 reshard？
+
+答题要点：
+
+- 张量并行（TP）在单层算子内部切矩阵，常在层内产生 All-Reduce 或 All-Gather；流水线并行（PP）在阶段之间传激活与梯度；专家并行（EP）路由 Token，常用 All-to-All；FSDP/ZeRO 在使用参数和归并梯度时进行 All-Gather、Reduce-Scatter 等。
+- Checkpoint 必须描述逻辑 Tensor 及原来的并行布局。若恢复时 world size 或 mesh 变化，旧 shard 不能简单按文件名发给新 rank，要按全局 offset、shape 和 dtype 重组再切分，这就是 reshard。
+- 计算通信量时先写每个逻辑 Tensor 的字节数，再标出谁持有什么、在哪一步发送给谁；只背并行方式名称无法判断瓶颈。
+
+### 78. NCCL 调用成功返回，是否说明接收缓冲已经可用？
+
+答题要点：
+
+- 通常不是。主机侧 API 返回多表示 collective 已异步排入 CUDA Stream；同一 Stream 的后续工作可依赖其顺序，主机或另一 Stream 读取前则需要 Event、Stream 同步或等价依赖。
+- 远端 rank 退出、链路故障或设备错误可能稍后才暴露。系统要轮询异步错误、设置有边界的超时，并让所有 rank 对同一次失败作一致退出或恢复。
+- “队列提交完成”“本地设备工作完成”“所有参与者得到可用结果”和“训练步骤已持久提交”是四个不同边界。
+
+### 79. RDMA Read/Write 为什么叫 one-sided？本地完成是否等于远端应用已经处理？
+
+答题要点：
+
+- RDMA Read/Write 的数据搬运可以由发起端 RNIC 直接访问已授权的远端注册内存，远端 CPU 不必为每次传输执行匹配的收发调用，因此叫 one-sided。
+- 本地 CQE（Completion Queue Entry，完成队列项）说明的是所请求操作达到该传输语义的完成边界，不代表远端业务线程已经看见、校验或提交了数据。
+- 应用仍需版本号、所有权或通知协议来判断缓冲何时可读、能否覆盖以及失败后如何重试；Send/Receive 则需要双方预先准备匹配缓冲。
+
+### 80. 分布式 AI 存储为什么要把元数据和大块数据分开设计？纠删码为什么不是“免费省副本”？
+
+答题要点：
+
+- 路径、目录、对象版本、权限和块位置是小而频繁变化的元数据；数据集 shard、模型权重和 Checkpoint 是大块数据。两者的请求大小、并发、事务和扩展方式不同，分开后可各自选择一致性与扩展机制。
+- 纠删码把数据编码成多个数据块与校验块；满足规定数量的块才能重建。它比多副本节省容量，但小写更新、编码、降级读、修复流量和故障相关性更复杂。
+- 设计题先列 workload：顺序吞吐、随机小读、Checkpoint 突发、恢复时间与故障域，再决定副本或纠删码；不能只按静态容量价格选择。
+
+## 6. AI 与 Agent 综合问题
 
 下面把模型、Agent 与平台机制组合成跨层问题。每一项都要求同时说明数据流、状态边界和失败条件。
 
@@ -431,7 +617,7 @@
 | 模型网关 | 说明模型路由、版本、限流、预算、超时、重试、fallback、流式响应、观测和租户隔离 | fallback 会改变质量与语义；模型调用超时和重试也要考虑重复计费及未知结果 |
 | 自进化闭环 | 画出轨迹采集、失败归因、数据/规则/Prompt/策略候选、离线评测、消融、门禁、灰度、回滚和新失败回流 | 不能让同一个有缺陷的 evaluator 同时出题、打分和决定上线，也不能只报最好一次结果 |
 
-## 6. 开放追问：没有唯一标准答案
+## 7. 开放追问：没有唯一标准答案
 
 这些问题没有唯一方案，关键是先定义约束，再提出能够验证的设计：
 
@@ -458,7 +644,7 @@
 
 </details>
 
-## 7. 常见回答缺陷
+## 8. 常见回答缺陷
 
 - 只给定义，不说它解决哪个失败模式。
 - 答案出现十个组件名，却没有状态、数据流和信任边界。
@@ -467,7 +653,7 @@
 - 把模型判断当最终授权或最终 verifier。
 - 未知问题强行作答；承认边界后给验证方法通常更专业。
 
-## 8. 回答框架
+## 9. 回答框架
 
 - 技术题四步：**定义 → 失败模式 → 方案/取舍 → 验证与限制。**
 - 高频关键词不是装饰：幂等、租约、背压、verifier、trace、最小权限都要能画出机制。

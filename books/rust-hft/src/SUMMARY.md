@@ -28,6 +28,7 @@
 # 第二部分：Rust 底层原理与并发
 
 - [为什么选择 Rust 编写系统程序](introduction/why_rust.md)
+- [Rust 基础：从可运行程序到类型、模式与测试](introduction/rust_basics.md)
 - [怎样为 Rust 项目选择工具与依赖](introduction/ecosystem.md)
 - [Rust 的零成本抽象](foundations/zero_cost.md)
 - [编译器怎样理解并优化 Rust 程序](foundations/compiler_optimizations.md)
@@ -46,11 +47,15 @@
 - [宏编程实战](rust_advanced/macros.md)
 - [闭包与函数指针](rust_advanced/closures.md)
 
-# 第四部分：现代 C++ 与系统开发
+# 第四部分：Python 工程基础与原生协作
+
+- [Python 工程基础：从对象语义到并发与原生边界](python/core_engineering.md)
+
+# 第五部分：现代 C++ 与系统开发
 
 - [现代 C++：对象生命周期与系统开发](cpp/README.md)
-- [C++ 基础复习：重新找回手感](cpp/basics_refresher.md)
 - [C++ 最小语法与数据建模](cpp/minimal_syntax.md)
+- [C++ 基础诊断与动手练习](cpp/basics_refresher.md)
 - [编译、链接与内存地图](cpp/compilation_memory.md)
 - [指针、引用与 const](cpp/pointers_references.md)
 - [对象生命周期与 RAII](cpp/raii_lifetime.md)
@@ -60,17 +65,19 @@
 - [模板、Concepts 与多态](cpp/templates_polymorphism.md)
 - [内存布局、缓存与 False Sharing](cpp/memory_layout.md)
 - [错误、异常与未定义行为](cpp/errors_ub.md)
+- [C++ 线程、锁与条件变量](cpp/threads_sync.md)
 - [原子操作与 C++ 内存模型](cpp/atomics_memory_model.md)
 - [无锁结构与 SPSC 队列](cpp/lock_free.md)
 - [分配器、对象池与零拷贝](cpp/allocators_zero_copy.md)
 - [编译优化、基准与诊断工具](cpp/optimization_tooling.md)
 - [C++ HFT 贯穿项目](cpp/hft_capstone.md)
 
-# 第五部分：数据结构、算法与面试编码
+# 第六部分：数据结构、算法与面试编码
 
 - [数据结构、算法与 C++20 实现](algorithms/README.md)
 - [数据结构总论：逻辑、存储与抽象类型](algorithms/data_structures_intro.md)
 - [复杂度、正确性与测试](algorithms/complexity_correctness.md)
+- [概率、组合计数与统计直觉](algorithms/probability_statistics.md)
 - [线性表：顺序表与链表](algorithms/linear_lists.md)
 - [栈、队列与数组](algorithms/stacks_queues_arrays.md)
 - [树与二叉树：性质、遍历、Huffman 与堆](algorithms/trees_foundations.md)
@@ -94,9 +101,9 @@
 - [进阶数据结构与图算法](algorithms/advanced_structures.md)
 - [基础设施与量化岗位场景综合题](algorithms/company_scenarios.md)
 - [限时模拟笔试与面试](algorithms/mock_exams.md)
-- [追加盲测卷：完整输入输出与陌生组合](algorithms/mock_exams_extra.md)
+- [追加盲测与协作编码：陌生组合、需求演进与代码评审](algorithms/mock_exams_extra.md)
 
-# 第六部分：吞吐量、并发与基础设施
+# 第七部分：吞吐量、并发与基础设施
 
 - [并发与通用基础设施](infrastructure/README.md)
 - [原子操作详解](infrastructure/atomics.md)
@@ -104,13 +111,14 @@
 - [Ring Buffer 实现](infrastructure/ring_buffer.md)
 - [队列拓扑：SPSC、MPSC 与 MPMC](infrastructure/queues.md)
 - [吞吐量优化：批处理、流水线与背压](infrastructure/throughput.md)
+- [数据流水线基础：从一条记录到可重放的结果](infrastructure/data_pipelines.md)
 - [资源效率：分配、零拷贝与对象复用](infrastructure/resource_efficiency.md)
 - [可扩展性：分片、Share-Nothing 与核间通信](infrastructure/scalability.md)
 - [高性能日志系统](infrastructure/logging.md)
 - [配置热更新：一致快照、审计与回滚](infrastructure/config.md)
 - [指标监控与遥测](infrastructure/metrics.md)
 
-# 第七部分：计算机网络与 Linux I/O
+# 第八部分：计算机网络与 Linux I/O
 
 - [计算机网络与 Linux I/O 知识地图](network/README.md)
 - [计算机网络概述](network/network_overview.md)
@@ -131,7 +139,7 @@
   - [Solarflare OpenOnload](network/openonload.md)
 - [Linux 网络调优](network/tuning.md)
 
-# 第八部分：数据库与分布式系统
+# 第九部分：数据库与分布式系统
 
 - [数据库基础](databases/README.md)
 - [关系模型与 SQL](databases/relational_sql.md)
@@ -144,8 +152,9 @@
 - [分片与缓存：把数据和请求分散开](distributed/partitioning_caching.md)
 - [可靠性与跨服务事务](distributed/reliability_transactions.md)
 
-# 第九部分：HFT 业务基础与面试主线
+# 第十部分：HFT 业务基础与面试主线
 
+- [量化开发岗位考点矩阵](hft/developer_role_matrix.md)
 - [HFT 总览：从行情到成交的完整生命周期](hft/README.md)
 - [市场微观结构：价格怎样形成](hft/market_microstructure.md)
 - [订单类型与撮合优先级](hft/orders_matching.md)
@@ -153,7 +162,7 @@
 - [HFT 系统设计面试](hft/system_design_interview.md)
 - [HFT 高频面试题库](hft/interview_question_bank.md)
 
-# 第十部分：行情、协议与订单接入
+# 第十一部分：行情、协议与订单接入
 
 - [电子市场协议概览](connectivity/protocols.md)
   - [FIX 协议解析](connectivity/fix.md)
@@ -163,7 +172,7 @@
   - [增量更新、快照与恢复](connectivity/incremental_updates.md)
 - [订单路由系统](connectivity/order_routing.md)
 
-# 第十一部分：交易引擎、风控与策略
+# 第十二部分：交易引擎、风控与策略
 
 - [订单簿管理](engine/order_book.md)
 - [风控系统](engine/risk.md)
@@ -173,10 +182,11 @@
   - [信号生成](engine/signals.md)
   - [执行算法](engine/execution.md)
 
-# 第十二部分：性能工程、测试与仿真
+# 第十三部分：性能工程、测试与仿真
 
 - [基准测试](optimization/benchmarking.md)
 - [性能分析](optimization/profiling.md)
+- [Linux 开发与排障：从崩溃、卡住和变慢找到证据](optimization/linux_debugging.md)
 - [CPU 亲和性与隔离](optimization/cpu_affinity.md)
 - [编译优化与 PGO](optimization/pgo.md)
 - [生产环境部署清单](optimization/deployment.md)

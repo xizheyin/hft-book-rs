@@ -2,9 +2,9 @@
 
 <div class="book-hero">
   <p class="book-hero__eyebrow">INTERVIEW-FIRST · 从零建立可解释的知识体系</p>
-  <p class="book-hero__lead">先看懂程序怎样经过 CPU、Linux、内存、网络与存储运行，再用 Rust 与 C++ 解决后端、AI 基础设施和 HFT 问题。</p>
+  <p class="book-hero__lead">先看懂程序怎样经过 CPU、Linux、内存、网络与存储运行，再用 Rust、C++ 与 Python 解决后端、AI 基础设施和 HFT 问题。</p>
   <div class="book-hero__badges">
-    <span>计算机系统</span><span>Linux</span><span>Rust</span><span>C++</span><span>算法编码</span><span>网络与并发</span><span>HFT</span><span>系统设计</span>
+    <span>计算机系统</span><span>Linux</span><span>Rust</span><span>C++</span><span>Python</span><span>算法编码</span><span>网络与并发</span><span>HFT</span><span>系统设计</span>
   </div>
 </div>
 
@@ -38,9 +38,9 @@ flowchart LR
 | 部分 | 主讲内容 | 典型问题 |
 |---|---|---|
 | 计算机组成与操作系统 | 数据表示、指令、CPU、存储层次、进程、同步、内存、文件与 I/O | 一条指令、一次缺页或一次 `write` 在软硬件中怎样完成 |
-| Rust、C++ 与算法 | 所有权、RAII、对象布局、类型系统、并发、数据结构与算法 | 程序为什么正确，资源由谁拥有，时间和空间成本是多少 |
+| Rust、C++、Python 与算法 | 所有权、RAII、对象布局、Python 对象/并发边界、类型系统、数据结构与算法 | 程序为什么正确，资源由谁拥有，跨语言时是否复制，时间和空间成本是多少 |
 | 基础设施与网络 | 队列、背压、配置、日志、指标、分层网络、TCP/UDP 与 Linux I/O | 数据怎样流动，系统怎样处理拥塞、部分失败和重试 |
 | 数据库与分布式系统 | 关系模型、索引、事务、恢复、复制、共识、分片与跨服务可靠性 | 多个请求或节点同时读写时怎样保持约束，崩溃后怎样恢复 |
 | HFT 系统 | 市场微观结构、行情、订单、风控、撮合、回放与性能工程 | 一个订单从决策到成交经历哪些状态，断线或数据缺口怎样恢复 |
 
-机器学习、大模型、推理服务与 Agent 平台的专属内容位于同站点的 <a href="../ai/index.html">《AI 与 Agent Infra 基础宝典》</a>。CPU、Linux、内存、并发、网络和存储只在本书主讲，AI 子书直接引用这些定义，避免维护两套互相矛盾的解释。
+机器学习、大模型、PyTorch、GPU、分布式训推与 Agent 平台的专属内容位于同站点的 <a href="../ai/index.html">《AI 系统与 Agent Infra 基础宝典》</a>。CPU、Linux、内存、并发、网络和数据库的通用原理只在本书主讲，AI 子书直接引用这些定义，避免维护两套互相矛盾的解释。

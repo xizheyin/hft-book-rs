@@ -1,32 +1,31 @@
 # Summary
 
-- [首页：AI 与 Agent Infra 面试宝典](README.md)
-- [AI 与 Agent Infra 岗位能力地图](orientation/role_map.md)
+- [首页：AI 系统与 Agent Infra 基础宝典](README.md)
+- [AI 系统与 Agent Infra 岗位能力地图](orientation/role_map.md)
 
-# 第一部分：Agent Infra 的系统机制
-
-- [Agent 沙箱怎样安全执行命令](systems/process_threads_syscalls.md)
-- [Agent 内存隔离与容量](systems/virtual_memory.md)
-- [Agent 并发协议：领取、取消与背压](systems/concurrency_async_io.md)
-- [Agent RPC 与工具网络](systems/network_rpc.md)
-- [数据库、Checkpoint 与可恢复状态](systems/filesystem_database.md)
-- [Agent 容量规划与跨层诊断](systems/performance_diagnostics.md)
-
-# 第二部分：AI 与机器学习基础
+# 第一部分：AI 与机器学习基础
 
 - [AI、机器学习、深度学习与 LLM](foundations/ai_ml_llm.md)
 - [最小数学直觉：向量、概率、梯度与损失](foundations/math_and_learning.md)
 - [数据、泛化、泄漏与分布漂移](foundations/data_and_generalization.md)
 - [神经网络积木：Linear、激活、Normalization、FFN 与残差](foundations/neural_network_blocks.md)
 
-# 第三部分：Transformer、LLM 推理与 DeepSeek 综合架构
+# 第二部分：Transformer、生成与模型机制
 
 - [Transformer：Token 如何交换信息](llm/transformer.md)
 - [自回归生成与采样](llm/generation.md)
 - [GPU 与数值基础：算力、显存、Kernel 与混合精度](llm/gpu_numerics.md)
-- [推理系统：Prefill、Decode 与 KV Cache](llm/inference.md)
 - [预训练、SFT、偏好对齐与强化学习](llm/training_and_alignment.md)
 - [DeepSeek 综合架构：MoE、MLA 与 MTP](llm/deepseek_architecture.md)
+
+# 第三部分：AI 核心系统开发
+
+- [PyTorch 运行时：Tensor、Autograd 与异步执行](llm/pytorch_runtime.md)
+- [GPU 并行编程：线程、内存与 Kernel](llm/gpu_parallel_programming.md)
+- [AI 编译器与算子：从计算图到 Kernel](llm/ml_compilers_operators.md)
+- [GPU 集合通信、NCCL 与 RDMA](llm/gpu_collectives_rdma.md)
+- [分布式训练系统：并行、分片与恢复](llm/distributed_training_systems.md)
+- [推理系统：Prefill、Decode 与 KV Cache](llm/inference.md)
 
 # 第四部分：Model + Harness = Agent
 
@@ -55,11 +54,23 @@
 - [可靠性、SLO 与事故响应](platform/reliability.md)
 - [压测与容量规划](platform/performance_capacity.md)
 - [能力票据、秘密、供应链与审计](platform/security.md)
+- [GPU 集群：拓扑调度、健康与卡死排障](platform/gpu_cluster_reliability.md)
+- [AI 分布式存储：数据集、Checkpoint 与 KV Cache](platform/ai_distributed_storage.md)
 
-# 第七部分：面试实战
+# 第七部分：Agent Infra 跨层案例
 
+- [Agent 沙箱怎样安全执行命令](systems/process_threads_syscalls.md)
+- [Agent 内存隔离与容量](systems/virtual_memory.md)
+- [Agent 并发协议：领取、取消与背压](systems/concurrency_async_io.md)
+- [Agent RPC 与工具网络](systems/network_rpc.md)
+- [数据库、Checkpoint 与可恢复状态](systems/filesystem_database.md)
+- [Agent 容量规划与跨层诊断](systems/performance_diagnostics.md)
+
+# 第八部分：面试实战
+
+- [AI 核心系统设计：推理、训练与存储](interview/core_system_design.md)
 - [Coding Agent 沙箱系统设计](interview/system_design.md)
-- [AI 与 Agent Infra 高频问题库](interview/question_bank.md)
+- [AI 系统与 Agent Infra 高频问题库](interview/question_bank.md)
 
 # 附录
 

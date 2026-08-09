@@ -1,6 +1,21 @@
-# AI 与 Agent Infra 岗位能力地图
+# AI 系统与 Agent Infra 岗位能力地图
 
 AI 系统岗位并不只有“训练模型”和“调用模型 API（Application Programming Interface，应用程序接口）”两种。一个生产系统从数据、训练、推理延伸到 Agent Harness、安全执行环境和分布式平台，不同岗位负责其中不同边界。理解这些边界，才能判断一个问题属于算法、模型服务、Agent 控制流还是基础设施。
+
+同一家 AI 公司也不会要求一位校招生同时精通 CUDA Kernel、分布式存储、虚拟化、模型训练和 Agent 产品。共同要求通常是编程、算法、计算机系统、Linux、网络与排障；进入具体岗位后，才在一条专业轨道继续深入。下面的矩阵依据 DeepSeek 当前公开开发岗位组织，用来回答“这个职位究竟需要读哪些章”，而不是制造一张所有人都要背完的名词表。
+
+| 开发岗位轨道 | 共同基础之外的主线 | 本书入口 |
+|---|---|---|
+| 服务端 / Agent 后端 | API、流式响应、数据库、缓存、可靠性、模型与 Agent 基本语义 | [模型到 Agent](../agent/model_plus_harness.md)、[工具 RPC](../systems/network_rpc.md)、[数据库与 Checkpoint](../systems/filesystem_database.md) |
+| Agent Harness | Context、Tool Use、Planning、Memory、Multi-Agent、长任务、评测 | [Agent 全部章节](../agent/model_plus_harness.md) |
+| Agent Infra / Runtime | 进程、VM、容器、虚拟网络、临时存储、调度、控制面、安全 | [Runtime](../runtime/sandbox_threat_model.md)与[跨层系统案例](../systems/process_threads_syscalls.md) |
+| 训练 / 推理框架 | PyTorch、Autograd、混合并行、Checkpoint、KV、调度与模型服务 | [PyTorch 执行](../llm/pytorch_runtime.md)、[分布式训练](../llm/distributed_training_systems.md)、[推理系统](../llm/inference.md) |
+| 算子 / AI 编译器 | CUDA 执行与内存、算子正确性、Triton/TileLang、IR、lowering 与 codegen | [GPU 并行](../llm/gpu_parallel_programming.md)、[AI 编译器与算子](../llm/ml_compilers_operators.md) |
+| 高性能通信 / 超算集群 | collective、NCCL、RDMA、拓扑、成组调度、慢 rank 与硬件健康 | [GPU 通信与 RDMA](../llm/gpu_collectives_rdma.md)、[GPU 集群可靠性](../platform/gpu_cluster_reliability.md) |
+| 高性能分布式存储 | 文件/对象/块、元数据、复制、AI 负载、Checkpoint、KV Cache 与 RDMA 路径 | [AI 分布式存储](../platform/ai_distributed_storage.md) |
+| 测试开发 / SRE / 安全 | 测试分层、故障注入、性能回归、观测、事故响应和供应链 | [性能与容量](../platform/performance_capacity.md)、[可靠性](../platform/reliability.md)、[安全](../platform/security.md) |
+
+每一轨都仍需共享册的[算法与数据结构](../../rust-hft/algorithms/index.html)、[操作系统](../../rust-hft/foundations/os_internals.html)、[网络](../../rust-hft/network/index.html)、[数据库](../../rust-hft/databases/index.html)、[分布式系统](../../rust-hft/distributed/index.html)和[Linux 排障](../../rust-hft/optimization/linux_debugging.html)。语言则至少掌握一种能现场编码的主力语言；Python、C++ 与 Rust 在不同团队承担的比例不同。
 
 ## 1. 从一条请求看岗位分工
 
@@ -26,7 +41,7 @@ flowchart LR
 
 同一团队可能覆盖多层，但设计时仍应把责任分清。例如，模型输出了错误命令属于模型或上下文质量问题；未经授权就执行命令属于 Harness/权限问题；命令突破文件边界则属于 Runtime 隔离问题。
 
-## 2. 六类常见技术方向
+## 2. 九类技术责任
 
 ### 2.1 数据、训练与对齐
 
@@ -107,6 +122,18 @@ Runtime 的正确性标准不是“命令能运行”，而是命令只能在授
 
 可观测性不是“多打日志”，可靠性也不是“永不失败”。它们共同建立证据，使系统能发现故障、限制影响并恢复。
 
+### 2.7 训练、推理框架与 PyTorch Runtime
+
+这一方向把模型数学图变成能在多卡上训练或服务的执行过程：Tensor 的 Storage/View/stride，Autograd 保存哪些中间量，DDP/FSDP 怎样同步或分片，Checkpoint 怎样恢复，推理 Scheduler 怎样管理 KV 与请求生命周期。它与“研究一种新模型结构”不同，重点是让已有目标正确、高效、可恢复地运行。
+
+### 2.8 GPU 算子、通信与编译器
+
+算子工程师决定线程怎样分工、数据怎样进入寄存器/共享内存、怎样同步和验证数值；通信工程师优化 All-Reduce、All-to-All 与跨机 RDMA；编译器工程师把图和 IR 逐层 lower 成目标代码。这三个方向共享 GPU、内存与测量基础，但面试深挖点不同，岗位通常允许候选人在其中一条最强。
+
+### 2.9 GPU 集群与 AI 存储
+
+集群方向管理 GPU、CPU、NIC、拓扑、版本和故障域，处理成组调度、慢卡、网络拥塞和作业恢复。存储方向服务数据集、权重、Checkpoint 与 KV Cache，处理元数据、复制、一致性、吞吐和故障重建。二者通过 RDMA、Checkpoint 与数据加载相连，却不应合并成一句“懂 Kubernetes”。
+
 ## 3. 共同系统基础怎样进入 AI 场景
 
 通用计算机基础由系统子书主讲，AI 子书只解释新增语义：
@@ -149,7 +176,7 @@ Runtime 的正确性标准不是“命令能运行”，而是命令只能在授
 
 ## 6. 一个容量算例
 
-假设平台峰值每秒接收 120 个任务，平均占用沙箱 40 秒。根据 Little 定律，稳定状态下平均并发约为：
+假设在一个持续的高峰观察窗口内，平台的**平均**到达率是每秒 120 个任务，并且系统没有持续积压或丢弃任务；任务从进入系统到离开的平均停留时间是 40 秒。根据 Little 定律，这个窗口内的平均在途任务数约为：
 
 ```text
 L = λW = 120 × 40 = 4,800 个任务
@@ -191,3 +218,8 @@ CPU    = 4,800 × 0.5 = 2,400 核
 8. 示例选择“推理服务”：**定义**是把 Prompt 转为输出 Token 的在线系统；**机制**是排队、Prefill、KV Cache、逐轮 Decode 与流式返回；**算例**是 `总时长≈TTFT+(N-1)×TPOT`，若 TTFT=500 ms、生成 101 Token、TPOT=20 ms，则约 `500+100×20=2500 ms`；**失败**可以是 KV 耗尽导致拒绝或超长 Prefill 阻塞短请求；**证据**是同一 trace 的队列时长、Prompt 长度、KV 占用、Batch、Kernel 时间和停止原因。这个五层结构也可替换成安全、调度或存储方向。
 
 </details>
+
+## 一手岗位依据
+
+- [DeepSeek 官方招聘](https://talent.deepseek.com/)：服务端、Agent Harness、Agent Infra、训练/推理框架、算子/通信/编译器、超算集群、分布式存储、测试与平台岗位的公开职责。
+- [DeepSeek 官方开源组织](https://github.com/deepseek-ai)：DeepEP、DeepGEMM、3FS 等公开系统与岗位技术方向的对应案例。
